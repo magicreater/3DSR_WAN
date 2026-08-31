@@ -1,0 +1,23 @@
+name: rl3dsr-stage0
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.4.0
+  - torchvision=0.19.0
+  - pytorch-cuda=12.4
+  - numpy=1.26
+  - pillow>=9
+  - pytest>=8
+  - pip
+  - pip:
+      - diffusers==0.31.0
+      - einops==0.8.1
+      - easydict==1.13
+      - transformers==4.49.0
+      - tokenizers>=0.20.3
+      - accelerate>=1.1.1
+      - imageio>=2.37.0
+      - ftfy>=6.3.1
