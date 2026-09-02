@@ -14,3 +14,6 @@ dist/
 /datasets/
 /models/
 
+
+# Reproducible Stage 1 experiment artifacts (checkpoints and raw metrics).
+/artifacts/stage1/

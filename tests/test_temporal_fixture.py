@@ -28,3 +28,17 @@ def test_temporal_video_rejects_misaligned_metadata():
     sample = make_synthetic_video(3)
     with pytest.raises(ValueError, match="intrinsics"):
         TemporalVideoSample(sample.scene_id, sample.frames, sample.intrinsics[:2], sample.extrinsics, sample.timestamps)
+
+
+def test_motion_video_is_reproducible_and_has_coherent_nontrivial_motion():
+    from rl3dsr.data.temporal_fixture import make_motion_video
+
+    first = make_motion_video(9, height=64, width=64, seed=7)
+    second = make_motion_video(9, height=64, width=64, seed=7)
+    np.testing.assert_array_equal(first.frames, second.frames)
+    assert first.scene_id == "stage1_motion_seed_7"
+    assert np.unique(first.frames.reshape(9, -1), axis=0).shape[0] == 9
+    adjacent = np.abs(first.frames[1:].astype(np.float32) - first.frames[:-1]).mean()
+    shuffled = np.abs(first.frames[1:].astype(np.float32) - first.frames[:0:-1].astype(np.float32)).mean()
+    assert adjacent > 0
+    assert adjacent < shuffled
