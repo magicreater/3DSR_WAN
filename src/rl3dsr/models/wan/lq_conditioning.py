@@ -354,17 +354,27 @@ def conditioned_prediction(
 ) -> Tensor:
     """Run the shared Stage 1/2 path and sum residuals at matching blocks."""
     residuals: dict[int, Tensor] = {}
+    camera_attention = None
     if features is not None:
         for block, residual in conditioner.bridge_residuals(features, timestep).items():
             residuals[block] = residual
     if geometry_adapter is not None and geometry_enabled:
         if camera is None or latent_shape is None:
             raise ValueError("camera and latent_shape are required for geometry conditioning")
-        for block, residual in geometry_adapter.residuals(camera, latent_shape, timestep).items():
-            residuals[block] = residual if block not in residuals else residuals[block] + residual
-    if not residuals:
+        if getattr(geometry_adapter, "injection_mode", None) == "self_attention":
+            camera_attention = (geometry_adapter, geometry_adapter.prepare(camera, latent_shape))
+        else:
+            for block, residual in geometry_adapter.residuals(camera, latent_shape, timestep).items():
+                residuals[block] = residual if block not in residuals else residuals[block] + residual
+    if not residuals and camera_attention is None:
         return dit(sample, timestep, context)
-    return dit(sample, timestep, context, block_token_residuals=residuals)
+    return dit(
+        sample,
+        timestep,
+        context,
+        block_token_residuals=residuals or None,
+        camera_attention=camera_attention,
+    )
 
 
 def _prefix_first(video: Tensor, count: int) -> Tensor:

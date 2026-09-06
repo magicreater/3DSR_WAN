@@ -2,7 +2,15 @@
 
 from rl3dsr.models.wan.checkpoint import WanCheckpoint
 from rl3dsr.models.wan.dit import WanDiT
-from rl3dsr.models.wan.geometry_conditioning import CameraBatch, GeometryConditioner, load_geometry_checkpoint
+from rl3dsr.models.wan.geometry_conditioning import (
+    CameraBatch,
+    FullRREConditioner,
+    FullRREContext,
+    GeometryConditioner,
+    build_world_to_ray,
+    load_geometry_checkpoint,
+    save_geometry_checkpoint,
+)
 from rl3dsr.models.wan.flow import flow_matching_loss, flow_matching_pair
 from rl3dsr.models.wan.lq_conditioning import (
     CausalLQ4xProjector,
@@ -16,8 +24,12 @@ from rl3dsr.models.wan.vae import WanVAE
 
 __all__ = [
     "CameraBatch",
+    "FullRREConditioner",
+    "FullRREContext",
     "GeometryConditioner",
+    "build_world_to_ray",
     "load_geometry_checkpoint",
+    "save_geometry_checkpoint",
     "CausalLQ4xProjector",
     "FrozenLQConditioner",
     "Stage1Degradation",

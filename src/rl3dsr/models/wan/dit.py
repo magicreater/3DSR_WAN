@@ -59,6 +59,7 @@ class WanDiT:
         *,
         token_residual: Tensor | None = None,
         block_token_residuals: Mapping[int, Tensor] | None = None,
+        camera_attention: tuple[object, object] | None = None,
     ) -> Tensor:
         if not isinstance(latents, Tensor) or latents.ndim != 5 or latents.shape[1] != 16:
             raise ValueError("latents must have shape [B,16,F,h,w]")
@@ -92,6 +93,15 @@ class WanDiT:
             if not torch.is_floating_point(residual) or not torch.isfinite(residual).all():
                 raise ValueError("token_residual must be finite floating values")
             residuals[block_index] = residual.to(device=self.device)
+        camera_adapter = camera_context = None
+        if camera_attention is not None:
+            if not isinstance(camera_attention, tuple) or len(camera_attention) != 2:
+                raise ValueError("camera_attention must be an (adapter, context) tuple")
+            camera_adapter, camera_context = camera_attention
+            if getattr(camera_adapter, "injection_mode", None) != "self_attention":
+                raise ValueError("camera attention adapter has an unsupported injection mode")
+            if int(getattr(camera_adapter, "branch_count", -1)) != len(self.model.blocks):
+                raise ValueError("camera attention branch count must match Wan blocks")
         autocast = (
             torch.autocast(device_type=self.device.type, dtype=model_dtype)
             if self.device.type in {"cuda", "cpu"} and model_dtype in {torch.float16, torch.bfloat16}
@@ -117,6 +127,34 @@ class WanDiT:
                         }
                         return (embedded + cast_residual, *args[1:])
                     handles.append(self.model.blocks[block_index].register_forward_pre_hook(inject_tokens))
+                if camera_adapter is not None:
+                    for block_index, block in enumerate(self.model.blocks):
+                        def inject_camera(
+                            _module,
+                            args,
+                            output,
+                            block_index=block_index,
+                        ):
+                            if not isinstance(output, Tensor) or not args or not isinstance(args[0], Tensor):
+                                raise RuntimeError("Wan self-attention hook received an invalid input/output")
+                            residual = camera_adapter.attention_residual(
+                                block_index,
+                                args[0],
+                                camera_context,
+                            )
+                            if residual.shape != output.shape or not torch.isfinite(residual).all():
+                                raise RuntimeError("full RRE residual must be finite and match self-attention output")
+                            cast_residual = residual.to(dtype=output.dtype)
+                            output_rms = output.detach().float().square().mean().sqrt()
+                            residual_rms = cast_residual.detach().float().square().mean().sqrt()
+                            stats = self.last_injection_stats.setdefault(block_index, {})
+                            stats.update({
+                                "attention_output_rms": output_rms,
+                                "camera_residual_rms": residual_rms,
+                                "camera_to_attention_rms": residual_rms / output_rms.clamp_min(1e-12),
+                            })
+                            return output + cast_residual
+                        handles.append(block.self_attn.register_forward_hook(inject_camera))
                 with autocast:
                     outputs = self.model(samples, timesteps.to(self.device), contexts, seq_len)
             finally:
