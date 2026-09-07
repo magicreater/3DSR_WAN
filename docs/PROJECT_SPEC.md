@@ -272,22 +272,33 @@ Implement and validate:
 
 Initially verify structure using forward passes, shapes, parameter counts, and controlled ablations before expensive training.
 
-### Stage 3 — Supervised 3DSR training
+### Stage 3 — Pose-aware cross-view LR fusion
 
-Train the adapted model on multi-view SR.
+Implement a static-3D-only LR evidence router between the frozen LR encoder
+and the existing bridge. Compare matched A0-A3 arms: no fusion, same-view
+attention, visual cross-view attention, and epipolar-biased cross-view
+attention. Preserve the full RRE camera path and bypass fusion for temporal
+4DSR inputs.
+
+Validate structure, controlled auxiliary-view interventions, and small shared
+multi-scene training before claiming a cross-view or geometry contribution.
+
+### Stage 4 — First large-scale supervised 3DSR training
+
+Train the selected Stage 3 architecture at the intended 3DSR scale.
 
 Evaluate:
 
-- per-view reconstruction quality;
-- perceptual quality;
-- cross-view consistency;
-- geometry-related consistency where measurable.
+- per-view reconstruction and perceptual quality;
+- held-out-scene generalization;
+- causal use of auxiliary LR views and camera correspondence;
+- cross-view and downstream reconstruction consistency where measurable.
 
-This stage establishes the primary 3DSR model.
+This stage establishes the primary supervised 3DSR baseline.
 
-### Stage 4 — 4DSR extension
+### Stage 5 — 4DSR extension
 
-Enable supervised training/evaluation on single-view video.
+Enable supervised training/evaluation on single-view video as a distinct later stage.
 
 Reuse:
 
@@ -299,9 +310,11 @@ Preserve the native temporal modeling required by video.
 
 Evaluate spatial SR quality together with temporal consistency.
 
-### Stage 5 — RL / post-training
+### Stage 6 — RL / post-training
 
-After a strong supervised baseline exists, investigate RL or other post-training methods.
+Only after Stage 4 establishes a strong supervised 3DSR baseline, investigate
+RL or other post-training methods. Stage 3 implementation or small-scale gains
+alone are insufficient grounds for RL.
 
 Potential signals may include:
 
