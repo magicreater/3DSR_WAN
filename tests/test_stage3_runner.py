@@ -118,6 +118,42 @@ def test_training_state_restores_all_rng_streams(runner, tmp_path):
     assert all(torch.equal(left, right) for left, right in zip(actual[2:], expected[2:]))
 
 
+def test_training_state_restores_target_dropout_rng(runner):
+    class Cycle:
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state):
+            assert state == {}
+
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(()))])
+    cycle = Cycle()
+    view_generator = torch.Generator().manual_seed(29)
+    noise_generator = torch.Generator().manual_seed(39)
+    dropout_generator = torch.Generator().manual_seed(49)
+    state = runner._training_state(
+        optimizer, cycle, view_generator, noise_generator, 7, dropout_generator
+    )
+    expected = torch.rand(3, generator=dropout_generator)
+    dropout_generator.manual_seed(99)
+    runner._restore_training_state(
+        state, optimizer, cycle, view_generator, noise_generator, dropout_generator
+    )
+    assert torch.equal(torch.rand(3, generator=dropout_generator), expected)
+
+
+def test_target_drop_intervention_only_hides_target_lr(runner):
+    lr = torch.ones(1, 3, 4, 2, 2)
+    camera = object()
+    changed, changed_camera, mask = runner._intervention(
+        lr, camera, "target_drop", torch.Generator().manual_seed(1)
+    )
+    assert changed_camera is camera
+    assert changed[:, :, 0].count_nonzero() == 0
+    assert torch.equal(changed[:, :, 1:], lr[:, :, 1:])
+    assert mask.shape == (1, 4) and mask.all()
+
+
 def test_output_directory_never_overwrites(runner, tmp_path):
     (tmp_path / "existing").write_text("keep")
     with pytest.raises(ValueError, match="empty"):

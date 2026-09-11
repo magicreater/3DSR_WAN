@@ -31,6 +31,11 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
     with pytest.raises(ValueError, match="Unknown"):
         load_stage3_config(path)
     assert Stage3Config().final_inference_seeds == (3302, 3303, 3304)
+    assert Stage3Config(target_lr_dropout=0.5).target_lr_dropout == 0.5
+    with pytest.raises(ValueError, match="target_lr_dropout"):
+        replace(Stage3Config(), target_lr_dropout=1.0)
+    with pytest.raises(ValueError, match="target_lr_dropout"):
+        replace(Stage3Config(), target_lr_dropout=-0.1)
 
 
 def test_interventions_preserve_target_and_inputs():

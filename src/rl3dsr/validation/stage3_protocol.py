@@ -49,6 +49,7 @@ class Stage3Config:
     fusion_heads: int = 3
     query_chunk_size: int = 128
     epipolar_tau: float = 1.0
+    target_lr_dropout: float = 0.0
 
     def __post_init__(self):
         if self.arm not in ARM_MODES:
@@ -71,6 +72,9 @@ class Stage3Config:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        value = self.target_lr_dropout
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value < 1:
+            raise ValueError("target_lr_dropout must be finite and in [0, 1)")
         for group in (self.training_seeds, self.final_inference_seeds):
             if not isinstance(group, tuple) or not group or any(type(v) is not int or v < 0 for v in group) or len(set(group)) != len(group):
                 raise ValueError("seed lists must contain distinct nonnegative integers")

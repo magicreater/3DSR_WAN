@@ -395,7 +395,8 @@ def _load_seen_groups(path: Path, config: Stage3Config, subset: str,
     return payload, [available[item] for item in selected]
 
 
-def _training_state(optimizer, sigma_cycle, view_generator, noise_generator, step):
+def _training_state(optimizer, sigma_cycle, view_generator, noise_generator, step,
+                    dropout_generator=None):
     numpy_state = np.random.get_state()
     state = {
         "step": step,
@@ -413,6 +414,8 @@ def _training_state(optimizer, sigma_cycle, view_generator, noise_generator, ste
         },
         "torch_rng_state": torch.get_rng_state(),
     }
+    if dropout_generator is not None:
+        state["dropout_generator_state"] = dropout_generator.get_state()
     if torch.cuda.is_available():
         state["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
     return state
@@ -433,11 +436,14 @@ def _validate_runtime_inputs(args, *, checkpoint: Path | None = None) -> None:
         raise ValueError("Stage 3 checkpoint must be an existing file")
 
 
-def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise_generator):
+def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise_generator,
+                            dropout_generator=None):
     optimizer.load_state_dict(state["optimizer"])
     sigma_cycle.load_state_dict(state["sigma_cycle"])
     view_generator.set_state(state["view_generator_state"])
     noise_generator.set_state(state["noise_generator_state"])
+    if dropout_generator is not None and "dropout_generator_state" in state:
+        dropout_generator.set_state(state["dropout_generator_state"])
     random.setstate(state["python_rng_state"])
     numpy_state = state["numpy_rng_state"]
     np.random.set_state((
@@ -473,7 +479,9 @@ def _train(args, config: Stage3Config) -> None:
             raise ValueError("resume manifest is missing")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         expected_config = json.loads(json.dumps(config.to_dict()))
-        if manifest.get("config") != expected_config or manifest.get("provenance", {}).get("training_seed") != args.seed:
+        manifest_config = dict(manifest.get("config") or {})
+        manifest_config.setdefault("target_lr_dropout", 0.0)
+        if manifest_config != expected_config or manifest.get("provenance", {}).get("training_seed") != args.seed:
             raise ValueError("resume manifest does not match config and training seed")
         start_step = resume_step + 1
         if start_step > config.steps:
@@ -503,12 +511,13 @@ def _train(args, config: Stage3Config) -> None:
     )
     view_generator = torch.Generator().manual_seed(args.seed + 2000)
     noise_generator = torch.Generator(device=runtime.device).manual_seed(args.seed + 3000)
+    dropout_generator = torch.Generator().manual_seed(args.seed + 4000)
     if runtime.checkpoint is not None:
         state = runtime.checkpoint.get("training_state")
         if not isinstance(state, dict) or state.get("step") != start_step - 1:
             raise ValueError("resume checkpoint has no matching training state")
         _restore_training_state(
-            state, optimizer, sigma_cycle, view_generator, noise_generator
+            state, optimizer, sigma_cycle, view_generator, noise_generator, dropout_generator
         )
     provenance = {
         "training_seed": args.seed,
@@ -535,7 +544,7 @@ def _train(args, config: Stage3Config) -> None:
     for step in range(start_step, config.steps + 1):
         step_started = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        losses, scenes, view_groups, sigmas = [], [], [], []
+        losses, scenes, view_groups, sigmas, target_lr_dropped = [], [], [], [], []
         for micro in range(config.gradient_accumulation):
             scene = config.train_scenes[
                 ((step - 1) * config.gradient_accumulation + micro) % len(config.train_scenes)
@@ -543,6 +552,13 @@ def _train(args, config: Stage3Config) -> None:
             indices, hr, lr, camera = _load_group(
                 args.dataset_root, scene, "train", config, view_generator, runtime.device
             )
+            dropped = (
+                config.target_lr_dropout > 0
+                and float(torch.rand((), generator=dropout_generator)) < config.target_lr_dropout
+            )
+            if dropped:
+                lr = lr.clone()
+                lr[:, :, 0] = 0
             with torch.no_grad():
                 clean = runtime.vae.encode_multiview(hr)
             prepared = runtime.module.prepare_multiview(
@@ -574,6 +590,7 @@ def _train(args, config: Stage3Config) -> None:
             scenes.append(scene)
             view_groups.append(indices)
             sigmas.append(float(sigma))
+            target_lr_dropped.append(bool(dropped))
         if any(p.grad is None or not torch.isfinite(p.grad).all() for p in trainable):
             raise RuntimeError("trainable adapter gradient is missing or non-finite")
         if any(p.grad is not None for p in runtime.dit.model.parameters()):
@@ -595,6 +612,8 @@ def _train(args, config: Stage3Config) -> None:
             "scenes": scenes,
             "view_indices": view_groups,
             "sigmas": sigmas,
+            "target_lr_dropped": target_lr_dropped,
+            "target_lr_drop_count": sum(target_lr_dropped),
             "elapsed_seconds": elapsed_prior + time.perf_counter() - started,
             "step_seconds": time.perf_counter() - step_started,
             "peak_gpu_memory_mib": torch.cuda.max_memory_allocated(runtime.device) / 2**20,
@@ -610,7 +629,8 @@ def _train(args, config: Stage3Config) -> None:
                 step=step,
                 provenance=provenance,
                 training_state=_training_state(
-                    optimizer, sigma_cycle, view_generator, noise_generator, step
+                    optimizer, sigma_cycle, view_generator, noise_generator, step,
+                    dropout_generator,
                 ),
             )
 
@@ -636,6 +656,11 @@ class _PerFrameLPIPS(torch.nn.Module):
 def _intervention(lr, camera, mode, generator):
     if mode in {"correct", "correct_repeat"}:
         return intervene_lr(lr, camera, "correct", target=0, generator=generator)
+    if mode == "target_drop":
+        changed = lr.clone()
+        changed[:, :, 0] = 0
+        mask = torch.ones(lr.shape[0], lr.shape[2], dtype=torch.bool, device=lr.device)
+        return changed, camera, mask
     if mode == "local_patch":
         h, w = lr.shape[-2:]
         return intervene_lr(
@@ -682,6 +707,58 @@ def _metric_row(metrics: dict, *, config: Stage3Config, training_seed, checkpoin
     }
 
 
+def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch,
+                         clean_shape: tuple[int, ...], config: Stage3Config,
+                         changed_lr: torch.Tensor, fusion_camera: CameraBatch,
+                         source_mask: torch.Tensor, group: dict, condition: str) -> dict:
+    """Measure how an intervention changes prepared and bridge residual features."""
+    correct = runtime.module.prepare_multiview(
+        lr, camera, tuple(clean_shape[2:]), (config.image_size, config.image_size)
+    )
+    changed = runtime.module.prepare_multiview(
+        changed_lr,
+        fusion_camera,
+        tuple(clean_shape[2:]),
+        (config.image_size, config.image_size),
+        source_mask=source_mask,
+    )
+    delta = (correct.float() - changed.float()).reshape(
+        correct.shape[0], tuple(clean_shape[2:])[0], -1, correct.shape[-1]
+    )
+    correct_views = correct.float().reshape_as(delta)
+    timestep = torch.full(
+        (correct.shape[0],), 0.5, device=correct.device, dtype=torch.float32
+    )
+    bridge_correct = runtime.module.conditioner.bridge_residuals(correct, timestep)
+    bridge_changed = runtime.module.conditioner.bridge_residuals(changed, timestep)
+    bridge = {}
+    for block in sorted(bridge_correct):
+        block_delta = bridge_correct[block].float() - bridge_changed[block].float()
+        bridge["block_" + str(block)] = {
+            "correct_norm": float(bridge_correct[block].float().norm()),
+            "delta_norm": float(block_delta.norm()),
+            "relative_delta": float(
+                block_delta.norm() / bridge_correct[block].float().norm().clamp_min(1e-12)
+            ),
+        }
+    return {
+        "group_id": group["id"],
+        "scene": group["scene"],
+        "view_index": group["anchor"],
+        "condition": condition,
+        "feature_norm": float(correct.float().norm()),
+        "feature_delta_norm": float(delta.norm()),
+        "feature_relative_delta": float(
+            delta.norm() / correct.float().norm().clamp_min(1e-12)
+        ),
+        "view_relative_delta": [
+            float(delta[:, view].norm() / correct_views[:, view].norm().clamp_min(1e-12))
+            for view in range(delta.shape[1])
+        ],
+        "bridge": bridge,
+    }
+
+
 def _write_evaluation(output: Path, rows: list[dict], baseline_rows: list[dict], summary: dict) -> None:
     for name, values in (("evaluation_rows", rows), ("baseline_rows", baseline_rows)):
         with (output / f"{name}.jsonl").open("x", encoding="utf-8") as stream:
@@ -721,7 +798,7 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
     payload = runtime.checkpoint or {}
     step = int(payload.get("step", -1))
     training_seed = payload.get("provenance", {}).get("training_seed")
-    rows, baseline_rows = [], []
+    rows, baseline_rows, diagnostic_rows = [], [], []
     scene_order = {scene: index for index, scene in enumerate(config.train_scenes)}
     for group in groups:
         _, hr, lr, camera = _load_indices(
@@ -773,6 +850,21 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                     changed_lr, fusion_camera, source_mask = _intervention(
                         lr, camera, mode, intervention_generator
                     )
+                    if getattr(args, "save_diagnostics", False) and mode not in {"correct", "correct_repeat"}:
+                        diagnostic_rows.append(
+                            _feature_diagnostics(
+                                runtime,
+                                lr,
+                                camera,
+                                tuple(clean.shape),
+                                config,
+                                changed_lr,
+                                fusion_camera,
+                                source_mask,
+                                group,
+                                mode,
+                            )
+                        )
                     latent = sample_latents(
                         runtime,
                         changed_lr,
@@ -826,8 +918,13 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
             "seen_manifest": str(args.seen_manifest.resolve()),
             "seen_manifest_sha256": _sha256(args.seen_manifest),
             "dataset_manifest": manifest["datasets"],
+            "diagnostics": bool(diagnostic_rows),
         },
     )
+    if diagnostic_rows:
+        with (output / "diagnostics.jsonl").open("x", encoding="utf-8") as stream:
+            for row in diagnostic_rows:
+                stream.write(json.dumps(row, allow_nan=False, sort_keys=True) + "\n")
 
 
 def _evaluate(
@@ -1001,9 +1098,10 @@ def _parser() -> argparse.ArgumentParser:
     seen.add_argument(
         "--modes",
         nargs="+",
-        choices=("correct", "correct_repeat", "remove", "duplicate", "shuffle_camera"),
+        choices=("correct", "correct_repeat", "target_drop", "remove", "duplicate", "shuffle_camera"),
         default=("correct",),
     )
+    seen.add_argument("--save-diagnostics", action="store_true")
     seen.add_argument("--group-ids", nargs="+")
     seen.add_argument("--save-images", action="store_true")
     freeze = subparsers.add_parser("freeze")

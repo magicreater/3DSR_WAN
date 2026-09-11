@@ -82,8 +82,14 @@ def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config:
     payload = torch.load(Path(path), map_location="cpu", weights_only=True)
     if payload.get("format") != "rl3dsr-stage3" or payload.get("format_version") != 1:
         raise ValueError("unsupported Stage 3 checkpoint; initialize old bridges with load_adapter_checkpoint")
-    if expected_config is not None and payload.get("config") != json.loads(json.dumps(expected_config)):
-        raise ValueError("Stage 3 checkpoint config mismatch")
+    if expected_config is not None:
+        saved_config = dict(payload.get("config") or {})
+        expected = json.loads(json.dumps(expected_config))
+        # Stage 3.1 adds a default-off training knob; old Stage 3 bundles remain valid.
+        saved_config.setdefault("target_lr_dropout", 0.0)
+        expected.setdefault("target_lr_dropout", 0.0)
+        if saved_config != expected:
+            raise ValueError("Stage 3 checkpoint config mismatch")
     expected_arch = {"blocks": list(module.conditioner.bridge_blocks),
                      "time_conditioning": module.conditioner.bridge_time_conditioning}
     if payload.get("bridge_architecture") != expected_arch:

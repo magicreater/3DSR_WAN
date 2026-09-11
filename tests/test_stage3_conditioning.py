@@ -87,6 +87,17 @@ def test_checkpoint_roundtrip_and_mismatch_rejected_before_loading(tmp_path):
         save_stage3_checkpoint(path, module, config={}, step=9, provenance={})
 
 
+def test_old_checkpoint_config_defaults_new_dropout_field(tmp_path):
+    module = bundle()
+    path = tmp_path / "stage3-old.pt"
+    save_stage3_checkpoint(path, module, config={"arm": "A3"}, step=8, provenance={})
+    target = bundle()
+    payload = load_stage3_checkpoint(
+        path, target, expected_config={"arm": "A3", "target_lr_dropout": 0.0}
+    )
+    assert payload["config"] == {"arm": "A3"}
+
+
 def test_multiview_entry_rejects_temporal_instead_of_flattening_it():
     with pytest.raises(ValueError, match="multiview"):
         bundle().prepare_multiview(torch.rand(1, 3, 2, 8, 8), camera("temporal"), (2, 4, 4), (32, 32))
