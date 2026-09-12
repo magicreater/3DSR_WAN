@@ -44,11 +44,29 @@ class Stage3Conditioning(nn.Module):
         fused = self.fusion(shaped, camera, (height // 2, width // 2), source_mask=source_mask)
         return fused.reshape_as(features)
 
-    def predict(self, dit, sample, timestep, context, prepared_features, camera, latent_shape):
-        """Consume prepared features without invoking LR encoding or fusion."""
+    def predict(
+        self,
+        dit,
+        sample,
+        timestep,
+        context,
+        prepared_features,
+        camera,
+        latent_shape,
+        *,
+        geometry_camera=None,
+    ):
+        """Consume prepared features and use an explicit camera for geometry.
+
+        ``camera`` remains the backwards-compatible positional argument. A
+        separate ``geometry_camera`` makes intervention scope explicit: the
+        camera used by LR fusion need not be the one seen by the Wan geometry
+        adapter. When omitted, both paths intentionally use ``camera``.
+        """
+        geometry_camera = camera if geometry_camera is None else geometry_camera
         return conditioned_prediction(
             dit, self.conditioner, sample, timestep, context, prepared_features,
-            geometry_adapter=self.geometry, camera=camera, latent_shape=latent_shape)
+            geometry_adapter=self.geometry, camera=geometry_camera, latent_shape=latent_shape)
 
 
 def _states(module: Stage3Conditioning):
@@ -85,9 +103,13 @@ def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config:
     if expected_config is not None:
         saved_config = dict(payload.get("config") or {})
         expected = json.loads(json.dumps(expected_config))
-        # Stage 3.1 adds a default-off training knob; old Stage 3 bundles remain valid.
+        # Stage 3.1 adds default-off knobs; old Stage 3 bundles remain valid.
         saved_config.setdefault("target_lr_dropout", 0.0)
+        saved_config.setdefault("epipolar_attention", "global_bias")
+        saved_config.setdefault("epipolar_band", 1.5)
         expected.setdefault("target_lr_dropout", 0.0)
+        expected.setdefault("epipolar_attention", "global_bias")
+        expected.setdefault("epipolar_band", 1.5)
         if saved_config != expected:
             raise ValueError("Stage 3 checkpoint config mismatch")
     expected_arch = {"blocks": list(module.conditioner.bridge_blocks),

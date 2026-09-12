@@ -49,6 +49,8 @@ class Stage3Config:
     fusion_heads: int = 3
     query_chunk_size: int = 128
     epipolar_tau: float = 1.0
+    epipolar_attention: str = "global_bias"
+    epipolar_band: float = 1.5
     target_lr_dropout: float = 0.0
 
     def __post_init__(self):
@@ -68,10 +70,12 @@ class Stage3Config:
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        for name in ("learning_rate", "weight_decay", "gradient_clip", "sampling_shift", "epipolar_tau"):
+        for name in ("learning_rate", "weight_decay", "gradient_clip", "sampling_shift", "epipolar_tau", "epipolar_band"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.epipolar_attention not in {"global_bias", "local_band"}:
+            raise ValueError("epipolar_attention must be global_bias or local_band")
         value = self.target_lr_dropout
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value < 1:
             raise ValueError("target_lr_dropout must be finite and in [0, 1)")
@@ -209,6 +213,41 @@ def intervene_lr(lr: Tensor, camera: CameraBatch, mode: str, *, target: int = 0,
         result[:, :, source, y0:y1, x0:x1] = 0
     else:
         raise ValueError(f"unknown intervention {mode}")
+    return result, replace(camera, K=k, T_world_from_camera=t), mask
+
+
+def shuffle_auxiliary_pairs(
+    lr: Tensor,
+    camera: CameraBatch,
+    *,
+    target: int = 0,
+    generator: torch.Generator | None = None,
+) -> tuple[Tensor, CameraBatch, Tensor]:
+    """Cyclically permute auxiliary LR/camera pairs while preserving target 0.
+
+    The returned tensors keep the target view at ``target`` and apply the same
+    non-zero auxiliary permutation to both the image evidence and its camera.
+    This is the explicit pair-alignment intervention used by Stage 3.1.
+    """
+    if lr.ndim != 5 or lr.shape[1] != 3:
+        raise ValueError("LR must be [B,3,V,H,W]")
+    camera.validate(batch=lr.shape[0])
+    if camera.sequence_kind != "multiview" or camera.K.shape[1] != lr.shape[2]:
+        raise ValueError("LR views require aligned multiview cameras")
+    if not 0 <= target < lr.shape[2]:
+        raise ValueError("target is out of range")
+    aux = [index for index in range(lr.shape[2]) if index != target]
+    if len(aux) < 2:
+        raise ValueError("pair shuffling requires at least two auxiliary views")
+    shift = int(torch.randint(1, len(aux), (), generator=generator))
+    shuffled = aux[shift:] + aux[:shift]
+    result = lr.clone()
+    result[:, :, aux] = lr[:, :, shuffled]
+    k = camera.K.clone()
+    t = camera.T_world_from_camera.clone()
+    k[:, aux] = camera.K[:, shuffled]
+    t[:, aux] = camera.T_world_from_camera[:, shuffled]
+    mask = torch.ones(lr.shape[0], lr.shape[2], dtype=torch.bool, device=lr.device)
     return result, replace(camera, K=k, T_world_from_camera=t), mask
 
 

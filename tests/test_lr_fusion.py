@@ -49,7 +49,7 @@ class FusionTests(unittest.TestCase):
         self.assertFalse(bool(valid[0, 0, 0]))
 
     def test_noop_and_bypasses(self):
-        for mode in ('off', 'same_view', 'visual', 'epipolar'):
+        for mode in ('off', 'same_view', 'visual', 'epipolar', 'epipolar_local'):
             model = LRViewFusion(12, 12, 3, mode=mode)
             self.assertTrue(torch.equal(model(self.x, self.cam, (2, 3)), self.x))
         model = active()
@@ -93,6 +93,14 @@ class FusionTests(unittest.TestCase):
         model = active()
         model(self.x, self.cam, (2, 3)).square().sum().backward()
         self.assertGreater(float(model.qkv.weight.grad.abs().sum()), 0)
+
+    def test_local_epipolar_mode_is_finite_and_uses_a_band(self):
+        model = active('epipolar_local')
+        output = model(self.x, self.cam, (2, 3))
+        self.assertTrue(bool(torch.isfinite(output).all()))
+        self.assertEqual(model.epipolar_band, 1.5)
+        with self.assertRaises(ValueError):
+            LRViewFusion(12, 12, 3, mode='epipolar_local', epipolar_band=0)
 
     def test_bfloat16_features_with_float32_weights(self):
         model = active()

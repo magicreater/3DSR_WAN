@@ -53,6 +53,7 @@ from rl3dsr.validation.stage3_protocol import (
     load_stage3_config,
     nearest_view_indices,
     sample_view_indices,
+    shuffle_auxiliary_pairs,
     select_candidate,
 )
 
@@ -200,12 +201,16 @@ def load_runtime(
         )
     fusion = None
     if config.fusion_mode != "off":
+        fusion_mode = config.fusion_mode
+        if fusion_mode == "epipolar" and config.epipolar_attention == "local_band":
+            fusion_mode = "epipolar_local"
         fusion = LRViewFusion(
             hidden_dim=config.fusion_dim,
             heads=config.fusion_heads,
-            mode=config.fusion_mode,
+            mode=fusion_mode,
             query_chunk_size=config.query_chunk_size,
             tau=config.epipolar_tau,
+            epipolar_band=config.epipolar_band,
         ).to(device)
     module = Stage3Conditioning(conditioner, geometry, fusion).to(device)
     payload = None
@@ -214,6 +219,41 @@ def load_runtime(
             stage3_checkpoint, module, expected_config=config.to_dict()
         )
     return Runtime(module, vae, dit, device, payload)
+
+
+def _camera_digest(camera: CameraBatch) -> str:
+    """Hash canonical camera tensors for intervention provenance."""
+    camera.validate()
+    digest = hashlib.sha256()
+    for value in (camera.K, camera.T_world_from_camera):
+        tensor = value.detach().float().cpu().contiguous()
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+    digest.update(str(camera.image_size).encode("ascii"))
+    digest.update(camera.sequence_kind.encode("ascii"))
+    digest.update(str(camera.reference_index).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _scalar_diagnostics(payload) -> dict[str, dict[str, float]]:
+    """Convert module diagnostics to JSON-safe scalar summaries."""
+    result: dict[str, dict[str, float]] = {}
+    if not isinstance(payload, dict):
+        return result
+    for block, values in payload.items():
+        if not isinstance(values, dict):
+            continue
+        converted = {}
+        for name, value in values.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    continue
+                value = value.detach().float().item()
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value):
+                converted[str(name)] = float(value)
+        if converted:
+            result[str(block)] = converted
+    return result
 
 
 def sample_latents(
@@ -225,16 +265,20 @@ def sample_latents(
     image_size: int,
     *,
     fusion_camera: CameraBatch | None = None,
+    geometry_camera: CameraBatch | None = None,
     source_mask: torch.Tensor | None = None,
     sampler=sample_conditioned_flow,
     seed: int = 0,
     sampling_shift: float = 5.0,
     dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
+    return_diagnostics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict]:
     latent_shape = tuple(initial_shape[2:])
+    fusion_camera = camera if fusion_camera is None else fusion_camera
+    geometry_camera = camera if geometry_camera is None else geometry_camera
     prepared = runtime.module.prepare_multiview(
         lr,
-        fusion_camera if fusion_camera is not None else camera,
+        fusion_camera,
         latent_shape,
         (image_size, image_size),
         source_mask=source_mask,
@@ -244,25 +288,44 @@ def sample_latents(
     context = torch.zeros(
         initial_shape[0], 512, 4096, device=runtime.device, dtype=dtype
     )
+    velocity_trace: list[torch.Tensor] = []
+    geometry_trace: list[dict[str, dict[str, float]]] = []
+    injection_trace: list[dict[str, dict[str, float]]] = []
 
     def predict_velocity(sample, timestep, text_context, features):
-        return runtime.module.predict(
+        velocity = runtime.module.predict(
             runtime.dit,
             sample,
             timestep,
             text_context,
             features,
-            camera,
+            geometry_camera,
             latent_shape,
         )
+        if return_diagnostics:
+            velocity_trace.append(velocity.detach().float().cpu())
+            geometry_trace.append(_scalar_diagnostics(getattr(runtime.module.geometry, "last_diagnostics", {})))
+            injection_trace.append(_scalar_diagnostics(getattr(runtime.dit, "last_injection_stats", {})))
+        return velocity
 
-    return sampler(
+    sampled = sampler(
         noise,
         prepared,
         context,
         predict_velocity=predict_velocity,
         config=FlowSamplingConfig(sampling_steps, sampling_shift),
     )
+    if not return_diagnostics:
+        return sampled
+    return sampled, {
+        "prepared_features": prepared.detach().float().cpu(),
+        "velocity_trace": velocity_trace,
+        "geometry_trace": geometry_trace,
+        "injection_trace": injection_trace,
+        "initial_noise": noise.detach().float().cpu(),
+        "fusion_camera_sha256": _camera_digest(fusion_camera),
+        "geometry_camera_sha256": _camera_digest(geometry_camera),
+    }
 
 
 def _camera(observations, resolution: int, device: torch.device) -> CameraBatch:
@@ -654,16 +717,43 @@ class _PerFrameLPIPS(torch.nn.Module):
 
 
 def _intervention(lr, camera, mode, generator):
+    """Return LR, fusion camera, geometry camera and source mask.
+
+    The old ``shuffle_camera`` name is retained as a compatibility alias for
+    the historical fusion-only intervention. New audits should use the
+    explicit ``shuffle_fusion``, ``shuffle_geometry`` or ``shuffle_all`` modes.
+    """
     if mode in {"correct", "correct_repeat"}:
-        return intervene_lr(lr, camera, "correct", target=0, generator=generator)
+        changed, changed_camera, mask = intervene_lr(
+            lr, camera, "correct", target=0, generator=generator
+        )
+        return changed, changed_camera, changed_camera, mask
     if mode == "target_drop":
         changed = lr.clone()
         changed[:, :, 0] = 0
         mask = torch.ones(lr.shape[0], lr.shape[2], dtype=torch.bool, device=lr.device)
-        return changed, camera, mask
+        return changed, camera, camera, mask
+    if mode in {"shuffle_fusion", "shuffle_geometry", "shuffle_all", "shuffle_camera"}:
+        _, shuffled_camera, mask = intervene_lr(
+            lr, camera, "shuffle_camera", target=0, generator=generator
+        )
+        if mode in {"shuffle_geometry", "shuffle_all"}:
+            geometry_camera = shuffled_camera
+        else:
+            geometry_camera = camera
+        if mode in {"shuffle_fusion", "shuffle_all", "shuffle_camera"}:
+            fusion_camera = shuffled_camera
+        else:
+            fusion_camera = camera
+        return lr.clone(), fusion_camera, geometry_camera, mask
+    if mode == "shuffle_pair":
+        changed, shuffled_camera, mask = shuffle_auxiliary_pairs(
+            lr, camera, target=0, generator=generator
+        )
+        return changed, shuffled_camera, shuffled_camera, mask
     if mode == "local_patch":
         h, w = lr.shape[-2:]
-        return intervene_lr(
+        changed, changed_camera, mask = intervene_lr(
             lr,
             camera,
             mode,
@@ -672,7 +762,11 @@ def _intervention(lr, camera, mode, generator):
             box=(h // 4, w // 4, max(h // 4 + 1, h // 2), max(w // 4 + 1, w // 2)),
             generator=generator,
         )
-    return intervene_lr(lr, camera, mode, target=0, generator=generator)
+        return changed, changed_camera, changed_camera, mask
+    changed, changed_camera, mask = intervene_lr(
+        lr, camera, mode, target=0, generator=generator
+    )
+    return changed, changed_camera, changed_camera, mask
 
 
 def _save_frame(path: Path, video: torch.Tensor) -> None:
@@ -710,6 +804,7 @@ def _metric_row(metrics: dict, *, config: Stage3Config, training_seed, checkpoin
 def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch,
                          clean_shape: tuple[int, ...], config: Stage3Config,
                          changed_lr: torch.Tensor, fusion_camera: CameraBatch,
+                         geometry_camera: CameraBatch,
                          source_mask: torch.Tensor, group: dict, condition: str) -> dict:
     """Measure how an intervention changes prepared and bridge residual features."""
     correct = runtime.module.prepare_multiview(
@@ -746,7 +841,13 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
         "scene": group["scene"],
         "view_index": group["anchor"],
         "condition": condition,
+        "correct_camera_sha256": _camera_digest(camera),
+        "fusion_camera_sha256": _camera_digest(fusion_camera),
+        "geometry_camera_sha256": _camera_digest(geometry_camera),
+        "fusion_camera_changed": _camera_digest(camera) != _camera_digest(fusion_camera),
+        "geometry_camera_changed": _camera_digest(camera) != _camera_digest(geometry_camera),
         "feature_norm": float(correct.float().norm()),
+        "prepared_feature_delta": float(delta.norm()),
         "feature_delta_norm": float(delta.norm()),
         "feature_relative_delta": float(
             delta.norm() / correct.float().norm().clamp_min(1e-12)
@@ -756,6 +857,54 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
             for view in range(delta.shape[1])
         ],
         "bridge": bridge,
+    }
+
+
+def _trace_delta(correct: dict, changed: dict) -> dict:
+    """Compare per-step diagnostics captured with identical initial noise."""
+    correct_velocities = correct.get("velocity_trace", [])
+    changed_velocities = changed.get("velocity_trace", [])
+    if len(correct_velocities) != len(changed_velocities):
+        raise RuntimeError("diagnostic velocity traces have different lengths")
+    velocity_deltas = []
+    for reference, value in zip(correct_velocities, changed_velocities):
+        reference = reference.float()
+        value = value.float()
+        delta = (reference - value).norm()
+        velocity_deltas.append({
+            "absolute": float(delta),
+            "relative": float(delta / reference.norm().clamp_min(1e-12)),
+        })
+
+    def block_delta(key: str) -> list[dict[str, float]]:
+        reference_trace = correct.get(key, [])
+        changed_trace = changed.get(key, [])
+        if len(reference_trace) != len(changed_trace):
+            raise RuntimeError(f"diagnostic {key} traces have different lengths")
+        rows = []
+        for reference, value in zip(reference_trace, changed_trace):
+            blocks = sorted(set(reference) | set(value))
+            row = {}
+            for block in blocks:
+                ref_values = reference.get(block, {})
+                changed_values = value.get(block, {})
+                ref_rms = float(ref_values.get("residual_rms", ref_values.get("camera_residual_rms", 0.0)))
+                changed_rms = float(changed_values.get("residual_rms", changed_values.get("camera_residual_rms", 0.0)))
+                row[str(block)] = {
+                    "absolute_rms_delta": abs(ref_rms - changed_rms),
+                    "relative_rms_delta": abs(ref_rms - changed_rms) / max(abs(ref_rms), 1e-12),
+                }
+            rows.append(row)
+        return rows
+
+    geometry_deltas = block_delta("geometry_trace")
+    injection_deltas = block_delta("injection_trace")
+    return {
+        "per_step_velocity_delta": velocity_deltas,
+        "per_step_velocity_delta_mean": float(np.mean([row["absolute"] for row in velocity_deltas])) if velocity_deltas else 0.0,
+        "per_step_velocity_delta_relative_mean": float(np.mean([row["relative"] for row in velocity_deltas])) if velocity_deltas else 0.0,
+        "per_block_geometry_residual_delta": geometry_deltas,
+        "per_block_injection_delta": injection_deltas,
     }
 
 
@@ -843,29 +992,16 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                     + scene_order[group["scene"]] * 1_000
                     + group["anchor"]
                 )
+                mode_diagnostics = {}
+                mode_interventions = {}
                 for mode_index, mode in enumerate(args.modes):
                     intervention_generator = torch.Generator().manual_seed(
                         sample_seed * 10 + mode_index
                     )
-                    changed_lr, fusion_camera, source_mask = _intervention(
+                    changed_lr, fusion_camera, geometry_camera, source_mask = _intervention(
                         lr, camera, mode, intervention_generator
                     )
-                    if getattr(args, "save_diagnostics", False) and mode not in {"correct", "correct_repeat"}:
-                        diagnostic_rows.append(
-                            _feature_diagnostics(
-                                runtime,
-                                lr,
-                                camera,
-                                tuple(clean.shape),
-                                config,
-                                changed_lr,
-                                fusion_camera,
-                                source_mask,
-                                group,
-                                mode,
-                            )
-                        )
-                    latent = sample_latents(
+                    sampled = sample_latents(
                         runtime,
                         changed_lr,
                         camera,
@@ -873,11 +1009,20 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                         config.sampling_steps,
                         config.image_size,
                         fusion_camera=fusion_camera,
+                        geometry_camera=geometry_camera,
                         source_mask=source_mask,
                         seed=sample_seed,
                         sampling_shift=config.sampling_shift,
                         dtype=torch.bfloat16,
+                        return_diagnostics=getattr(args, "save_diagnostics", False),
                     )
+                    if getattr(args, "save_diagnostics", False):
+                        latent, mode_diagnostics[mode] = sampled
+                        mode_interventions[mode] = (
+                            changed_lr, fusion_camera, geometry_camera, source_mask
+                        )
+                    else:
+                        latent = sampled
                     decoded = runtime.vae.decode_multiview(latent)[:, :, :1]
                     item = frame_metrics(decoded, target, perceptual_metric=metric)[0]
                     rows.append(_metric_row(
@@ -896,6 +1041,30 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                             / f"seed_{inference_seed}" / f"{mode}.png"
                         )
                         _save_frame(image_path, decoded)
+                if getattr(args, "save_diagnostics", False) and "correct" in mode_diagnostics:
+                    for mode, intervention in mode_interventions.items():
+                        if mode == "correct":
+                            continue
+                        changed_lr, fusion_camera, geometry_camera, source_mask = intervention
+                        diagnostic = _feature_diagnostics(
+                            runtime,
+                            lr,
+                            camera,
+                            tuple(clean.shape),
+                            config,
+                            changed_lr,
+                            fusion_camera,
+                            geometry_camera,
+                            source_mask,
+                            group,
+                            mode,
+                        )
+                        diagnostic.update(_trace_delta(mode_diagnostics["correct"], mode_diagnostics[mode]))
+                        diagnostic.update({
+                            "inference_seed": inference_seed,
+                            "sample_seed": sample_seed,
+                        })
+                        diagnostic_rows.append(diagnostic)
     expected = len(groups) * len(args.inference_seeds) * len(args.modes)
     if len(rows) != expected or len(baseline_rows) != len(groups) * 2:
         raise RuntimeError("seen-view evaluation row count mismatch")
@@ -915,6 +1084,7 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
             "groups": len(groups),
             "rows": len(rows),
             "baseline_rows": len(baseline_rows),
+            "diagnostic_rows": len(diagnostic_rows),
             "seen_manifest": str(args.seen_manifest.resolve()),
             "seen_manifest_sha256": _sha256(args.seen_manifest),
             "dataset_manifest": manifest["datasets"],
@@ -973,7 +1143,7 @@ def _evaluate(
                         intervention_generator = torch.Generator().manual_seed(
                             inference_seed * 1000000 + scene_index * 10000 + group * 100 + mode_index
                         )
-                        changed_lr, fusion_camera, source_mask = _intervention(
+                        changed_lr, fusion_camera, geometry_camera, source_mask = _intervention(
                             lr, camera, mode, intervention_generator
                         )
                         latent = sample_latents(
@@ -984,6 +1154,7 @@ def _evaluate(
                             config.sampling_steps,
                             config.image_size,
                             fusion_camera=fusion_camera,
+                            geometry_camera=geometry_camera,
                             source_mask=source_mask,
                             seed=inference_seed * 10000 + group,
                             sampling_shift=config.sampling_shift,
@@ -1084,9 +1255,13 @@ def _parser() -> argparse.ArgumentParser:
     intervene.add_argument(
         "--modes",
         nargs="+",
-        choices=("correct", "remove", "duplicate", "shuffle_camera", "local_patch"),
+        choices=(
+            "correct", "remove", "duplicate", "shuffle_camera", "shuffle_fusion",
+            "shuffle_geometry", "shuffle_all", "shuffle_pair", "local_patch",
+        ),
         default=("correct", "remove", "duplicate", "shuffle_camera", "local_patch"),
     )
+    intervene.add_argument("--save-diagnostics", action="store_true")
     seen = subparsers.add_parser("seen-eval")
     seen.add_argument("--config", type=Path, required=True)
     _add_runtime_paths(seen)
@@ -1098,7 +1273,11 @@ def _parser() -> argparse.ArgumentParser:
     seen.add_argument(
         "--modes",
         nargs="+",
-        choices=("correct", "correct_repeat", "target_drop", "remove", "duplicate", "shuffle_camera"),
+        choices=(
+            "correct", "correct_repeat", "target_drop", "remove", "duplicate",
+            "shuffle_camera", "shuffle_fusion", "shuffle_geometry", "shuffle_all",
+            "shuffle_pair",
+        ),
         default=("correct",),
     )
     seen.add_argument("--save-diagnostics", action="store_true")

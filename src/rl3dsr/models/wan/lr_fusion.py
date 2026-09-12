@@ -76,9 +76,10 @@ class LRViewFusion(nn.Module):
         mode: str = 'epipolar',
         query_chunk_size: int = 128,
         tau: float = 1.0,
+        epipolar_band: float = 1.5,
     ) -> None:
         super().__init__()
-        if mode not in {'off', 'same_view', 'visual', 'epipolar'}:
+        if mode not in {'off', 'same_view', 'visual', 'epipolar', 'epipolar_local'}:
             raise ValueError('invalid LR fusion mode')
         dimensions = (feature_dim, hidden_dim, heads, query_chunk_size)
         if any(type(value) is not int or value < 1 for value in dimensions):
@@ -87,12 +88,15 @@ class LRViewFusion(nn.Module):
             raise ValueError('positive dimensions required and hidden_dim must divide heads')
         if isinstance(tau, bool) or not isinstance(tau, (int, float)) or not math.isfinite(tau) or tau <= 0:
             raise ValueError('query_chunk_size and finite tau must be positive')
+        if isinstance(epipolar_band, bool) or not isinstance(epipolar_band, (int, float)) or not math.isfinite(epipolar_band) or epipolar_band <= 0:
+            raise ValueError('epipolar_band must be finite and positive')
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         self.heads = heads
         self.mode = mode
         self.query_chunk_size = query_chunk_size
         self.tau = float(tau)
+        self.epipolar_band = float(epipolar_band)
         self.qkv = nn.Linear(feature_dim, hidden_dim * 3, bias=False)
         self.output = nn.Linear(hidden_dim, feature_dim, bias=False)
         nn.init.zeros_(self.output.weight)
@@ -155,7 +159,7 @@ class LRViewFusion(nn.Module):
             )
             pixels = torch.stack((xx, yy, torch.ones_like(xx)), -1).reshape(patches, 3)
             matrices, valid = (None, None)
-            if self.mode == 'epipolar':
+            if self.mode in {'epipolar', 'epipolar_local'}:
                 matrices, valid = patch_fundamental_matrices(camera, patch_grid)
             key_allowed = None
             if source_mask is not None:
@@ -175,6 +179,14 @@ class LRViewFusion(nn.Module):
                     bias = (-dist2 / (2 * self.tau**2)).clamp(-20, 0)
                     bias = torch.where(usable[..., None], bias, torch.zeros_like(bias))
                     logits[..., :tokens] = logits[..., :tokens] + bias.reshape(b, stop - start, tokens)[:, None]
+                    if self.mode == 'epipolar_local':
+                        # Keep a null candidate and fall back to global keys for
+                        # degenerate camera pairs; otherwise restrict each query
+                        # to a finite epipolar band in source patch coordinates.
+                        allowed = (~usable[..., None]) | (dist2 <= self.epipolar_band ** 2)
+                        logits[..., :tokens] = logits[..., :tokens].masked_fill(
+                            ~allowed.reshape(b, stop - start, tokens)[:, None], -torch.inf
+                        )
                 if self.mode == 'same_view':
                     allowed = query_views[:, None] == view_ids[None, :]
                     logits[..., :tokens] = logits[..., :tokens].masked_fill(~allowed[None, None], -torch.inf)

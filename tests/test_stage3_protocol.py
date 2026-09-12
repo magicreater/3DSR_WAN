@@ -8,7 +8,7 @@ from rl3dsr.models.wan.geometry_conditioning import CameraBatch
 from rl3dsr.validation.stage3_protocol import (
     Stage3Config, claim_final_evaluation, evenly_spaced_indices, freeze_candidate,
     intervene_lr, load_frozen_candidate, load_stage3_config, nearest_view_indices,
-    sample_view_indices, select_candidate,
+    sample_view_indices, select_candidate, shuffle_auxiliary_pairs,
 )
 
 
@@ -32,6 +32,9 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
         load_stage3_config(path)
     assert Stage3Config().final_inference_seeds == (3302, 3303, 3304)
     assert Stage3Config(target_lr_dropout=0.5).target_lr_dropout == 0.5
+    assert Stage3Config(epipolar_attention="local_band").epipolar_band == 1.5
+    with pytest.raises(ValueError, match="epipolar_attention"):
+        replace(Stage3Config(), epipolar_attention="invalid")
     with pytest.raises(ValueError, match="target_lr_dropout"):
         replace(Stage3Config(), target_lr_dropout=1.0)
     with pytest.raises(ValueError, match="target_lr_dropout"):
@@ -64,6 +67,21 @@ def test_interventions_preserve_target_and_inputs():
         intervene_lr(lr, cam, "local_patch", target=1, source=1, box=(0, 0, 2, 2))
     with pytest.raises(ValueError):
         intervene_lr(lr[:, :, :2], camera(2), "shuffle_camera")
+
+
+def test_shuffle_auxiliary_pairs_keeps_target_and_reorders_matching_camera():
+    lr = torch.arange(1 * 3 * 4 * 2 * 2).reshape(1, 3, 4, 2, 2).float()
+    cam = camera()
+    original = lr.clone()
+    changed, changed_cam, mask = shuffle_auxiliary_pairs(
+        lr, cam, target=0, generator=torch.Generator().manual_seed(3)
+    )
+    assert torch.equal(changed[:, :, 0], original[:, :, 0])
+    assert torch.equal(changed_cam.T_world_from_camera[:, 0], cam.T_world_from_camera[:, 0])
+    assert mask.shape == (1, 4) and mask.all()
+    for view in range(1, 4):
+        source = int(changed_cam.T_world_from_camera[0, view, 0, 3].item())
+        assert torch.equal(changed[:, :, view], original[:, :, source])
 
 
 def test_view_sampling_is_reproducible():

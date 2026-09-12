@@ -385,6 +385,7 @@ class GeometryConditioner(nn.Module):
             result[int(key)] = residual
             diagnostics[int(key)] = {
                 "residual_rms": residual.detach().float().square().mean().sqrt(),
+                "residual_abs_mean": residual.detach().float().abs().mean(),
                 "hidden_rms": hidden.detach().float().square().mean().sqrt(),
             }
         self.last_diagnostics = diagnostics
@@ -523,6 +524,7 @@ class FullRREConditioner(nn.Module):
         self.last_diagnostics[block_index] = {
             "input_rms": tokens.detach().float().square().mean().sqrt(),
             "residual_rms": residual.detach().float().square().mean().sqrt(),
+            "residual_abs_mean": residual.detach().float().abs().mean(),
         }
         return residual
 

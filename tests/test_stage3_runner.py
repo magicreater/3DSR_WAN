@@ -62,6 +62,49 @@ def test_fusion_prepared_once_and_camera_intervention_isolated(runner):
     assert calls == [("prepare", fusion_camera)] + [("predict", original)] * 3
 
 
+def test_sample_latents_uses_explicit_geometry_camera_and_captures_diagnostics(runner):
+    calls = []
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+    original = CameraBatch(
+        torch.eye(3).repeat(1, 2, 1, 1),
+        torch.eye(4).repeat(1, 2, 1, 1),
+        (16, 16),
+        "multiview",
+    )
+    fusion_camera = original
+    geometry_camera = original
+    features = torch.ones(1, 8, 4)
+    module = SimpleNamespace(
+        prepare_multiview=lambda lr, cam, shape, size, **kw: calls.append(("prepare", cam)) or features,
+        predict=lambda dit, x, t, c, f, cam, shape: calls.append(("predict", cam)) or torch.zeros_like(x),
+        geometry=SimpleNamespace(last_diagnostics={}),
+    )
+    dit = SimpleNamespace(last_injection_stats={})
+    runtime = SimpleNamespace(module=module, dit=dit, device=torch.device("cpu"))
+
+    def sampler(noise, prepared, context, *, predict_velocity, config):
+        predict_velocity(noise, torch.zeros(1), context, prepared)
+        return noise
+
+    result, diagnostics = runner.sample_latents(
+        runtime,
+        torch.zeros(1, 3, 2, 2, 2),
+        original,
+        (1, 16, 2, 2, 2),
+        5,
+        16,
+        fusion_camera=fusion_camera,
+        geometry_camera=geometry_camera,
+        sampler=sampler,
+        dtype=torch.float32,
+        return_diagnostics=True,
+    )
+    assert result.shape == (1, 16, 2, 2, 2)
+    assert calls == [("prepare", fusion_camera), ("predict", geometry_camera)]
+    assert len(diagnostics["velocity_trace"]) == 1
+    assert diagnostics["prepared_features"].shape == (1, 8, 4)
+
+
 def test_resume_requires_matching_log_tail(runner, tmp_path):
     path = tmp_path / "train_steps.jsonl"
     path.write_text('{"step":1}\n{"step":2}\n')
@@ -145,13 +188,41 @@ def test_training_state_restores_target_dropout_rng(runner):
 def test_target_drop_intervention_only_hides_target_lr(runner):
     lr = torch.ones(1, 3, 4, 2, 2)
     camera = object()
-    changed, changed_camera, mask = runner._intervention(
+    changed, fusion_camera, geometry_camera, mask = runner._intervention(
         lr, camera, "target_drop", torch.Generator().manual_seed(1)
     )
-    assert changed_camera is camera
+    assert fusion_camera is camera and geometry_camera is camera
     assert changed[:, :, 0].count_nonzero() == 0
     assert torch.equal(changed[:, :, 1:], lr[:, :, 1:])
     assert mask.shape == (1, 4) and mask.all()
+
+
+def test_camera_intervention_scopes_are_explicit(runner):
+    lr = torch.ones(1, 3, 4, 2, 2)
+    camera = SimpleNamespace()
+    camera.K = torch.eye(3).repeat(1, 4, 1, 1)
+    camera.T_world_from_camera = torch.eye(4).repeat(1, 4, 1, 1)
+    camera.T_world_from_camera[0, :, 0, 3] = torch.arange(4)
+    camera.image_size = (2, 2)
+    camera.sequence_kind = "multiview"
+    camera.reference_index = 0
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+    camera = CameraBatch(camera.K, camera.T_world_from_camera, camera.image_size, camera.sequence_kind)
+    for mode in ("shuffle_fusion", "shuffle_geometry", "shuffle_all"):
+        changed, fusion_camera, geometry_camera, mask = runner._intervention(
+            lr, camera, mode, torch.Generator().manual_seed(4)
+        )
+        assert torch.equal(changed, lr)
+        assert mask.all()
+        if mode == "shuffle_fusion":
+            assert fusion_camera.T_world_from_camera.equal(geometry_camera.T_world_from_camera) is False
+            assert geometry_camera.T_world_from_camera.equal(camera.T_world_from_camera)
+        elif mode == "shuffle_geometry":
+            assert fusion_camera.T_world_from_camera.equal(camera.T_world_from_camera)
+            assert geometry_camera.T_world_from_camera.equal(fusion_camera.T_world_from_camera) is False
+        else:
+            assert fusion_camera.T_world_from_camera.equal(geometry_camera.T_world_from_camera)
+            assert fusion_camera.T_world_from_camera.equal(camera.T_world_from_camera) is False
 
 
 def test_output_directory_never_overwrites(runner, tmp_path):
@@ -242,7 +313,11 @@ def test_seen_eval_writes_target_only_rows_and_images(runner, tmp_path, monkeypa
     monkeypatch.setattr(runner, "load_runtime", lambda *args, **kwargs: runtime)
     monkeypatch.setattr(runner, "_load_indices", lambda *args, **kwargs: (group["indices"], hr, lr, object()))
     monkeypatch.setattr(runner, "_PerFrameLPIPS", lambda device: object())
-    monkeypatch.setattr(runner, "_intervention", lambda value, camera, mode, generator: (value, camera, None))
+    monkeypatch.setattr(
+        runner,
+        "_intervention",
+        lambda value, camera, mode, generator: (value, camera, camera, None),
+    )
 
     def sample_latents(*args, seed, **kwargs):
         sample_seeds.append(seed)
