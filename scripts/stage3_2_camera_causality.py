@@ -1033,6 +1033,59 @@ def _clean_log(path: Path) -> bool:
         and re.search(r"\bnan\b", text, flags=re.IGNORECASE) is None
 
 
+def _frozen_hash_matches(path: Path, expected: str | None) -> bool:
+    return path.is_file() and expected is not None and sha256_file(path) == expected
+
+
+def phase_b_frozen_hash_checks(campaign_root: Path, protocol: dict) -> dict[str, bool]:
+    baseline_rows = Path(protocol["baseline_eval"]) / "evaluation_rows.jsonl"
+    return {
+        "seen_manifest_hash": _frozen_hash_matches(
+            Path(protocol["seen_manifest"]), protocol.get("seen_manifest_sha256")
+        ),
+        "baseline_evaluation_rows_hash": _frozen_hash_matches(
+            baseline_rows, protocol.get("baseline_evaluation_rows_sha256")
+        ),
+        "baseline_checkpoint_hash": _frozen_hash_matches(
+            Path(protocol["baseline_checkpoint"]), protocol.get("baseline_checkpoint_sha256")
+        ),
+        "bridge_checkpoint_hash": _frozen_hash_matches(
+            Path(protocol["bridge_checkpoint"]), protocol.get("bridge_checkpoint_sha256")
+        ),
+        "phase_a_summary_hash": _frozen_hash_matches(
+            campaign_root / "analysis" / "phase_a_summary.json",
+            protocol.get("phase_a_summary_sha256"),
+        ),
+    }
+
+
+def phase_c_frozen_hash_checks(campaign_root: Path, protocol: dict) -> dict[str, bool]:
+    no_self_rows = Path(protocol["no_self_baseline_eval"]) / "evaluation_rows.jsonl"
+    self_allowed_rows = Path(protocol["self_allowed_baseline_eval"]) / "evaluation_rows.jsonl"
+    return {
+        "seen_manifest_hash": _frozen_hash_matches(
+            Path(protocol["seen_manifest"]), protocol.get("seen_manifest_sha256")
+        ),
+        "no_self_baseline_rows_hash": _frozen_hash_matches(
+            no_self_rows, protocol.get("no_self_baseline_rows_sha256")
+        ),
+        "no_self_baseline_checkpoint_hash": _frozen_hash_matches(
+            Path(protocol["no_self_baseline_checkpoint"]),
+            protocol.get("no_self_baseline_checkpoint_sha256"),
+        ),
+        "self_allowed_baseline_rows_hash": _frozen_hash_matches(
+            self_allowed_rows, protocol.get("self_allowed_baseline_rows_sha256")
+        ),
+        "bridge_checkpoint_hash": _frozen_hash_matches(
+            Path(protocol["bridge_checkpoint"]), protocol.get("bridge_checkpoint_sha256")
+        ),
+        "phase_b_summary_hash": _frozen_hash_matches(
+            campaign_root / "analysis" / "phase_b_pilot_summary.json",
+            protocol.get("phase_b_summary_sha256"),
+        ),
+    }
+
+
 def phase_b_integrity(args) -> dict:
     checks: dict[str, bool] = {}
     details: dict[str, object] = {}
@@ -1056,6 +1109,7 @@ def phase_b_integrity(args) -> dict:
         checks["analysis_git_pushed"] = (
             _git_revision(args.repo_root) == _origin_master_revision(args.repo_root)
         )
+        checks.update(phase_b_frozen_hash_checks(args.campaign_root, protocol))
         checks["config_hash"] = sha256_file(config_path) == protocol["config_sha256"]
         checks["no_self_config"] = config.allow_self_view_source is False
         checks["continuous_1000_steps"] = (
@@ -1106,6 +1160,12 @@ def phase_b_integrity(args) -> dict:
     return {"pass": bool(checks) and all(checks.values()), "checks": checks, "details": details}
 
 
+def phase_b_next_action(gate: dict, integrity: dict) -> str:
+    if not integrity.get("pass"):
+        return "AUDIT_INVALID"
+    return "RUN_2000_STEP_REPLICATION" if gate.get("pass") else "PROCEED_PHASE_C"
+
+
 def analyze_phase_b_pilot(args) -> dict:
     protocol = read_json(args.campaign_root / "phase_b" / "protocol.json")
     candidate = _phase_b_eval_payload(
@@ -1127,7 +1187,7 @@ def analyze_phase_b_pilot(args) -> dict:
         "self_allowed_baseline": baseline,
         "integrity": integrity,
         "gate": gate,
-        "next": "RUN_2000_STEP_REPLICATION" if gate["pass"] else "PROCEED_PHASE_C",
+        "next": phase_b_next_action(gate, integrity),
     }
     analysis = args.campaign_root / "analysis"
     write_json(analysis / "phase_b_pilot_summary.json", result)
@@ -1414,6 +1474,7 @@ def phase_c_integrity(args) -> dict:
         checkpoint_path = train_dir / "stage3_step_1000.pt"
         checks["experiment_git_pushed"] = protocol["git_revision"] == protocol["origin_master_revision"]
         checks["analysis_git_pushed"] = _git_revision(args.repo_root) == _origin_master_revision(args.repo_root)
+        checks.update(phase_c_frozen_hash_checks(args.campaign_root, protocol))
         checks["config_hash"] = sha256_file(config_path) == protocol["config_sha256"]
         checks["ranking_config"] = (
             config.allow_self_view_source is False

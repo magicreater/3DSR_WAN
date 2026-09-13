@@ -96,6 +96,8 @@ def test_mask_statistics_conserve_cross_key_counts():
     assert stats["cross_keys_per_query"] == pytest.approx(expected)
     assert 0 <= stats["cross_key_retention"] <= 1
     assert stats["valid_pair_ratio"] == 1
+    assert 0 <= stats["usable_query_pair_ratio"] <= 1
+    assert 0 <= stats["in_bounds_query_pair_ratio"] <= 1
 
 
 def test_mask_statistics_normalize_usable_pairs_across_batch():
@@ -175,6 +177,79 @@ def test_phase_a_decision_rejects_failed_integrity():
         integrity_pass=False,
     )
     assert decision == {"verdict": "AUDIT_INVALID", "proceed_phase_b": False}
+
+
+def test_phase_b_next_action_stops_on_failed_integrity():
+    driver = load_driver()
+    assert driver.phase_b_next_action({"pass": False}, {"pass": False}) == "AUDIT_INVALID"
+    assert driver.phase_b_next_action({"pass": False}, {"pass": True}) == "PROCEED_PHASE_C"
+    assert driver.phase_b_next_action({"pass": True}, {"pass": True}) == "RUN_2000_STEP_REPLICATION"
+
+
+def test_phase_b_frozen_hash_checks_detect_upstream_drift(tmp_path):
+    driver = load_driver()
+    campaign = tmp_path / "campaign"
+    paths = {
+        "seen_manifest": tmp_path / "seen.json",
+        "baseline_eval": tmp_path / "baseline",
+        "baseline_checkpoint": tmp_path / "baseline.pt",
+        "bridge_checkpoint": tmp_path / "bridge.pt",
+        "phase_a_summary": campaign / "analysis" / "phase_a_summary.json",
+    }
+    for path in paths.values():
+        target = path / "evaluation_rows.jsonl" if path == paths["baseline_eval"] else path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(target), encoding="utf-8")
+    protocol = {
+        "seen_manifest": str(paths["seen_manifest"]),
+        "seen_manifest_sha256": driver.sha256_file(paths["seen_manifest"]),
+        "baseline_eval": str(paths["baseline_eval"]),
+        "baseline_evaluation_rows_sha256": driver.sha256_file(paths["baseline_eval"] / "evaluation_rows.jsonl"),
+        "baseline_checkpoint": str(paths["baseline_checkpoint"]),
+        "baseline_checkpoint_sha256": driver.sha256_file(paths["baseline_checkpoint"]),
+        "bridge_checkpoint": str(paths["bridge_checkpoint"]),
+        "bridge_checkpoint_sha256": driver.sha256_file(paths["bridge_checkpoint"]),
+        "phase_a_summary_sha256": driver.sha256_file(paths["phase_a_summary"]),
+    }
+    assert all(driver.phase_b_frozen_hash_checks(campaign, protocol).values())
+    (paths["baseline_eval"] / "evaluation_rows.jsonl").write_text("drift", encoding="utf-8")
+    checks = driver.phase_b_frozen_hash_checks(campaign, protocol)
+    assert checks["baseline_evaluation_rows_hash"] is False
+
+
+def test_phase_c_frozen_hash_checks_cover_both_baselines(tmp_path):
+    driver = load_driver()
+    campaign = tmp_path / "campaign"
+    files = {
+        "seen_manifest": tmp_path / "seen.json",
+        "no_self_rows": tmp_path / "no_self" / "evaluation_rows.jsonl",
+        "no_self_checkpoint": tmp_path / "no_self.pt",
+        "self_allowed_rows": tmp_path / "self_allowed" / "evaluation_rows.jsonl",
+        "bridge_checkpoint": tmp_path / "bridge.pt",
+        "phase_b_summary": campaign / "analysis" / "phase_b_pilot_summary.json",
+    }
+    for path in files.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(path), encoding="utf-8")
+    protocol = {
+        "seen_manifest": str(files["seen_manifest"]),
+        "seen_manifest_sha256": driver.sha256_file(files["seen_manifest"]),
+        "no_self_baseline_eval": str(files["no_self_rows"].parent),
+        "no_self_baseline_rows_sha256": driver.sha256_file(files["no_self_rows"]),
+        "no_self_baseline_checkpoint": str(files["no_self_checkpoint"]),
+        "no_self_baseline_checkpoint_sha256": driver.sha256_file(files["no_self_checkpoint"]),
+        "self_allowed_baseline_eval": str(files["self_allowed_rows"].parent),
+        "self_allowed_baseline_rows_sha256": driver.sha256_file(files["self_allowed_rows"]),
+        "bridge_checkpoint": str(files["bridge_checkpoint"]),
+        "bridge_checkpoint_sha256": driver.sha256_file(files["bridge_checkpoint"]),
+        "phase_b_summary_sha256": driver.sha256_file(files["phase_b_summary"]),
+    }
+    checks = driver.phase_c_frozen_hash_checks(campaign, protocol)
+    assert set(checks) == {
+        "seen_manifest_hash", "no_self_baseline_rows_hash", "no_self_baseline_checkpoint_hash",
+        "self_allowed_baseline_rows_hash", "bridge_checkpoint_hash", "phase_b_summary_hash",
+    }
+    assert all(checks.values())
 
 
 def test_phase_b_config_changes_only_self_source_switch():
