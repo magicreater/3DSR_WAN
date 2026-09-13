@@ -85,6 +85,27 @@ def test_mask_statistics_normalize_usable_pairs_across_batch():
     )
 
 
+def test_mask_statistics_do_not_call_out_of_frame_lines_zero_key_queries(monkeypatch):
+    driver = load_driver()
+    camera = yaw_camera([0, 30])
+    matrices = torch.zeros(1, 2, 2, 3, 3)
+    matrices[..., 0] = 1
+    matrices[..., 2] = 100  # x + 100 = 0 never intersects the patch extent.
+    valid = torch.ones(1, 2, 2, dtype=torch.bool)
+    monkeypatch.setattr(driver, "patch_fundamental_matrices", lambda *_: (matrices, valid))
+    monkeypatch.setattr(
+        driver,
+        "epipolar_local_key_mask",
+        lambda *_args, **_kwargs: (
+            torch.zeros(1, 2, 2, dtype=torch.bool),
+            torch.ones(1, 2, 2, dtype=torch.bool),
+        ),
+    )
+    _, stats = driver._mask_stats(camera, (1, 1), 1.5)
+    assert stats["in_bounds_query_nonempty_ratio"] == 0
+    assert stats["zero_key_query_pair_count"] == 0
+
+
 def test_output_gate_requires_thresholds_and_three_probe_directions():
     driver = load_driver()
     deltas = [

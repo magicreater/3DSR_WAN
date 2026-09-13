@@ -192,11 +192,12 @@ def mask_comparison(correct: torch.Tensor, wrong: torch.Tensor) -> dict[str, flo
 
 def _mask_stats(camera: CameraBatch, patch_grid: tuple[int, int], band: float) -> tuple[torch.Tensor, dict]:
     allowed, usable = epipolar_local_key_mask(camera, patch_grid, band=band)
-    _, valid = patch_fundamental_matrices(camera, patch_grid)
+    matrices, valid = patch_fundamental_matrices(camera, patch_grid)
     batch, queries, keys = allowed.shape
     views = camera.K.shape[1]
     patches = keys // views
     query_views = torch.arange(queries, device=allowed.device) // patches
+    query_patches = torch.arange(queries, device=allowed.device) % patches
     source_views = torch.arange(views, device=allowed.device)
     cross_pairs = query_views[:, None] != source_views[None]
     cross_keys = cross_pairs.repeat_interleave(patches, dim=1)
@@ -204,9 +205,22 @@ def _mask_stats(camera: CameraBatch, patch_grid: tuple[int, int], band: float) -
     by_source = allowed.reshape(batch, queries, views, patches)
     usable_cross = usable & cross_pairs[None]
     nonempty = by_source.any(dim=-1)
+    gh, gw = patch_grid
+    query_pixels = torch.stack((
+        query_patches.remainder(gw).float() + 0.5,
+        query_patches.div(gw, rounding_mode="floor").float() + 0.5,
+        torch.ones_like(query_patches, dtype=torch.float32),
+    ), dim=-1)
+    lines = torch.einsum("bqvij,qj->bqvi", matrices[:, query_views], query_pixels)
+    corners = lines.new_tensor(((0, 0, 1), (gw, 0, 1), (0, gh, 1), (gw, gh, 1)))
+    corner_values = torch.einsum("bqvi,ci->bqvc", lines, corners)
+    intersects_extent = (
+        corner_values.amin(dim=-1) <= 0
+    ) & (corner_values.amax(dim=-1) >= 0)
+    in_bounds_cross = usable_cross & intersects_extent
     in_bounds = (
-        float(nonempty[usable_cross].float().mean())
-        if bool(usable_cross.any())
+        float(nonempty[in_bounds_cross].float().mean())
+        if bool(in_bounds_cross.any())
         else 0.0
     )
     pair_cross = ~torch.eye(views, dtype=torch.bool, device=valid.device)
@@ -215,8 +229,11 @@ def _mask_stats(camera: CameraBatch, patch_grid: tuple[int, int], band: float) -
         "usable_query_pair_ratio": float(
             usable_cross.float().sum() / (batch * cross_pairs.sum()).clamp_min(1)
         ),
+        "in_bounds_query_pair_ratio": float(
+            in_bounds_cross.float().sum() / (batch * cross_pairs.sum()).clamp_min(1)
+        ),
         "in_bounds_query_nonempty_ratio": in_bounds,
-        "zero_key_query_pair_count": int((usable_cross & ~nonempty).sum()),
+        "zero_key_query_pair_count": int((in_bounds_cross & ~nonempty).sum()),
         "cross_key_retention": float(cross_allowed.float().sum() / (batch * cross_keys.sum()).clamp_min(1)),
         "cross_keys_per_query": float(cross_allowed.sum() / max(batch * queries, 1)),
     }
