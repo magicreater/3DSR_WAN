@@ -38,6 +38,33 @@ def yaw_camera(degrees):
     return CameraBatch(intrinsic, transform, (32, 32), "multiview")
 
 
+def test_gpu_idle_guard_ignores_processes_on_other_gpus(monkeypatch):
+    driver = load_driver()
+
+    def fake_check_output(command, **_kwargs):
+        query = " ".join(command)
+        if "query-compute-apps" in query:
+            return "GPU-other, 123, python, 4096 MiB\n"
+        return "0, GPU-selected, 2, 0\n1, GPU-other, 4098, 95\n"
+
+    monkeypatch.setattr(driver.subprocess, "check_output", fake_check_output)
+    driver._gpu_is_idle(0)
+
+
+def test_gpu_idle_guard_rejects_process_on_selected_gpu(monkeypatch):
+    driver = load_driver()
+
+    def fake_check_output(command, **_kwargs):
+        query = " ".join(command)
+        if "query-compute-apps" in query:
+            return "GPU-selected, 456, python, 1024 MiB\n"
+        return "0, GPU-selected, 1026, 90\n1, GPU-other, 2, 0\n"
+
+    monkeypatch.setattr(driver.subprocess, "check_output", fake_check_output)
+    with pytest.raises(RuntimeError, match="GPU work is already running"):
+        driver._gpu_is_idle(0)
+
+
 def test_far_donors_are_deterministic_unique_and_outside_group():
     driver = load_driver()
     camera = yaw_camera([0, 10, 20, 170, 180, -170, 90])

@@ -466,17 +466,17 @@ def _gpu_is_idle(gpu: int) -> None:
     processes = subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory", "--format=csv,noheader"],
         text=True,
-    ).strip()
-    if processes:
-        raise RuntimeError(f"GPU work is already running; refusing to share GPU {gpu}")
+    ).splitlines()
     rows = subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
+        ["nvidia-smi", "--query-gpu=index,uuid,memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
         text=True,
     ).splitlines()
     selected = next((line for line in rows if int(line.split(",")[0]) == gpu), None)
     if selected is None:
         raise RuntimeError(f"GPU {gpu} is not visible")
-    _, memory, utilization = [value.strip() for value in selected.split(",")]
+    _, gpu_uuid, memory, utilization = [value.strip() for value in selected.split(",")]
+    if any(line.split(",", 1)[0].strip() == gpu_uuid for line in processes if line.strip()):
+        raise RuntimeError(f"GPU work is already running; refusing to share GPU {gpu}")
     if float(memory) > 64 or float(utilization) > 1:
         raise RuntimeError(f"GPU {gpu} is not idle: memory={memory} MiB, utilization={utilization}%")
 
