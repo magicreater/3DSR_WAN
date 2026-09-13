@@ -784,16 +784,21 @@ def _mean_metrics(rows: list[dict]) -> dict[str, float]:
     return {metric: mean(float(row[metric]) for row in rows) for metric in METRICS}
 
 
-def _phase_b_eval_payload(eval_dir: Path) -> dict:
+def _phase_b_eval_payload(
+    eval_dir: Path,
+    *,
+    required_modes: tuple[str, ...] = PHASE_B_MODES,
+) -> dict:
     rows = read_jsonl(eval_dir / "evaluation_rows.jsonl")
     diagnostics = read_jsonl(eval_dir / "diagnostics.jsonl")
     indexed = {(row["condition"], row["group_id"]): row for row in rows}
-    expected = {(mode, group) for mode in PHASE_B_MODES for group in PROBE_IDS}
-    if set(indexed) != expected:
+    expected = {(mode, group) for mode in required_modes for group in PROBE_IDS}
+    if not expected.issubset(indexed):
         raise ValueError("Phase B evaluation identities do not match the frozen probe protocol")
     delta_rows = {
         mode: _paired_deltas(rows, "correct", mode)
         for mode in ("remove", "target_drop", "shuffle_fusion", "shuffle_geometry", "shuffle_pair")
+        if mode in required_modes
     }
     repeat_jitter = {
         metric: max(
@@ -809,7 +814,7 @@ def _phase_b_eval_payload(eval_dir: Path) -> dict:
     return {
         "means": {
             mode: _mean_metrics([indexed[(mode, group)] for group in PROBE_IDS])
-            for mode in PHASE_B_MODES
+            for mode in required_modes
         },
         "deltas": {mode: _mean_metrics(values) for mode, values in delta_rows.items()},
         "delta_rows": delta_rows,
@@ -1044,8 +1049,11 @@ def phase_b_integrity(args) -> dict:
         diagnostics = read_jsonl(eval_dir / "diagnostics.jsonl")
         summary = read_json(eval_dir / "evaluation_summary.json")
         checkpoint_path = train_dir / "stage3_step_1000.pt"
-        checks["pushed_git"] = (
-            protocol["git_revision"] == protocol["origin_master_revision"] == _git_revision(args.repo_root)
+        checks["experiment_git_pushed"] = (
+            protocol["git_revision"] == protocol["origin_master_revision"]
+        )
+        checks["analysis_git_pushed"] = (
+            _git_revision(args.repo_root) == _origin_master_revision(args.repo_root)
         )
         checks["config_hash"] = sha256_file(config_path) == protocol["config_sha256"]
         checks["no_self_config"] = config.allow_self_view_source is False
@@ -1102,13 +1110,18 @@ def analyze_phase_b_pilot(args) -> dict:
     candidate = _phase_b_eval_payload(
         args.campaign_root / "phase_b" / "eval" / "no_self" / "seed42"
     )
-    baseline = _phase_b_eval_payload(Path(protocol["baseline_eval"]))
+    baseline = _phase_b_eval_payload(
+        Path(protocol["baseline_eval"]),
+        required_modes=("correct", "correct_repeat", "target_drop", "shuffle_fusion"),
+    )
     integrity = phase_b_integrity(args)
     gate = phase_b_pilot_gate(candidate, baseline, integrity)
     result = {
         "scope": "stage3_2_camera_causality_phase_b_pilot",
         "claim_limit": "seen-train 3DSR camera-pair causality only",
         "stage4_status": "HOLD",
+        "training_git_revision": protocol["git_revision"],
+        "analysis_git_revision": _git_revision(args.repo_root),
         "candidate": candidate,
         "self_allowed_baseline": baseline,
         "integrity": integrity,

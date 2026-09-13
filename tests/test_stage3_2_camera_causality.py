@@ -1,5 +1,6 @@
 """CPU-only contracts for the staged camera-causality audit."""
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -183,3 +184,34 @@ def test_phase_b_pilot_gate_enforces_camera_gain_and_no_self_attention():
     assert driver.phase_b_pilot_gate(candidate, baseline, {"pass": True})["pass"]
     candidate["same_view_attention_mass"] = 1e-4
     assert not driver.phase_b_pilot_gate(candidate, baseline, {"pass": True})["pass"]
+
+
+def test_phase_b_payload_accepts_legacy_baseline_condition_set(tmp_path):
+    driver = load_driver()
+    conditions = (
+        "correct", "correct_repeat", "target_drop", "shuffle_fusion",
+        "shuffle_geometry", "shuffle_all", "shuffle_pair",
+    )
+    rows = [
+        {
+            "condition": condition,
+            "group_id": group,
+            "psnr": 30.0,
+            "ssim": 0.95,
+            "lpips": 0.03,
+            "mae": 0.01,
+        }
+        for condition in conditions
+        for group in driver.PROBE_IDS
+    ]
+    (tmp_path / "evaluation_rows.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    diagnostic = {"fusion_correct": {"fusion": {"same_view_attention_mass": 0.5}}}
+    (tmp_path / "diagnostics.jsonl").write_text(json.dumps(diagnostic) + "\n", encoding="utf-8")
+    payload = driver._phase_b_eval_payload(
+        tmp_path,
+        required_modes=("correct", "correct_repeat", "target_drop", "shuffle_fusion"),
+    )
+    assert set(payload["means"]) == {"correct", "correct_repeat", "target_drop", "shuffle_fusion"}
+    assert "remove" not in payload["deltas"]
