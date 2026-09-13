@@ -269,6 +269,18 @@ def test_seen_eval_parser_requires_explicit_scope_inputs(runner):
         parser.parse_args(["seen-eval", "--config", "a.json"])
 
 
+def test_trace_delta_rejects_different_initial_noise(runner):
+    reference = {
+        "initial_noise": torch.zeros(1),
+        "velocity_trace": [],
+        "geometry_trace": [],
+        "injection_trace": [],
+    }
+    changed = {**reference, "initial_noise": torch.ones(1)}
+    with pytest.raises(RuntimeError, match="different initial noise"):
+        runner._trace_delta(reference, changed)
+
+
 def test_seen_eval_writes_target_only_rows_and_images(runner, tmp_path, monkeypatch):
     from rl3dsr.validation.stage3_protocol import Stage3Config
 

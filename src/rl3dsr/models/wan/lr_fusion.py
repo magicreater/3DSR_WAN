@@ -97,6 +97,8 @@ class LRViewFusion(nn.Module):
         self.query_chunk_size = query_chunk_size
         self.tau = float(tau)
         self.epipolar_band = float(epipolar_band)
+        self.record_diagnostics = False
+        self.last_diagnostics: dict[str, dict[str, Tensor]] = {}
         self.qkv = nn.Linear(feature_dim, hidden_dim * 3, bias=False)
         self.output = nn.Linear(hidden_dim, feature_dim, bias=False)
         nn.init.zeros_(self.output.weight)
@@ -109,6 +111,7 @@ class LRViewFusion(nn.Module):
         *,
         source_mask: Tensor | None = None,
     ) -> Tensor:
+        self.last_diagnostics = {}
         if features.ndim != 4 or features.shape[-1] != self.feature_dim:
             raise ValueError('features must have shape [B,V,P,feature_dim]')
         b, views, patches, _ = features.shape
@@ -152,6 +155,16 @@ class LRViewFusion(nn.Module):
             k = torch.cat((k, null), dim=2)
             value = torch.cat((value, null), dim=2)
             view_ids = torch.arange(tokens, device=features.device) // patches
+            record = bool(self.record_diagnostics)
+            same_mass = features.new_zeros((), dtype=torch.float32)
+            cross_mass = features.new_zeros((), dtype=torch.float32)
+            null_mass = features.new_zeros((), dtype=torch.float32)
+            retained_key_ratio = features.new_zeros((), dtype=torch.float32)
+            attention_count = 0
+            key_count = 0
+            aux_source_ratio = features.new_tensor(1.0, dtype=torch.float32)
+            if record and source_mask is not None and views > 1:
+                aux_source_ratio = source_mask[:, 1:].float().mean()
             yy, xx = torch.meshgrid(
                 torch.arange(gh, device=features.device, dtype=torch.float32) + .5,
                 torch.arange(gw, device=features.device, dtype=torch.float32) + .5,
@@ -169,6 +182,11 @@ class LRViewFusion(nn.Module):
                 stop = min(tokens, start + self.query_chunk_size)
                 query_views = view_ids[start:stop]
                 logits = (q[:, :, start:stop] @ k.transpose(-1, -2)) / math.sqrt(head_dim)
+                allowed_keys = None
+                if record:
+                    allowed_keys = torch.ones(
+                        (b, stop - start, tokens), dtype=torch.bool, device=features.device
+                    )
                 if matrices is not None:
                     query_pixels = pixels[torch.arange(start, stop, device=features.device) % patches]
                     lines = torch.einsum('bqvij,qj->bqvi', matrices[:, query_views], query_pixels)
@@ -187,12 +205,39 @@ class LRViewFusion(nn.Module):
                         logits[..., :tokens] = logits[..., :tokens].masked_fill(
                             ~allowed.reshape(b, stop - start, tokens)[:, None], -torch.inf
                         )
+                        if record:
+                            allowed_keys = allowed_keys & allowed.reshape(b, stop - start, tokens)
                 if self.mode == 'same_view':
                     allowed = query_views[:, None] == view_ids[None, :]
                     logits[..., :tokens] = logits[..., :tokens].masked_fill(~allowed[None, None], -torch.inf)
+                    if record:
+                        allowed_keys = allowed_keys & allowed[None].expand(b, -1, -1)
                 if key_allowed is not None:
                     logits[..., :tokens] = logits[..., :tokens].masked_fill(~key_allowed[:, None, None, :], -torch.inf)
-                chunks.append(torch.softmax(logits, dim=-1) @ value)
+                    if record:
+                        allowed_keys = allowed_keys & key_allowed[:, None, :]
+                weights = torch.softmax(logits, dim=-1)
+                if record:
+                    same = query_views[:, None] == view_ids[None, :]
+                    non_null = weights[..., :tokens]
+                    same_mass = same_mass + (non_null * same[None, None]).sum()
+                    cross_mass = cross_mass + (non_null * (~same)[None, None]).sum()
+                    null_mass = null_mass + weights[..., tokens].sum()
+                    retained_key_ratio = retained_key_ratio + allowed_keys.float().mean() * (b * (stop - start))
+                    attention_count += b * self.heads * (stop - start)
+                    key_count += b * (stop - start)
+                chunks.append(weights @ value)
             fused = torch.cat(chunks, dim=2).transpose(1, 2).reshape(b, views, patches, self.hidden_dim)
+            if record:
+                self.last_diagnostics = {
+                    'fusion': {
+                        'same_view_attention_mass': (same_mass / attention_count).detach(),
+                        'cross_view_attention_mass': (cross_mass / attention_count).detach(),
+                        'null_attention_mass': (null_mass / attention_count).detach(),
+                        'attention_mass_total': ((same_mass + cross_mass + null_mass) / attention_count).detach(),
+                        'retained_key_ratio': (retained_key_ratio / max(key_count, 1)).detach(),
+                        'active_auxiliary_source_ratio': aux_source_ratio.detach(),
+                    }
+                }
         residual = self.output(fused.to(self.output.weight.dtype)).to(features.dtype)
         return features + residual

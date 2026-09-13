@@ -102,6 +102,24 @@ class FusionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             LRViewFusion(12, 12, 3, mode='epipolar_local', epipolar_band=0)
 
+    def test_optional_diagnostics_partition_attention_and_bound_keys(self):
+        model = active('epipolar_local')
+        model.record_diagnostics = True
+        model(self.x, self.cam, (2, 3))
+        stats = model.last_diagnostics['fusion']
+        self.assertAlmostEqual(float(stats['attention_mass_total']), 1.0, places=5)
+        self.assertGreaterEqual(float(stats['same_view_attention_mass']), 0.0)
+        self.assertGreaterEqual(float(stats['cross_view_attention_mass']), 0.0)
+        self.assertGreaterEqual(float(stats['null_attention_mass']), 0.0)
+        self.assertGreaterEqual(float(stats['retained_key_ratio']), 0.0)
+        self.assertLessEqual(float(stats['retained_key_ratio']), 1.0)
+        self.assertAlmostEqual(float(stats['active_auxiliary_source_ratio']), 1.0, places=6)
+
+    def test_diagnostics_are_disabled_by_default(self):
+        model = active('epipolar_local')
+        model(self.x, self.cam, (2, 3))
+        self.assertEqual(model.last_diagnostics, {})
+
     def test_bfloat16_features_with_float32_weights(self):
         model = active()
         features = self.x.to(torch.bfloat16)

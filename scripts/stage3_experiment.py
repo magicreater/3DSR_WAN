@@ -276,6 +276,9 @@ def sample_latents(
     latent_shape = tuple(initial_shape[2:])
     fusion_camera = camera if fusion_camera is None else fusion_camera
     geometry_camera = camera if geometry_camera is None else geometry_camera
+    fusion_module = getattr(runtime.module, "fusion", None)
+    if fusion_module is not None:
+        fusion_module.record_diagnostics = bool(return_diagnostics)
     prepared = runtime.module.prepare_multiview(
         lr,
         fusion_camera,
@@ -319,6 +322,9 @@ def sample_latents(
         return sampled
     return sampled, {
         "prepared_features": prepared.detach().float().cpu(),
+        "fusion_diagnostics": _scalar_diagnostics(
+            getattr(fusion_module, "last_diagnostics", {})
+        ),
         "velocity_trace": velocity_trace,
         "geometry_trace": geometry_trace,
         "injection_trace": injection_trace,
@@ -807,8 +813,14 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
                          geometry_camera: CameraBatch,
                          source_mask: torch.Tensor, group: dict, condition: str) -> dict:
     """Measure how an intervention changes prepared and bridge residual features."""
+    fusion_module = getattr(runtime.module, "fusion", None)
+    if fusion_module is not None:
+        fusion_module.record_diagnostics = True
     correct = runtime.module.prepare_multiview(
         lr, camera, tuple(clean_shape[2:]), (config.image_size, config.image_size)
+    )
+    correct_fusion = _scalar_diagnostics(
+        getattr(fusion_module, "last_diagnostics", {})
     )
     changed = runtime.module.prepare_multiview(
         changed_lr,
@@ -816,6 +828,9 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
         tuple(clean_shape[2:]),
         (config.image_size, config.image_size),
         source_mask=source_mask,
+    )
+    changed_fusion = _scalar_diagnostics(
+        getattr(fusion_module, "last_diagnostics", {})
     )
     delta = (correct.float() - changed.float()).reshape(
         correct.shape[0], tuple(clean_shape[2:])[0], -1, correct.shape[-1]
@@ -857,11 +872,15 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
             for view in range(delta.shape[1])
         ],
         "bridge": bridge,
+        "fusion_correct": correct_fusion,
+        "fusion_changed": changed_fusion,
     }
 
 
 def _trace_delta(correct: dict, changed: dict) -> dict:
     """Compare per-step diagnostics captured with identical initial noise."""
+    if not torch.equal(correct.get("initial_noise"), changed.get("initial_noise")):
+        raise RuntimeError("paired diagnostics used different initial noise")
     correct_velocities = correct.get("velocity_trace", [])
     changed_velocities = changed.get("velocity_trace", [])
     if len(correct_velocities) != len(changed_velocities):
