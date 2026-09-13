@@ -538,7 +538,7 @@ def write_report(args, results: list[dict], gate: dict) -> None:
     lines = [
         "# local_band 3DSR sufficiency",
         "",
-        "This is a Stage 3.1 seen-view gate before formal 4DSR Stage 4.",
+        "This is a Stage 3.1 seen-view gate before Stage 4 large-scale supervised 3DSR; 4DSR remains a separate Stage 5 route.",
         "It does not claim temporal consistency, held-out generalization, NVS or 3DGS.",
         "",
     ]

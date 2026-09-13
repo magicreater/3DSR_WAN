@@ -211,6 +211,7 @@ def load_runtime(
             query_chunk_size=config.query_chunk_size,
             tau=config.epipolar_tau,
             epipolar_band=config.epipolar_band,
+            allow_self_view_source=config.allow_self_view_source,
         ).to(device)
     module = Stage3Conditioning(conditioner, geometry, fusion).to(device)
     payload = None
@@ -267,6 +268,7 @@ def sample_latents(
     fusion_camera: CameraBatch | None = None,
     geometry_camera: CameraBatch | None = None,
     source_mask: torch.Tensor | None = None,
+    allow_self_view_source: bool | None = None,
     sampler=sample_conditioned_flow,
     seed: int = 0,
     sampling_shift: float = 5.0,
@@ -285,6 +287,7 @@ def sample_latents(
         latent_shape,
         (image_size, image_size),
         source_mask=source_mask,
+        allow_self_view_source=allow_self_view_source,
     )
     generator = torch.Generator(device=runtime.device).manual_seed(seed)
     noise = torch.randn(initial_shape, generator=generator, device=runtime.device, dtype=dtype)
@@ -464,6 +467,72 @@ def _load_seen_groups(path: Path, config: Stage3Config, subset: str,
     return payload, [available[item] for item in selected]
 
 
+def _load_camera_donors(
+    path: Path,
+    seen_manifest: Path,
+    config: Stage3Config,
+    groups: list[dict],
+) -> dict[str, dict]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("version") != 1 or payload.get("scope") != "stage3_2_far_camera_donors":
+        raise ValueError("unsupported camera donor manifest")
+    if payload.get("seen_manifest_sha256") != _sha256(seen_manifest):
+        raise ValueError("camera donor manifest does not match seen manifest")
+    if payload.get("sampling_signature") != _sampling_signature(config):
+        raise ValueError("camera donor manifest does not match sampling config")
+    items = payload.get("groups", [])
+    available = {item.get("id"): item for item in items}
+    if len(available) != len(items):
+        raise ValueError("camera donor manifest has duplicate group ids")
+    selected = {}
+    for group in groups:
+        item = available.get(group["id"])
+        if item is None:
+            raise ValueError(f"camera donor missing group {group['id']}")
+        if item.get("scene") != group["scene"] or item.get("anchor") != group["anchor"]:
+            raise ValueError(f"camera donor identity mismatch for {group['id']}")
+        if item.get("source_indices") != group["indices"]:
+            raise ValueError(f"camera donor source indices mismatch for {group['id']}")
+        donor_indices = item.get("fusion_camera_indices")
+        angles = item.get("donor_angles_deg")
+        if (
+            not isinstance(donor_indices, list)
+            or len(donor_indices) != config.views
+            or donor_indices[0] != group["anchor"]
+            or len(set(donor_indices)) != len(donor_indices)
+            or set(donor_indices[1:]) & set(group["indices"])
+        ):
+            raise ValueError(f"invalid camera donor indices for {group['id']}")
+        if (
+            not isinstance(angles, list)
+            or len(angles) != config.views - 1
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not np.isfinite(value)
+                or value < 0
+                for value in angles
+            )
+        ):
+            raise ValueError(f"invalid camera donor angles for {group['id']}")
+        selected[group["id"]] = item
+    return selected
+
+
+def _camera_for_indices(
+    dataset_root: Path,
+    scene: str,
+    indices: list[int],
+    config: Stage3Config,
+    device: torch.device,
+) -> CameraBatch:
+    sequence = NeRFSyntheticAdapter(dataset_root / scene).index(Split.TRAIN)
+    if any(type(index) is not int or not 0 <= index < len(sequence.observations) for index in indices):
+        raise ValueError("camera donor index is out of range")
+    observations = [sequence.observations[index] for index in indices]
+    return _camera(observations, config.image_size, device)
+
+
 def _training_state(optimizer, sigma_cycle, view_generator, noise_generator, step,
                     dropout_generator=None):
     numpy_state = np.random.get_state()
@@ -550,6 +619,7 @@ def _train(args, config: Stage3Config) -> None:
         expected_config = json.loads(json.dumps(config.to_dict()))
         manifest_config = dict(manifest.get("config") or {})
         manifest_config.setdefault("target_lr_dropout", 0.0)
+        manifest_config.setdefault("allow_self_view_source", True)
         if manifest_config != expected_config or manifest.get("provenance", {}).get("training_seed") != args.seed:
             raise ValueError("resume manifest does not match config and training seed")
         start_step = resume_step + 1
@@ -722,13 +792,15 @@ class _PerFrameLPIPS(torch.nn.Module):
         )
 
 
-def _intervention(lr, camera, mode, generator):
+def _intervention(lr, camera, mode, generator, *, far_camera=None):
     """Return LR, fusion camera, geometry camera and source mask.
 
     The old ``shuffle_camera`` name is retained as a compatibility alias for
     the historical fusion-only intervention. New audits should use the
     explicit ``shuffle_fusion``, ``shuffle_geometry`` or ``shuffle_all`` modes.
     """
+    if mode.startswith("no_self_"):
+        mode = mode.removeprefix("no_self_")
     if mode in {"correct", "correct_repeat"}:
         changed, changed_camera, mask = intervene_lr(
             lr, camera, "correct", target=0, generator=generator
@@ -739,6 +811,18 @@ def _intervention(lr, camera, mode, generator):
         changed[:, :, 0] = 0
         mask = torch.ones(lr.shape[0], lr.shape[2], dtype=torch.bool, device=lr.device)
         return changed, camera, camera, mask
+    if mode == "far_shuffle_fusion":
+        if far_camera is None:
+            raise ValueError("far_shuffle_fusion requires a frozen donor camera")
+        far_camera.validate(batch=lr.shape[0])
+        if far_camera.K.shape[1] != lr.shape[2]:
+            raise ValueError("far donor camera view count does not match LR")
+        if not torch.equal(far_camera.K[:, :1], camera.K[:, :1]) or not torch.equal(
+            far_camera.T_world_from_camera[:, :1], camera.T_world_from_camera[:, :1]
+        ):
+            raise ValueError("far donor camera must preserve the target camera")
+        mask = torch.ones(lr.shape[0], lr.shape[2], dtype=torch.bool, device=lr.device)
+        return lr.clone(), far_camera, camera, mask
     if mode in {"shuffle_fusion", "shuffle_geometry", "shuffle_all", "shuffle_camera"}:
         _, shuffled_camera, mask = intervene_lr(
             lr, camera, "shuffle_camera", target=0, generator=generator
@@ -811,13 +895,18 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
                          clean_shape: tuple[int, ...], config: Stage3Config,
                          changed_lr: torch.Tensor, fusion_camera: CameraBatch,
                          geometry_camera: CameraBatch,
-                         source_mask: torch.Tensor, group: dict, condition: str) -> dict:
+                         source_mask: torch.Tensor, group: dict, condition: str,
+                         allow_self_view_source: bool | None = None) -> dict:
     """Measure how an intervention changes prepared and bridge residual features."""
     fusion_module = getattr(runtime.module, "fusion", None)
     if fusion_module is not None:
         fusion_module.record_diagnostics = True
     correct = runtime.module.prepare_multiview(
-        lr, camera, tuple(clean_shape[2:]), (config.image_size, config.image_size)
+        lr,
+        camera,
+        tuple(clean_shape[2:]),
+        (config.image_size, config.image_size),
+        allow_self_view_source=allow_self_view_source,
     )
     correct_fusion = _scalar_diagnostics(
         getattr(fusion_module, "last_diagnostics", {})
@@ -828,6 +917,7 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
         tuple(clean_shape[2:]),
         (config.image_size, config.image_size),
         source_mask=source_mask,
+        allow_self_view_source=allow_self_view_source,
     )
     changed_fusion = _scalar_diagnostics(
         getattr(fusion_module, "last_diagnostics", {})
@@ -947,6 +1037,16 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
     manifest, groups = _load_seen_groups(
         args.seen_manifest, config, args.subset, args.group_ids
     )
+    far_modes = {"far_shuffle_fusion", "no_self_far_shuffle_fusion"}
+    needs_far_camera = bool(set(args.modes) & far_modes)
+    donor_manifest = getattr(args, "camera_donor_manifest", None)
+    if needs_far_camera and donor_manifest is None:
+        raise ValueError("far fusion-camera modes require --camera-donor-manifest")
+    camera_donors = (
+        _load_camera_donors(donor_manifest, args.seen_manifest, config, groups)
+        if donor_manifest is not None
+        else {}
+    )
     output = prepare_output(args.output_dir)
     _seed_all(args.inference_seeds[0])
     runtime = load_runtime(
@@ -972,6 +1072,15 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
         _, hr, lr, camera = _load_indices(
             args.dataset_root, group["scene"], "train", group["indices"], config, runtime.device
         )
+        far_camera = None
+        if group["id"] in camera_donors:
+            far_camera = _camera_for_indices(
+                args.dataset_root,
+                group["scene"],
+                camera_donors[group["id"]]["fusion_camera_indices"],
+                config,
+                runtime.device,
+            )
         with torch.inference_mode():
             clean = runtime.vae.encode_multiview(hr)
             target = hr[:, :, :1]
@@ -1018,8 +1127,9 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                         sample_seed * 10 + mode_index
                     )
                     changed_lr, fusion_camera, geometry_camera, source_mask = _intervention(
-                        lr, camera, mode, intervention_generator
+                        lr, camera, mode, intervention_generator, far_camera=far_camera
                     )
+                    self_source_override = False if mode.startswith("no_self_") else None
                     sampled = sample_latents(
                         runtime,
                         changed_lr,
@@ -1030,6 +1140,7 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                         fusion_camera=fusion_camera,
                         geometry_camera=geometry_camera,
                         source_mask=source_mask,
+                        allow_self_view_source=self_source_override,
                         seed=sample_seed,
                         sampling_shift=config.sampling_shift,
                         dtype=torch.bfloat16,
@@ -1038,7 +1149,8 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                     if getattr(args, "save_diagnostics", False):
                         latent, mode_diagnostics[mode] = sampled
                         mode_interventions[mode] = (
-                            changed_lr, fusion_camera, geometry_camera, source_mask
+                            changed_lr, fusion_camera, geometry_camera, source_mask,
+                            self_source_override,
                         )
                     else:
                         latent = sampled
@@ -1062,9 +1174,14 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                         _save_frame(image_path, decoded)
                 if getattr(args, "save_diagnostics", False) and "correct" in mode_diagnostics:
                     for mode, intervention in mode_interventions.items():
-                        if mode == "correct":
+                        if mode in {"correct", "no_self_correct"}:
                             continue
-                        changed_lr, fusion_camera, geometry_camera, source_mask = intervention
+                        changed_lr, fusion_camera, geometry_camera, source_mask, self_source_override = intervention
+                        reference_mode = (
+                            "no_self_correct"
+                            if mode.startswith("no_self_") and "no_self_correct" in mode_diagnostics
+                            else "correct"
+                        )
                         diagnostic = _feature_diagnostics(
                             runtime,
                             lr,
@@ -1077,11 +1194,13 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                             source_mask,
                             group,
                             mode,
+                            self_source_override,
                         )
-                        diagnostic.update(_trace_delta(mode_diagnostics["correct"], mode_diagnostics[mode]))
+                        diagnostic.update(_trace_delta(mode_diagnostics[reference_mode], mode_diagnostics[mode]))
                         diagnostic.update({
                             "inference_seed": inference_seed,
                             "sample_seed": sample_seed,
+                            "reference_condition": reference_mode,
                         })
                         diagnostic_rows.append(diagnostic)
     expected = len(groups) * len(args.inference_seeds) * len(args.modes)
@@ -1106,6 +1225,8 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
             "diagnostic_rows": len(diagnostic_rows),
             "seen_manifest": str(args.seen_manifest.resolve()),
             "seen_manifest_sha256": _sha256(args.seen_manifest),
+            "camera_donor_manifest": None if donor_manifest is None else str(donor_manifest.resolve()),
+            "camera_donor_manifest_sha256": None if donor_manifest is None else _sha256(donor_manifest),
             "dataset_manifest": manifest["datasets"],
             "diagnostics": bool(diagnostic_rows),
         },
@@ -1289,13 +1410,15 @@ def _parser() -> argparse.ArgumentParser:
     seen.add_argument("--seen-manifest", type=Path, required=True)
     seen.add_argument("--subset", choices=("probe", "full", "intervention"), required=True)
     seen.add_argument("--inference-seeds", type=int, nargs="+", required=True)
+    seen.add_argument("--camera-donor-manifest", type=Path)
     seen.add_argument(
         "--modes",
         nargs="+",
         choices=(
             "correct", "correct_repeat", "target_drop", "remove", "duplicate",
             "shuffle_camera", "shuffle_fusion", "shuffle_geometry", "shuffle_all",
-            "shuffle_pair",
+            "shuffle_pair", "far_shuffle_fusion", "no_self_correct",
+            "no_self_shuffle_fusion", "no_self_far_shuffle_fusion",
         ),
         default=("correct",),
     )

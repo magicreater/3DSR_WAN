@@ -25,8 +25,10 @@ class Fusion(nn.Module):
         self.offset = nn.Parameter(torch.ones(()))
         self.calls = 0
 
-    def forward(self, features, camera, patch_grid, *, source_mask=None):
+    def forward(self, features, camera, patch_grid, *, source_mask=None,
+                allow_self_view_source=None):
         self.calls += 1
+        self.allow_self_view_source = allow_self_view_source
         return features + self.offset
 
 
@@ -93,9 +95,20 @@ def test_old_checkpoint_config_defaults_new_dropout_field(tmp_path):
     save_stage3_checkpoint(path, module, config={"arm": "A3"}, step=8, provenance={})
     target = bundle()
     payload = load_stage3_checkpoint(
-        path, target, expected_config={"arm": "A3", "target_lr_dropout": 0.0}
+        path, target, expected_config={
+            "arm": "A3", "target_lr_dropout": 0.0, "allow_self_view_source": True,
+        }
     )
     assert payload["config"] == {"arm": "A3"}
+
+
+def test_prepare_multiview_propagates_self_source_override():
+    module = bundle()
+    module.prepare_multiview(
+        torch.rand(1, 3, 2, 8, 8), camera(), (2, 4, 4), (32, 32),
+        allow_self_view_source=False,
+    )
+    assert module.fusion.allow_self_view_source is False
 
 
 def test_multiview_entry_rejects_temporal_instead_of_flattening_it():

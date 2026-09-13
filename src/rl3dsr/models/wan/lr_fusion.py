@@ -59,6 +59,63 @@ def patch_fundamental_matrices(
         return fundamental, valid
 
 
+def _patch_centers(device: torch.device, patch_grid: tuple[int, int]) -> Tensor:
+    gh, gw = patch_grid
+    yy, xx = torch.meshgrid(
+        torch.arange(gh, device=device, dtype=torch.float32) + .5,
+        torch.arange(gw, device=device, dtype=torch.float32) + .5,
+        indexing='ij',
+    )
+    return torch.stack((xx, yy, torch.ones_like(xx)), -1).reshape(gh * gw, 3)
+
+
+def _epipolar_chunk(
+    matrices: Tensor,
+    valid: Tensor,
+    pixels: Tensor,
+    query_views: Tensor,
+    query_patches: Tensor,
+    *,
+    tau: float,
+    band: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    query_pixels = pixels[query_patches]
+    lines = torch.einsum('bqvij,qj->bqvi', matrices[:, query_views], query_pixels)
+    numer = torch.einsum('bqvi,pi->bqvp', lines, pixels).square()
+    denom = lines[..., :2].square().sum(-1)
+    usable = valid[:, query_views] & (denom > 1e-12)
+    dist2 = numer / denom.clamp_min(1e-12).unsqueeze(-1)
+    bias = (-dist2 / (2 * tau**2)).clamp(-20, 0)
+    bias = torch.where(usable[..., None], bias, torch.zeros_like(bias))
+    allowed = (~usable[..., None]) | (dist2 <= band**2)
+    return bias, allowed, usable
+
+
+def epipolar_local_key_mask(
+    camera: CameraBatch,
+    patch_grid: tuple[int, int],
+    *,
+    band: float = 1.5,
+) -> tuple[Tensor, Tensor]:
+    """Return local-band key mask [B,V*P,V*P] and usable pairs [B,V*P,V]."""
+    if isinstance(band, bool) or not isinstance(band, (int, float)) or not math.isfinite(band) or band <= 0:
+        raise ValueError('band must be finite and positive')
+    matrices, valid = patch_fundamental_matrices(camera, patch_grid)
+    patches = patch_grid[0] * patch_grid[1]
+    tokens = camera.K.shape[1] * patches
+    ids = torch.arange(tokens, device=camera.K.device)
+    _, allowed, usable = _epipolar_chunk(
+        matrices,
+        valid,
+        _patch_centers(camera.K.device, patch_grid),
+        ids // patches,
+        ids % patches,
+        tau=1.0,
+        band=float(band),
+    )
+    return allowed.reshape(camera.K.shape[0], tokens, tokens), usable
+
+
 class LRViewFusion(nn.Module):
     """One zero-initialized LR attention residual; never encodes views as time.
 
@@ -77,6 +134,7 @@ class LRViewFusion(nn.Module):
         query_chunk_size: int = 128,
         tau: float = 1.0,
         epipolar_band: float = 1.5,
+        allow_self_view_source: bool = True,
     ) -> None:
         super().__init__()
         if mode not in {'off', 'same_view', 'visual', 'epipolar', 'epipolar_local'}:
@@ -90,6 +148,8 @@ class LRViewFusion(nn.Module):
             raise ValueError('query_chunk_size and finite tau must be positive')
         if isinstance(epipolar_band, bool) or not isinstance(epipolar_band, (int, float)) or not math.isfinite(epipolar_band) or epipolar_band <= 0:
             raise ValueError('epipolar_band must be finite and positive')
+        if type(allow_self_view_source) is not bool:
+            raise ValueError('allow_self_view_source must be boolean')
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         self.heads = heads
@@ -97,6 +157,7 @@ class LRViewFusion(nn.Module):
         self.query_chunk_size = query_chunk_size
         self.tau = float(tau)
         self.epipolar_band = float(epipolar_band)
+        self.allow_self_view_source = allow_self_view_source
         self.record_diagnostics = False
         self.last_diagnostics: dict[str, dict[str, Tensor]] = {}
         self.qkv = nn.Linear(feature_dim, hidden_dim * 3, bias=False)
@@ -110,6 +171,7 @@ class LRViewFusion(nn.Module):
         patch_grid: tuple[int, int],
         *,
         source_mask: Tensor | None = None,
+        allow_self_view_source: bool | None = None,
     ) -> Tensor:
         self.last_diagnostics = {}
         if features.ndim != 4 or features.shape[-1] != self.feature_dim:
@@ -127,6 +189,13 @@ class LRViewFusion(nn.Module):
                 raise ValueError('source_mask must be bool [B,V]')
             if source_mask.device != features.device:
                 raise ValueError('source_mask must share the feature device')
+        if allow_self_view_source is not None and type(allow_self_view_source) is not bool:
+            raise ValueError('allow_self_view_source override must be boolean')
+        allow_self = (
+            self.allow_self_view_source
+            if allow_self_view_source is None
+            else allow_self_view_source
+        )
         if self.mode == 'off':
             return features
         if camera is not None:
@@ -165,12 +234,7 @@ class LRViewFusion(nn.Module):
             aux_source_ratio = features.new_tensor(1.0, dtype=torch.float32)
             if record and source_mask is not None and views > 1:
                 aux_source_ratio = source_mask[:, 1:].float().mean()
-            yy, xx = torch.meshgrid(
-                torch.arange(gh, device=features.device, dtype=torch.float32) + .5,
-                torch.arange(gw, device=features.device, dtype=torch.float32) + .5,
-                indexing='ij',
-            )
-            pixels = torch.stack((xx, yy, torch.ones_like(xx)), -1).reshape(patches, 3)
+            pixels = _patch_centers(features.device, patch_grid)
             matrices, valid = (None, None)
             if self.mode in {'epipolar', 'epipolar_local'}:
                 matrices, valid = patch_fundamental_matrices(camera, patch_grid)
@@ -188,20 +252,20 @@ class LRViewFusion(nn.Module):
                         (b, stop - start, tokens), dtype=torch.bool, device=features.device
                     )
                 if matrices is not None:
-                    query_pixels = pixels[torch.arange(start, stop, device=features.device) % patches]
-                    lines = torch.einsum('bqvij,qj->bqvi', matrices[:, query_views], query_pixels)
-                    numer = torch.einsum('bqvi,pi->bqvp', lines, pixels).square()
-                    denom = lines[..., :2].square().sum(-1)
-                    usable = valid[:, query_views] & (denom > 1e-12)
-                    dist2 = numer / denom.clamp_min(1e-12).unsqueeze(-1)
-                    bias = (-dist2 / (2 * self.tau**2)).clamp(-20, 0)
-                    bias = torch.where(usable[..., None], bias, torch.zeros_like(bias))
+                    bias, allowed, _ = _epipolar_chunk(
+                        matrices,
+                        valid,
+                        pixels,
+                        query_views,
+                        torch.arange(start, stop, device=features.device) % patches,
+                        tau=self.tau,
+                        band=self.epipolar_band,
+                    )
                     logits[..., :tokens] = logits[..., :tokens] + bias.reshape(b, stop - start, tokens)[:, None]
                     if self.mode == 'epipolar_local':
                         # Keep a null candidate and fall back to global keys for
                         # degenerate camera pairs; otherwise restrict each query
                         # to a finite epipolar band in source patch coordinates.
-                        allowed = (~usable[..., None]) | (dist2 <= self.epipolar_band ** 2)
                         logits[..., :tokens] = logits[..., :tokens].masked_fill(
                             ~allowed.reshape(b, stop - start, tokens)[:, None], -torch.inf
                         )
@@ -210,6 +274,13 @@ class LRViewFusion(nn.Module):
                 if self.mode == 'same_view':
                     allowed = query_views[:, None] == view_ids[None, :]
                     logits[..., :tokens] = logits[..., :tokens].masked_fill(~allowed[None, None], -torch.inf)
+                    if record:
+                        allowed_keys = allowed_keys & allowed[None].expand(b, -1, -1)
+                if not allow_self:
+                    allowed = query_views[:, None] != view_ids[None, :]
+                    logits[..., :tokens] = logits[..., :tokens].masked_fill(
+                        ~allowed[None, None], -torch.inf
+                    )
                     if record:
                         allowed_keys = allowed_keys & allowed[None].expand(b, -1, -1)
                 if key_allowed is not None:

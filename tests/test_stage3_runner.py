@@ -225,6 +225,77 @@ def test_camera_intervention_scopes_are_explicit(runner):
             assert fusion_camera.T_world_from_camera.equal(camera.T_world_from_camera) is False
 
 
+def test_far_fusion_camera_intervention_keeps_lr_target_and_geometry(runner):
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+
+    lr = torch.ones(1, 3, 4, 2, 2)
+    camera = CameraBatch(
+        torch.eye(3).repeat(1, 4, 1, 1),
+        torch.eye(4).repeat(1, 4, 1, 1),
+        (2, 2),
+        "multiview",
+    )
+    far = CameraBatch(
+        camera.K.clone(), camera.T_world_from_camera.clone(), (2, 2), "multiview"
+    )
+    far.T_world_from_camera[0, 1:, 0, 3] = torch.tensor([10.0, 20.0, 30.0])
+    changed, fusion_camera, geometry_camera, mask = runner._intervention(
+        lr, camera, "far_shuffle_fusion", torch.Generator().manual_seed(4),
+        far_camera=far,
+    )
+    assert torch.equal(changed, lr)
+    assert torch.equal(fusion_camera.T_world_from_camera, far.T_world_from_camera)
+    assert torch.equal(geometry_camera.T_world_from_camera, camera.T_world_from_camera)
+    assert mask.all()
+
+
+def test_seen_eval_parser_accepts_frozen_camera_donors_and_no_self_modes(runner):
+    parser = runner._parser()
+    args = parser.parse_args([
+        "seen-eval", "--config", "a.json", "--dataset-root", "data",
+        "--model-dir", "model", "--lq-source", "lq.py", "--lq-checkpoint", "lq.pt",
+        "--bridge-checkpoint", "bridge.pt", "--checkpoint", "stage3.pt",
+        "--output-dir", "out", "--seen-manifest", "seen.json", "--subset", "probe",
+        "--inference-seeds", "3302", "--camera-donor-manifest", "donors.json",
+        "--modes", "correct", "far_shuffle_fusion", "no_self_correct",
+        "no_self_far_shuffle_fusion",
+    ])
+    assert args.camera_donor_manifest == Path("donors.json")
+    assert args.modes[-1] == "no_self_far_shuffle_fusion"
+
+
+def test_camera_donor_manifest_is_bound_to_seen_groups(runner, tmp_path):
+    from rl3dsr.validation.stage3_protocol import Stage3Config
+
+    config = Stage3Config(train_scenes=("chair",), views=4)
+    seen = tmp_path / "seen.json"
+    seen.write_text("{}")
+    group = {"id": "chair:000", "scene": "chair", "anchor": 0,
+             "indices": [0, 1, 2, 3]}
+    payload = {
+        "version": 1,
+        "scope": "stage3_2_far_camera_donors",
+        "seen_manifest_sha256": runner._sha256(seen),
+        "sampling_signature": runner._sampling_signature(config),
+        "groups": [{
+            "id": "chair:000",
+            "scene": "chair",
+            "anchor": 0,
+            "source_indices": [0, 1, 2, 3],
+            "fusion_camera_indices": [0, 9, 8, 7],
+            "donor_angles_deg": [120.0, 110.0, 100.0],
+        }],
+    }
+    donors = tmp_path / "donors.json"
+    donors.write_text(json.dumps(payload))
+    loaded = runner._load_camera_donors(donors, seen, config, [group])
+    assert loaded["chair:000"]["fusion_camera_indices"] == [0, 9, 8, 7]
+    payload["groups"][0]["source_indices"] = [0, 4, 5, 6]
+    donors.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="source indices"):
+        runner._load_camera_donors(donors, seen, config, [group])
+
+
 def test_output_directory_never_overwrites(runner, tmp_path):
     (tmp_path / "existing").write_text("keep")
     with pytest.raises(ValueError, match="empty"):
@@ -328,7 +399,7 @@ def test_seen_eval_writes_target_only_rows_and_images(runner, tmp_path, monkeypa
     monkeypatch.setattr(
         runner,
         "_intervention",
-        lambda value, camera, mode, generator: (value, camera, camera, None),
+        lambda value, camera, mode, generator, **kwargs: (value, camera, camera, None),
     )
 
     def sample_latents(*args, seed, **kwargs):

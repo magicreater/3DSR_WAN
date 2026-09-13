@@ -24,7 +24,8 @@ class Stage3Conditioning(nn.Module):
 
     def prepare_multiview(self, lr: Tensor, camera: CameraBatch,
                           latent_shape: tuple[int, int, int],
-                          conditioning_size: tuple[int, int], *, source_mask=None) -> Tensor:
+                          conditioning_size: tuple[int, int], *, source_mask=None,
+                          allow_self_view_source=None) -> Tensor:
         """Encode independent LR views and fuse once, returning [B,V*P,D].
 
         Retain this tensor for the full inference trajectory. During training
@@ -41,7 +42,13 @@ class Stage3Conditioning(nn.Module):
             return features
         views, height, width = latent_shape
         shaped = features.reshape(features.shape[0], views, -1, features.shape[-1])
-        fused = self.fusion(shaped, camera, (height // 2, width // 2), source_mask=source_mask)
+        fused = self.fusion(
+            shaped,
+            camera,
+            (height // 2, width // 2),
+            source_mask=source_mask,
+            allow_self_view_source=allow_self_view_source,
+        )
         return fused.reshape_as(features)
 
     def predict(
@@ -107,9 +114,11 @@ def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config:
         saved_config.setdefault("target_lr_dropout", 0.0)
         saved_config.setdefault("epipolar_attention", "global_bias")
         saved_config.setdefault("epipolar_band", 1.5)
+        saved_config.setdefault("allow_self_view_source", True)
         expected.setdefault("target_lr_dropout", 0.0)
         expected.setdefault("epipolar_attention", "global_bias")
         expected.setdefault("epipolar_band", 1.5)
+        expected.setdefault("allow_self_view_source", True)
         if saved_config != expected:
             raise ValueError("Stage 3 checkpoint config mismatch")
     expected_arch = {"blocks": list(module.conditioner.bridge_blocks),

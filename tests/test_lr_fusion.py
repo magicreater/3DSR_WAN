@@ -5,7 +5,11 @@ import unittest
 import torch
 
 from rl3dsr.models.wan.geometry_conditioning import CameraBatch
-from rl3dsr.models.wan.lr_fusion import LRViewFusion, patch_fundamental_matrices
+from rl3dsr.models.wan.lr_fusion import (
+    LRViewFusion,
+    epipolar_local_key_mask,
+    patch_fundamental_matrices,
+)
 
 
 def camera(views=3):
@@ -57,6 +61,11 @@ class FusionTests(unittest.TestCase):
         single = self.x[:, :1]
         self.assertIs(model(single, camera(1), (2, 3)), single)
 
+    def test_visual_mode_keeps_legacy_camera_optional_behavior(self):
+        output = active('visual')(self.x, None, (2, 3))
+        self.assertEqual(output.shape, self.x.shape)
+        self.assertTrue(bool(torch.isfinite(output).all()))
+
     def test_mask_blocks_auxiliary_evidence(self):
         model = active('visual')
         changed = self.x.clone()
@@ -101,6 +110,29 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(model.epipolar_band, 1.5)
         with self.assertRaises(ValueError):
             LRViewFusion(12, 12, 3, mode='epipolar_local', epipolar_band=0)
+
+    def test_local_epipolar_mask_contains_known_projection(self):
+        c = camera(2)
+        allowed, usable = epipolar_local_key_mask(c, (3, 8), band=1.5)
+        target_patch = 1 * 8 + 4
+        source_patch = 1 * 8 + 4
+        assert usable[0, target_patch, 1]
+        assert allowed[0, target_patch, 24 + source_patch]
+
+    def test_no_self_masks_diagonal_kv_and_keeps_null_fallback(self):
+        model = active('epipolar_local')
+        model.record_diagnostics = True
+        default = model(self.x, self.cam, (2, 3))
+        explicit = model(self.x, self.cam, (2, 3), allow_self_view_source=True)
+        self.assertTrue(torch.equal(default, explicit))
+        without_self = model(self.x, self.cam, (2, 3), allow_self_view_source=False)
+        self.assertEqual(float(model.last_diagnostics['fusion']['same_view_attention_mass']), 0.0)
+        self.assertFalse(torch.equal(default, without_self))
+        empty = torch.zeros(1, 3, dtype=torch.bool)
+        self.assertTrue(torch.equal(
+            model(self.x, self.cam, (2, 3), source_mask=empty, allow_self_view_source=False),
+            self.x,
+        ))
 
     def test_optional_diagnostics_partition_attention_and_bound_keys(self):
         model = active('epipolar_local')

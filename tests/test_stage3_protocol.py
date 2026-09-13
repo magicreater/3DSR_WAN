@@ -33,12 +33,16 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
     assert Stage3Config().final_inference_seeds == (3302, 3303, 3304)
     assert Stage3Config(target_lr_dropout=0.5).target_lr_dropout == 0.5
     assert Stage3Config(epipolar_attention="local_band").epipolar_band == 1.5
+    assert Stage3Config().allow_self_view_source is True
+    assert Stage3Config(allow_self_view_source=False).allow_self_view_source is False
     with pytest.raises(ValueError, match="epipolar_attention"):
         replace(Stage3Config(), epipolar_attention="invalid")
     with pytest.raises(ValueError, match="target_lr_dropout"):
         replace(Stage3Config(), target_lr_dropout=1.0)
     with pytest.raises(ValueError, match="target_lr_dropout"):
         replace(Stage3Config(), target_lr_dropout=-0.1)
+    with pytest.raises(ValueError, match="allow_self_view_source"):
+        replace(Stage3Config(), allow_self_view_source=1)
 
 
 def test_interventions_preserve_target_and_inputs():
