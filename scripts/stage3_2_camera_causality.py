@@ -1153,6 +1153,390 @@ def analyze_phase_b_pilot(args) -> dict:
     return result
 
 
+def prepare_phase_c(args) -> dict:
+    root = args.repo_root.resolve()
+    campaign = args.campaign_root.resolve()
+    phase_b_path = campaign / "analysis" / "phase_b_pilot_summary.json"
+    phase_b = read_json(phase_b_path)
+    if phase_b.get("gate", {}).get("pass") or phase_b.get("next") != "PROCEED_PHASE_C":
+        raise RuntimeError("Phase C is gated off by the Phase B pilot")
+    revision = _git_revision(root)
+    origin_revision = _origin_master_revision(root)
+    if revision != origin_revision:
+        raise RuntimeError("Phase C must bind a pushed origin/master commit")
+    source_config = root / "configs" / "stage3_2" / "A3_no_self_rank_local_band_chair_1000.json"
+    config_target = campaign / "phase_c" / "config" / source_config.name
+    copy_or_verify(source_config, config_target)
+    config = load_stage3_config(config_target)
+    if (
+        config.allow_self_view_source
+        or config.steps != 1000
+        or config.views != 4
+        or config.epipolar_attention != "local_band"
+        or config.epipolar_band != 1.5
+        or config.target_lr_dropout != 0.5
+        or config.camera_rank_weight != 0.1
+        or config.camera_rank_margin_ratio != 0.05
+    ):
+        raise ValueError("Phase C pilot config drift")
+    phase_b_protocol = read_json(campaign / "phase_b" / "protocol.json")
+    seen_manifest = Path(phase_b_protocol["seen_manifest"])
+    no_self_eval = campaign / "phase_b" / "eval" / "no_self" / "seed42"
+    no_self_checkpoint = campaign / "phase_b" / "train" / "no_self" / "seed42" / "stage3_step_1000.pt"
+    self_allowed_eval = Path(phase_b_protocol["baseline_eval"])
+    required = (
+        seen_manifest,
+        no_self_eval / "evaluation_rows.jsonl",
+        no_self_checkpoint,
+        self_allowed_eval / "evaluation_rows.jsonl",
+        args.bridge_checkpoint,
+    )
+    for path in required:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    protocol = {
+        "schema_version": 1,
+        "scope": "stage3_2_camera_causality_phase_c_pilot",
+        "git_revision": revision,
+        "origin_master_revision": origin_revision,
+        "training_seed": 42,
+        "inference_seed": INFERENCE_SEED,
+        "steps": 1000,
+        "probe_ids": list(PROBE_IDS),
+        "modes": list(PHASE_B_MODES),
+        "config": str(config_target),
+        "config_sha256": sha256_file(config_target),
+        "seen_manifest": str(seen_manifest),
+        "seen_manifest_sha256": sha256_file(seen_manifest),
+        "no_self_baseline_eval": str(no_self_eval),
+        "no_self_baseline_rows_sha256": sha256_file(no_self_eval / "evaluation_rows.jsonl"),
+        "no_self_baseline_checkpoint": str(no_self_checkpoint),
+        "no_self_baseline_checkpoint_sha256": sha256_file(no_self_checkpoint),
+        "self_allowed_baseline_eval": str(self_allowed_eval),
+        "self_allowed_baseline_rows_sha256": sha256_file(self_allowed_eval / "evaluation_rows.jsonl"),
+        "bridge_checkpoint": str(args.bridge_checkpoint.resolve()),
+        "bridge_checkpoint_sha256": sha256_file(args.bridge_checkpoint),
+        "phase_b_summary_sha256": sha256_file(phase_b_path),
+        "stage4_status": "HOLD",
+        "stage5_4dsr": "preserved; outside this campaign",
+    }
+    write_frozen_json(campaign / "phase_c" / "protocol.json", protocol)
+    return protocol
+
+
+def preflight_phase_c(args) -> dict:
+    import stage3_experiment as stage3
+
+    _gpu_is_idle(args.gpu)
+    protocol = read_json(args.campaign_root / "phase_c" / "protocol.json")
+    config = load_stage3_config(Path(protocol["config"]))
+    seen = read_json(Path(protocol["seen_manifest"]))
+    group = next(item for item in seen["groups"] if item["id"] == PROBE_IDS[0])
+    runtime = stage3.load_runtime(
+        config,
+        model_dir=args.model_dir,
+        lq_source=args.lq_source,
+        lq_checkpoint=args.lq_checkpoint,
+        bridge_checkpoint=args.bridge_checkpoint,
+        device="cuda",
+    )
+    runtime.module.train()
+    runtime.dit.model.eval().requires_grad_(False)
+    runtime.vae.model.model.eval().requires_grad_(False)
+    runtime.module.fusion.record_diagnostics = True
+    trainable = [parameter for parameter in runtime.module.parameters() if parameter.requires_grad]
+    _, hr, lr, camera = stage3._load_indices(
+        args.dataset_root, group["scene"], "train", group["indices"], config, runtime.device
+    )
+    with torch.no_grad():
+        clean = runtime.vae.encode_multiview(hr)
+    prepared = runtime.module.prepare_multiview(
+        lr, camera, tuple(clean.shape[2:]), (config.image_size, config.image_size)
+    )
+    same_view_attention = float(
+        runtime.module.fusion.last_diagnostics["fusion"]["same_view_attention_mass"]
+    )
+    sigma = torch.tensor([0.5], device=runtime.device)
+    noise = torch.randn(
+        clean.shape,
+        generator=torch.Generator(device=runtime.device).manual_seed(33025),
+        device=runtime.device,
+        dtype=clean.dtype,
+    )
+    noisy, timestep, target = stage3.flow_matching_pair(clean, noise, sigma)
+    prediction = runtime.module.predict(
+        runtime.dit, noisy, timestep, None, prepared, camera, tuple(clean.shape[2:])
+    )
+    wrong_camera = stage3.derange_auxiliary_fusion_camera(
+        camera, torch.Generator().manual_seed(33026)
+    )
+    wrong_prepared = runtime.module.prepare_multiview(
+        lr, wrong_camera, tuple(clean.shape[2:]), (config.image_size, config.image_size)
+    )
+    prediction_wrong = runtime.module.predict(
+        runtime.dit, noisy, timestep, None, wrong_prepared, camera, tuple(clean.shape[2:])
+    )
+    e_correct, e_wrong, rank = stage3.camera_pair_ranking_loss(
+        prediction, prediction_wrong, target, margin_ratio=config.camera_rank_margin_ratio
+    )
+    rank_term = config.camera_rank_weight * rank.mean()
+    rank_gradients = torch.autograd.grad(rank_term, trainable, retain_graph=True, allow_unused=True)
+    loss = e_correct.mean() + rank_term
+    loss.backward()
+    gradient_norm = float(torch.nn.utils.clip_grad_norm_(trainable, config.gradient_clip))
+    result = {
+        "git_revision": protocol["git_revision"],
+        "group_id": group["id"],
+        "loss": float(loss.detach()),
+        "correct_flow_loss": float(e_correct.mean().detach()),
+        "wrong_flow_loss": float(e_wrong.mean().detach()),
+        "camera_rank_loss": float(rank.mean().detach()),
+        "camera_rank_active_fraction": float((rank.detach() > 0).float().mean()),
+        "camera_rank_gradient_norm": stage3._tensor_gradient_norm(rank_gradients),
+        "gradient_norm": gradient_norm,
+        "same_view_attention_mass": same_view_attention,
+        "trainable_parameters": sum(parameter.numel() for parameter in trainable),
+        "peak_gpu_memory_mib": torch.cuda.max_memory_allocated(runtime.device) / 2**20,
+    }
+    result["pass"] = (
+        all(math.isfinite(float(result[key])) for key in (
+            "loss", "correct_flow_loss", "wrong_flow_loss", "camera_rank_loss",
+            "camera_rank_gradient_norm", "gradient_norm",
+        ))
+        and result["camera_rank_active_fraction"] > 0
+        and result["camera_rank_gradient_norm"] > 0
+        and result["same_view_attention_mass"] <= 1e-7
+        and result["trainable_parameters"] == EXPECTED_PARAMETER_COUNTS["trainable_parameters"]
+    )
+    write_json(args.campaign_root / "phase_c" / "preflight" / "real_wan_rank_backward.json", result)
+    del runtime, clean, hr, lr, camera, prepared, wrong_prepared, prediction, prediction_wrong
+    gc.collect()
+    torch.cuda.empty_cache()
+    if not result["pass"]:
+        raise RuntimeError(f"Phase C real-Wan ranking preflight failed: {result}")
+    return result
+
+
+def train_phase_c_pilot(args) -> Path:
+    protocol = read_json(args.campaign_root / "phase_c" / "protocol.json")
+    output = args.campaign_root / "phase_c" / "train" / "rank" / "seed42"
+    final = output / "stage3_step_1000.pt"
+    rows_path = output / "train_steps.jsonl"
+    if final.is_file() and rows_path.is_file() and len(read_jsonl(rows_path)) == 1000:
+        return final
+    resume = None
+    if output.exists() and any(output.iterdir()):
+        candidates = sorted(output.glob("stage3_step_*.pt"))
+        if not candidates:
+            raise RuntimeError(f"incomplete Phase C training is not resumable: {output}")
+        resume = candidates[-1]
+    command = [
+        args.python,
+        str(args.repo_root / "scripts" / "stage3_experiment.py"),
+        "train",
+        "--config", protocol["config"],
+        *_runtime_args(args),
+        "--seed", "42",
+        "--output-dir", str(output),
+    ]
+    if resume is not None:
+        command.extend(("--resume", str(resume)))
+    suffix = "resume" if resume is not None else "initial"
+    control = args.campaign_root / "control" / f"phase_c_seed42_train_{suffix}.command.txt"
+    control.parent.mkdir(parents=True, exist_ok=True)
+    text = shlex.join(command) + "\n"
+    if control.is_file() and control.read_text(encoding="utf-8") != text:
+        raise RuntimeError(f"command drift: {control}")
+    control.write_text(text, encoding="utf-8")
+    _run_logged(
+        command,
+        args=args,
+        log_path=args.campaign_root / "logs" / f"phase_c_seed42_train_{suffix}.log",
+        append=resume is not None,
+    )
+    if not final.is_file() or len(read_jsonl(rows_path)) != 1000:
+        raise RuntimeError("Phase C pilot training did not complete 1000 contiguous steps")
+    return final
+
+
+def evaluate_phase_c_pilot(args) -> Path:
+    protocol = read_json(args.campaign_root / "phase_c" / "protocol.json")
+    checkpoint = args.campaign_root / "phase_c" / "train" / "rank" / "seed42" / "stage3_step_1000.pt"
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    output = args.campaign_root / "phase_c" / "eval" / "rank" / "seed42"
+    if output.exists() and any(output.iterdir()):
+        summary = output / "evaluation_summary.json"
+        if summary.is_file() and read_json(summary).get("rows") == 28:
+            return output
+        raise RuntimeError(f"refusing to reuse incomplete Phase C evaluation: {output}")
+    command = [
+        args.python,
+        str(args.repo_root / "scripts" / "stage3_experiment.py"),
+        "seen-eval",
+        "--config", protocol["config"],
+        *_runtime_args(args),
+        "--checkpoint", str(checkpoint),
+        "--seen-manifest", protocol["seen_manifest"],
+        "--subset", "probe",
+        "--inference-seeds", str(INFERENCE_SEED),
+        "--modes", *PHASE_B_MODES,
+        "--save-diagnostics",
+        "--save-images",
+        "--output-dir", str(output),
+    ]
+    control = args.campaign_root / "control" / "phase_c_seed42_eval.command.txt"
+    control.parent.mkdir(parents=True, exist_ok=True)
+    control.write_text(shlex.join(command) + "\n", encoding="utf-8")
+    _run_logged(command, args=args, log_path=args.campaign_root / "logs" / "phase_c_seed42_eval.log")
+    return output
+
+
+def phase_c_integrity(args) -> dict:
+    checks: dict[str, bool] = {}
+    details: dict[str, object] = {}
+    try:
+        protocol = read_json(args.campaign_root / "phase_c" / "protocol.json")
+        config_path = Path(protocol["config"])
+        config = load_stage3_config(config_path)
+        expected_config = read_json(config_path)
+        train_dir = args.campaign_root / "phase_c" / "train" / "rank" / "seed42"
+        eval_dir = args.campaign_root / "phase_c" / "eval" / "rank" / "seed42"
+        train_rows = read_jsonl(train_dir / "train_steps.jsonl")
+        manifest = read_json(train_dir / "run_manifest.json")
+        evaluation_rows = read_jsonl(eval_dir / "evaluation_rows.jsonl")
+        baseline_rows = read_jsonl(eval_dir / "baseline_rows.jsonl")
+        diagnostics = read_jsonl(eval_dir / "diagnostics.jsonl")
+        summary = read_json(eval_dir / "evaluation_summary.json")
+        preflight_result = read_json(
+            args.campaign_root / "phase_c" / "preflight" / "real_wan_rank_backward.json"
+        )
+        checkpoint_path = train_dir / "stage3_step_1000.pt"
+        checks["experiment_git_pushed"] = protocol["git_revision"] == protocol["origin_master_revision"]
+        checks["analysis_git_pushed"] = _git_revision(args.repo_root) == _origin_master_revision(args.repo_root)
+        checks["config_hash"] = sha256_file(config_path) == protocol["config_sha256"]
+        checks["ranking_config"] = (
+            config.allow_self_view_source is False
+            and config.camera_rank_weight == 0.1
+            and config.camera_rank_margin_ratio == 0.05
+        )
+        checks["real_wan_rank_preflight"] = bool(preflight_result.get("pass"))
+        checks["continuous_1000_steps"] = (
+            len(train_rows) == 1000 and [row.get("step") for row in train_rows] == list(range(1, 1001))
+        )
+        telemetry = (
+            "loss", "gradient_norm", "fusion_gradient_norm", "correct_flow_loss",
+            "wrong_flow_loss", "camera_rank_loss", "camera_rank_active_fraction",
+            "camera_rank_gradient_norm",
+        )
+        checks["training_values_finite"] = all(
+            math.isfinite(float(row[key])) for row in train_rows for key in telemetry
+        )
+        checks["rank_active_fraction_valid"] = all(
+            0 <= float(row["camera_rank_active_fraction"]) <= 1 for row in train_rows
+        ) and any(float(row["camera_rank_active_fraction"]) > 0 for row in train_rows)
+        checks["rank_gradient_nonzero"] = any(float(row["camera_rank_gradient_norm"]) > 0 for row in train_rows)
+        checks["target_dropout_exercised"] = sum(int(row.get("target_lr_drop_count", 0)) for row in train_rows) > 0
+        checks["manifest_config"] = manifest.get("config") == expected_config
+        checks["manifest_seed"] = manifest.get("provenance", {}).get("training_seed") == 42
+        checks["manifest_git"] = manifest.get("provenance", {}).get("git_revision") == protocol["git_revision"]
+        checks["manifest_bridge_hash"] = manifest.get("provenance", {}).get("bridge_checkpoint_sha256") == protocol["bridge_checkpoint_sha256"]
+        checks["parameter_counts"] = all(manifest.get(key) == value for key, value in EXPECTED_PARAMETER_COUNTS.items())
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checks["checkpoint_round_trip"] = payload.get("step") == 1000 and payload.get("config") == expected_config
+        checks["pairing_rng_checkpointed"] = "pairing_generator_state" in payload.get("training_state", {})
+        del payload
+        checks["evaluation_rows_28"] = len(evaluation_rows) == summary.get("rows") == 28
+        checks["baseline_rows_8"] = len(baseline_rows) == summary.get("baseline_rows") == 8
+        checks["diagnostic_rows_24"] = len(diagnostics) == summary.get("diagnostic_rows") == 24
+        checks["evaluation_protocol"] = (
+            summary.get("conditions") == list(PHASE_B_MODES)
+            and summary.get("inference_seeds") == [INFERENCE_SEED]
+            and summary.get("groups") == 4
+            and summary.get("seen_manifest_sha256") == protocol["seen_manifest_sha256"]
+        )
+        checks["evaluation_values_finite"] = all(
+            math.isfinite(float(row[metric]))
+            for row in (*evaluation_rows, *baseline_rows)
+            for metric in METRICS
+        )
+        checks["evaluation_images_44"] = len(list((eval_dir / "images").rglob("*.png"))) == 44
+        checks["logs_clean"] = _clean_log(args.campaign_root / "logs" / "phase_c_seed42_train_initial.log") \
+            and _clean_log(args.campaign_root / "logs" / "phase_c_seed42_eval.log")
+        details.update({
+            "train_rows": len(train_rows),
+            "evaluation_rows": len(evaluation_rows),
+            "baseline_rows": len(baseline_rows),
+            "diagnostic_rows": len(diagnostics),
+            "checkpoint_sha256": sha256_file(checkpoint_path),
+            "mean_rank_active_fraction": mean(float(row["camera_rank_active_fraction"]) for row in train_rows),
+            "mean_rank_gradient_norm": mean(float(row["camera_rank_gradient_norm"]) for row in train_rows),
+        })
+    except Exception as error:
+        checks["artifact_read_complete"] = False
+        details["error"] = f"{type(error).__name__}: {error}"
+    return {"pass": bool(checks) and all(checks.values()), "checks": checks, "details": details}
+
+
+def analyze_phase_c_pilot(args) -> dict:
+    protocol = read_json(args.campaign_root / "phase_c" / "protocol.json")
+    candidate = _phase_b_eval_payload(
+        args.campaign_root / "phase_c" / "eval" / "rank" / "seed42"
+    )
+    no_self = _phase_b_eval_payload(Path(protocol["no_self_baseline_eval"]))
+    self_allowed = _phase_b_eval_payload(
+        Path(protocol["self_allowed_baseline_eval"]),
+        required_modes=("correct", "correct_repeat", "target_drop", "shuffle_fusion"),
+    )
+    integrity = phase_c_integrity(args)
+    gate = phase_b_pilot_gate(candidate, self_allowed, integrity)
+    correct = candidate["means"]["correct"]
+    reference = no_self["means"]["correct"]
+    gate["checks"].update({
+        "rank_vs_no_self_correct_psnr": correct["psnr"] - reference["psnr"] >= -0.25,
+        "rank_vs_no_self_correct_ssim": correct["ssim"] - reference["ssim"] >= -0.005,
+        "rank_vs_no_self_correct_lpips": correct["lpips"] - reference["lpips"] <= 0.01,
+        "rank_vs_no_self_correct_mae": correct["mae"] - reference["mae"] <= 0.002,
+    })
+    gate["pass"] = all(gate["checks"].values())
+    result = {
+        "scope": "stage3_2_camera_causality_phase_c_pilot",
+        "claim_limit": "seen-train 3DSR camera-pair causality only",
+        "stage4_status": "HOLD",
+        "training_git_revision": protocol["git_revision"],
+        "analysis_git_revision": _git_revision(args.repo_root),
+        "candidate": candidate,
+        "no_self_baseline": no_self,
+        "self_allowed_baseline": self_allowed,
+        "integrity": integrity,
+        "gate": gate,
+        "next": "RUN_2000_STEP_REPLICATION" if gate["pass"] else "FINAL_HOLD_ARCHITECTURE_REDESIGN",
+    }
+    analysis = args.campaign_root / "analysis"
+    write_json(analysis / "phase_c_pilot_summary.json", result)
+    write_json(analysis / "machine_verdict.json", {
+        "CAMERA_FUSION_PASS": False,
+        "STAGE4_READY": False,
+        "phase_a_verdict": "PROCEED_PHASE_B",
+        "phase_b_pilot_pass": False,
+        "phase_c_pilot_pass": gate["pass"],
+        "next": result["next"],
+    })
+    lines = [
+        "# Stage 3.2 camera-pair causality — Phase C pilot",
+        "",
+        "Stage 4 large-scale supervised 3DSR remains **HOLD**. No 4DSR experiment was run.",
+        "",
+        f"Pilot verdict: **{'PASS' if gate['pass'] else 'HOLD'}**",
+        f"Next action: **{result['next']}**",
+        "",
+    ]
+    for name, value in gate["checks"].items():
+        lines.append(f"- `{name}`: `{value}`")
+    (analysis / "phase_c_pilot_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return result
+
+
 def _require_runtime(args) -> None:
     for name in ("dataset_root", "model_dir", "lq_source", "lq_checkpoint", "bridge_checkpoint"):
         path = Path(getattr(args, name))
@@ -1166,6 +1550,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("command", choices=(
         "prepare", "audit", "preflight", "evaluate", "analyze", "run",
         "phase-b-prepare", "phase-b-train", "phase-b-evaluate", "phase-b-analyze", "phase-b-pilot",
+        "phase-c-prepare", "phase-c-preflight", "phase-c-train", "phase-c-evaluate", "phase-c-analyze", "phase-c-pilot",
     ))
     parser.add_argument("--repo-root", type=Path, default=root)
     parser.add_argument("--campaign-root", type=Path, default=root / "artifacts" / "stage3_2_camera_causality_20260913")
@@ -1216,6 +1601,21 @@ def main(argv: list[str] | None = None) -> None:
         evaluate_phase_b_pilot(args)
     if args.command in {"phase-b-analyze", "phase-b-pilot"}:
         result = analyze_phase_b_pilot(args)
+        print(json.dumps({"pilot_pass": result["gate"]["pass"], "next": result["next"]}, indent=2))
+    if args.command in {"phase-c-prepare", "phase-c-pilot"}:
+        _require_runtime(args)
+        prepare_phase_c(args)
+    if args.command in {"phase-c-preflight", "phase-c-pilot"}:
+        _require_runtime(args)
+        preflight_phase_c(args)
+    if args.command in {"phase-c-train", "phase-c-pilot"}:
+        _require_runtime(args)
+        train_phase_c_pilot(args)
+    if args.command in {"phase-c-evaluate", "phase-c-pilot"}:
+        _require_runtime(args)
+        evaluate_phase_c_pilot(args)
+    if args.command in {"phase-c-analyze", "phase-c-pilot"}:
+        result = analyze_phase_c_pilot(args)
         print(json.dumps({"pilot_pass": result["gate"]["pass"], "next": result["next"]}, indent=2))
 
 

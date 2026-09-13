@@ -185,6 +185,73 @@ def test_training_state_restores_target_dropout_rng(runner):
     assert torch.equal(torch.rand(3, generator=dropout_generator), expected)
 
 
+def test_training_state_restores_pairing_rng(runner):
+    class Cycle:
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state):
+            assert state == {}
+
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(()))])
+    cycle = Cycle()
+    view_generator = torch.Generator().manual_seed(29)
+    noise_generator = torch.Generator().manual_seed(39)
+    dropout_generator = torch.Generator().manual_seed(49)
+    pairing_generator = torch.Generator().manual_seed(59)
+    state = runner._training_state(
+        optimizer, cycle, view_generator, noise_generator, 7,
+        dropout_generator, pairing_generator,
+    )
+    expected = torch.rand(3, generator=pairing_generator)
+    pairing_generator.manual_seed(99)
+    runner._restore_training_state(
+        state, optimizer, cycle, view_generator, noise_generator,
+        dropout_generator, pairing_generator,
+    )
+    assert torch.equal(torch.rand(3, generator=pairing_generator), expected)
+
+
+def test_camera_rank_hinge_and_gradients(runner):
+    correct = torch.ones(2, 1, 1, 1, 1, requires_grad=True)
+    wrong = torch.full_like(correct, 0.5, requires_grad=True)
+    target = torch.zeros_like(correct)
+    e_correct, e_wrong, rank = runner.camera_pair_ranking_loss(
+        correct, wrong, target, margin_ratio=0.05
+    )
+    assert torch.allclose(e_correct, torch.ones(2))
+    assert torch.allclose(e_wrong, torch.full((2,), 0.25))
+    assert torch.allclose(rank, torch.full((2,), 0.8))
+    (e_correct.mean() + 0.1 * rank.mean()).backward()
+    assert correct.grad is not None and correct.grad.gt(0).all()
+    assert wrong.grad is not None and wrong.grad.lt(0).all()
+
+
+def test_camera_rank_hinge_is_inactive_when_wrong_is_worse(runner):
+    correct = torch.ones(1, 1, 1, 1, 1, requires_grad=True)
+    wrong = torch.full_like(correct, 2.0, requires_grad=True)
+    target = torch.zeros_like(correct)
+    _, _, rank = runner.camera_pair_ranking_loss(correct, wrong, target, margin_ratio=0.05)
+    assert rank.item() == 0
+
+
+def test_pairing_derangement_preserves_target_and_changes_every_auxiliary(runner):
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+    k = torch.eye(3).repeat(1, 4, 1, 1)
+    t = torch.eye(4).repeat(1, 4, 1, 1)
+    t[0, :, 0, 3] = torch.arange(4)
+    camera = CameraBatch(k, t, (32, 32), "multiview")
+    wrong = runner.derange_auxiliary_fusion_camera(
+        camera, torch.Generator().manual_seed(11)
+    )
+    assert torch.equal(wrong.K[:, 0], camera.K[:, 0])
+    assert torch.equal(wrong.T_world_from_camera[:, 0], camera.T_world_from_camera[:, 0])
+    for view in range(1, 4):
+        assert not torch.equal(
+            wrong.T_world_from_camera[:, view], camera.T_world_from_camera[:, view]
+        )
+
+
 def test_target_drop_intervention_only_hides_target_lr(runner):
     lr = torch.ones(1, 3, 4, 2, 2)
     camera = object()

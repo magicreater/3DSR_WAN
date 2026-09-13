@@ -11,6 +11,7 @@ from rl3dsr.models.wan.geometry_conditioning import CameraBatch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "stage3_2_camera_causality.py"
 CONFIG = Path(__file__).resolve().parents[1] / "configs" / "stage3_2" / "A3_no_self_local_band_chair_1000.json"
+RANK_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "stage3_2" / "A3_no_self_rank_local_band_chair_1000.json"
 
 
 def load_driver():
@@ -158,6 +159,21 @@ def test_phase_b_config_changes_only_self_source_switch():
     assert config.epipolar_attention == "local_band"
     assert config.epipolar_band == 1.5
     assert config.target_lr_dropout == 0.5
+
+
+def test_phase_c_config_only_adds_preregistered_ranking_loss():
+    driver = load_driver()
+    no_self = driver.load_stage3_config(CONFIG).to_dict()
+    ranked = driver.load_stage3_config(RANK_CONFIG).to_dict()
+    differences = {
+        key: (no_self[key], ranked[key])
+        for key in no_self
+        if no_self[key] != ranked[key]
+    }
+    assert differences == {
+        "camera_rank_weight": (0.0, 0.1),
+    }
+    assert ranked["camera_rank_margin_ratio"] == 0.05
 
 
 def test_phase_b_pilot_gate_enforces_camera_gain_and_no_self_attention():

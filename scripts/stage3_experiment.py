@@ -533,8 +533,48 @@ def _camera_for_indices(
     return _camera(observations, config.image_size, device)
 
 
+def camera_pair_ranking_loss(prediction_correct, prediction_wrong, target, *, margin_ratio: float):
+    """Return per-sample correct/wrong MSE and the preregistered ranking hinge."""
+    if prediction_correct.shape != target.shape or prediction_wrong.shape != target.shape:
+        raise ValueError("camera ranking predictions and target must have matching shapes")
+    if isinstance(margin_ratio, bool) or not isinstance(margin_ratio, (int, float)) \
+            or not np.isfinite(margin_ratio) or margin_ratio <= 0:
+        raise ValueError("margin_ratio must be finite and positive")
+    dimensions = tuple(range(1, target.ndim))
+    e_correct = (prediction_correct - target).square().mean(dim=dimensions)
+    e_wrong = (prediction_wrong - target).square().mean(dim=dimensions)
+    rank = F.relu(float(margin_ratio) * e_correct.detach() + e_correct - e_wrong)
+    return e_correct, e_wrong, rank
+
+
+def derange_auxiliary_fusion_camera(camera: CameraBatch, generator: torch.Generator) -> CameraBatch:
+    """Cyclically derange auxiliary camera slots while preserving target view zero."""
+    camera.validate()
+    if camera.sequence_kind != "multiview" or camera.K.shape[1] < 3:
+        raise ValueError("camera ranking requires at least two auxiliary multiview cameras")
+    auxiliary = list(range(1, camera.K.shape[1]))
+    shift = int(torch.randint(1, len(auxiliary), (), generator=generator))
+    shuffled = auxiliary[shift:] + auxiliary[:shift]
+    k = camera.K.clone()
+    transform = camera.T_world_from_camera.clone()
+    k[:, auxiliary] = camera.K[:, shuffled]
+    transform[:, auxiliary] = camera.T_world_from_camera[:, shuffled]
+    return CameraBatch(
+        k,
+        transform,
+        camera.image_size,
+        camera.sequence_kind,
+        reference_index=camera.reference_index,
+    )
+
+
+def _tensor_gradient_norm(gradients) -> float:
+    values = [gradient.detach().float().square().sum() for gradient in gradients if gradient is not None]
+    return float(torch.stack(values).sum().sqrt()) if values else 0.0
+
+
 def _training_state(optimizer, sigma_cycle, view_generator, noise_generator, step,
-                    dropout_generator=None):
+                    dropout_generator=None, pairing_generator=None):
     numpy_state = np.random.get_state()
     state = {
         "step": step,
@@ -554,6 +594,8 @@ def _training_state(optimizer, sigma_cycle, view_generator, noise_generator, ste
     }
     if dropout_generator is not None:
         state["dropout_generator_state"] = dropout_generator.get_state()
+    if pairing_generator is not None:
+        state["pairing_generator_state"] = pairing_generator.get_state()
     if torch.cuda.is_available():
         state["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
     return state
@@ -575,13 +617,17 @@ def _validate_runtime_inputs(args, *, checkpoint: Path | None = None) -> None:
 
 
 def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise_generator,
-                            dropout_generator=None):
+                            dropout_generator=None, pairing_generator=None):
     optimizer.load_state_dict(state["optimizer"])
     sigma_cycle.load_state_dict(state["sigma_cycle"])
     view_generator.set_state(state["view_generator_state"])
     noise_generator.set_state(state["noise_generator_state"])
     if dropout_generator is not None and "dropout_generator_state" in state:
         dropout_generator.set_state(state["dropout_generator_state"])
+    if pairing_generator is not None:
+        if "pairing_generator_state" not in state:
+            raise ValueError("resume checkpoint is missing camera pairing RNG state")
+        pairing_generator.set_state(state["pairing_generator_state"])
     random.setstate(state["python_rng_state"])
     numpy_state = state["numpy_rng_state"]
     np.random.set_state((
@@ -620,6 +666,8 @@ def _train(args, config: Stage3Config) -> None:
         manifest_config = dict(manifest.get("config") or {})
         manifest_config.setdefault("target_lr_dropout", 0.0)
         manifest_config.setdefault("allow_self_view_source", True)
+        manifest_config.setdefault("camera_rank_weight", 0.0)
+        manifest_config.setdefault("camera_rank_margin_ratio", 0.05)
         if manifest_config != expected_config or manifest.get("provenance", {}).get("training_seed") != args.seed:
             raise ValueError("resume manifest does not match config and training seed")
         start_step = resume_step + 1
@@ -651,12 +699,17 @@ def _train(args, config: Stage3Config) -> None:
     view_generator = torch.Generator().manual_seed(args.seed + 2000)
     noise_generator = torch.Generator(device=runtime.device).manual_seed(args.seed + 3000)
     dropout_generator = torch.Generator().manual_seed(args.seed + 4000)
+    pairing_generator = (
+        torch.Generator().manual_seed(args.seed + 5000)
+        if config.camera_rank_weight > 0 else None
+    )
     if runtime.checkpoint is not None:
         state = runtime.checkpoint.get("training_state")
         if not isinstance(state, dict) or state.get("step") != start_step - 1:
             raise ValueError("resume checkpoint has no matching training state")
         _restore_training_state(
-            state, optimizer, sigma_cycle, view_generator, noise_generator, dropout_generator
+            state, optimizer, sigma_cycle, view_generator, noise_generator,
+            dropout_generator, pairing_generator,
         )
     provenance = {
         "training_seed": args.seed,
@@ -684,6 +737,8 @@ def _train(args, config: Stage3Config) -> None:
         step_started = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         losses, scenes, view_groups, sigmas, target_lr_dropped = [], [], [], [], []
+        correct_flow_losses, wrong_flow_losses = [], []
+        rank_losses, rank_active_fractions, rank_gradient_norms = [], [], []
         for micro in range(config.gradient_accumulation):
             scene = config.train_scenes[
                 ((step - 1) * config.gradient_accumulation + micro) % len(config.train_scenes)
@@ -723,7 +778,45 @@ def _train(args, config: Stage3Config) -> None:
                 camera,
                 tuple(clean.shape[2:]),
             )
-            loss = flow_matching_loss(prediction, target)
+            if config.camera_rank_weight > 0:
+                assert pairing_generator is not None
+                wrong_camera = derange_auxiliary_fusion_camera(camera, pairing_generator)
+                wrong_prepared = runtime.module.prepare_multiview(
+                    lr,
+                    wrong_camera,
+                    tuple(clean.shape[2:]),
+                    (config.image_size, config.image_size),
+                )
+                prediction_wrong = runtime.module.predict(
+                    runtime.dit,
+                    noisy,
+                    timestep,
+                    None,
+                    wrong_prepared,
+                    camera,
+                    tuple(clean.shape[2:]),
+                )
+                e_correct, e_wrong, rank = camera_pair_ranking_loss(
+                    prediction,
+                    prediction_wrong,
+                    target,
+                    margin_ratio=config.camera_rank_margin_ratio,
+                )
+                rank_term = config.camera_rank_weight * rank.mean()
+                rank_gradients = torch.autograd.grad(
+                    rank_term / config.gradient_accumulation,
+                    trainable,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                loss = e_correct.mean() + rank_term
+                correct_flow_losses.append(float(e_correct.mean().detach()))
+                wrong_flow_losses.append(float(e_wrong.mean().detach()))
+                rank_losses.append(float(rank.mean().detach()))
+                rank_active_fractions.append(float((rank.detach() > 0).float().mean()))
+                rank_gradient_norms.append(_tensor_gradient_norm(rank_gradients))
+            else:
+                loss = flow_matching_loss(prediction, target)
             (loss / config.gradient_accumulation).backward()
             losses.append(float(loss.detach()))
             scenes.append(scene)
@@ -757,6 +850,14 @@ def _train(args, config: Stage3Config) -> None:
             "step_seconds": time.perf_counter() - step_started,
             "peak_gpu_memory_mib": torch.cuda.max_memory_allocated(runtime.device) / 2**20,
         }
+        if config.camera_rank_weight > 0:
+            row.update({
+                "correct_flow_loss": float(np.mean(correct_flow_losses)),
+                "wrong_flow_loss": float(np.mean(wrong_flow_losses)),
+                "camera_rank_loss": float(np.mean(rank_losses)),
+                "camera_rank_active_fraction": float(np.mean(rank_active_fractions)),
+                "camera_rank_gradient_norm": float(np.mean(rank_gradient_norms)),
+            })
         rows.append(row)
         _append_jsonl(output / "train_steps.jsonl", row)
         _write_csv(output / "train_steps.csv", rows)
@@ -769,7 +870,7 @@ def _train(args, config: Stage3Config) -> None:
                 provenance=provenance,
                 training_state=_training_state(
                     optimizer, sigma_cycle, view_generator, noise_generator, step,
-                    dropout_generator,
+                    dropout_generator, pairing_generator,
                 ),
             )
 

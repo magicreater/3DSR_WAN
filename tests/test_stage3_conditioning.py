@@ -97,6 +97,7 @@ def test_old_checkpoint_config_defaults_new_dropout_field(tmp_path):
     payload = load_stage3_checkpoint(
         path, target, expected_config={
             "arm": "A3", "target_lr_dropout": 0.0, "allow_self_view_source": True,
+            "camera_rank_weight": 0.0, "camera_rank_margin_ratio": 0.05,
         }
     )
     assert payload["config"] == {"arm": "A3"}

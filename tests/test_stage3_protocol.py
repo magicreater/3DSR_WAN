@@ -35,6 +35,8 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
     assert Stage3Config(epipolar_attention="local_band").epipolar_band == 1.5
     assert Stage3Config().allow_self_view_source is True
     assert Stage3Config(allow_self_view_source=False).allow_self_view_source is False
+    assert Stage3Config().camera_rank_weight == 0.0
+    assert Stage3Config().camera_rank_margin_ratio == 0.05
     with pytest.raises(ValueError, match="epipolar_attention"):
         replace(Stage3Config(), epipolar_attention="invalid")
     with pytest.raises(ValueError, match="target_lr_dropout"):
@@ -43,6 +45,10 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
         replace(Stage3Config(), target_lr_dropout=-0.1)
     with pytest.raises(ValueError, match="allow_self_view_source"):
         replace(Stage3Config(), allow_self_view_source=1)
+    with pytest.raises(ValueError, match="camera_rank_weight"):
+        replace(Stage3Config(), camera_rank_weight=-0.1)
+    with pytest.raises(ValueError, match="camera_rank_margin_ratio"):
+        replace(Stage3Config(), camera_rank_margin_ratio=0.0)
 
 
 def test_interventions_preserve_target_and_inputs():

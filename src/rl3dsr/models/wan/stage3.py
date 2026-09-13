@@ -115,10 +115,14 @@ def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config:
         saved_config.setdefault("epipolar_attention", "global_bias")
         saved_config.setdefault("epipolar_band", 1.5)
         saved_config.setdefault("allow_self_view_source", True)
+        saved_config.setdefault("camera_rank_weight", 0.0)
+        saved_config.setdefault("camera_rank_margin_ratio", 0.05)
         expected.setdefault("target_lr_dropout", 0.0)
         expected.setdefault("epipolar_attention", "global_bias")
         expected.setdefault("epipolar_band", 1.5)
         expected.setdefault("allow_self_view_source", True)
+        expected.setdefault("camera_rank_weight", 0.0)
+        expected.setdefault("camera_rank_margin_ratio", 0.05)
         if saved_config != expected:
             raise ValueError("Stage 3 checkpoint config mismatch")
     expected_arch = {"blocks": list(module.conditioner.bridge_blocks),

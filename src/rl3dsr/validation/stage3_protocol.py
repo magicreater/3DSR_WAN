@@ -53,6 +53,8 @@ class Stage3Config:
     epipolar_band: float = 1.5
     target_lr_dropout: float = 0.0
     allow_self_view_source: bool = True
+    camera_rank_weight: float = 0.0
+    camera_rank_margin_ratio: float = 0.05
 
     def __post_init__(self):
         if self.arm not in ARM_MODES:
@@ -82,6 +84,14 @@ class Stage3Config:
             raise ValueError("target_lr_dropout must be finite and in [0, 1)")
         if type(self.allow_self_view_source) is not bool:
             raise ValueError("allow_self_view_source must be boolean")
+        value = self.camera_rank_weight
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError("camera_rank_weight must be finite and nonnegative")
+        value = self.camera_rank_margin_ratio
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError("camera_rank_margin_ratio must be finite and positive")
+        if self.camera_rank_weight > 0 and self.allow_self_view_source:
+            raise ValueError("camera ranking requires allow_self_view_source=false")
         for group in (self.training_seeds, self.final_inference_seeds):
             if not isinstance(group, tuple) or not group or any(type(v) is not int or v < 0 for v in group) or len(set(group)) != len(group):
                 raise ValueError("seed lists must contain distinct nonnegative integers")
