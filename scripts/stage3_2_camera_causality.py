@@ -810,6 +810,7 @@ def _phase_b_eval_payload(
     same_view_masses = [
         float(row["fusion_correct"]["fusion"]["same_view_attention_mass"])
         for row in diagnostics
+        if "fusion_correct" in row
     ]
     return {
         "means": {
@@ -819,7 +820,7 @@ def _phase_b_eval_payload(
         "deltas": {mode: _mean_metrics(values) for mode, values in delta_rows.items()},
         "delta_rows": delta_rows,
         "repeat_jitter": repeat_jitter,
-        "same_view_attention_mass": max(same_view_masses, default=math.inf),
+        "same_view_attention_mass": max(same_view_masses) if same_view_masses else None,
     }
 
 

@@ -207,7 +207,7 @@ def test_phase_b_payload_accepts_legacy_baseline_condition_set(tmp_path):
     (tmp_path / "evaluation_rows.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
     )
-    diagnostic = {"fusion_correct": {"fusion": {"same_view_attention_mass": 0.5}}}
+    diagnostic = {"condition": "shuffle_fusion"}
     (tmp_path / "diagnostics.jsonl").write_text(json.dumps(diagnostic) + "\n", encoding="utf-8")
     payload = driver._phase_b_eval_payload(
         tmp_path,
@@ -215,3 +215,4 @@ def test_phase_b_payload_accepts_legacy_baseline_condition_set(tmp_path):
     )
     assert set(payload["means"]) == {"correct", "correct_repeat", "target_drop", "shuffle_fusion"}
     assert "remove" not in payload["deltas"]
+    assert payload["same_view_attention_mass"] is None
