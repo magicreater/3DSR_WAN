@@ -9,6 +9,7 @@ from rl3dsr.models.wan.geometry_conditioning import CameraBatch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "stage3_2_camera_causality.py"
+CONFIG = Path(__file__).resolve().parents[1] / "configs" / "stage3_2" / "A3_no_self_local_band_chair_1000.json"
 
 
 def load_driver():
@@ -145,3 +146,40 @@ def test_phase_a_decision_rejects_failed_integrity():
         integrity_pass=False,
     )
     assert decision == {"verdict": "AUDIT_INVALID", "proceed_phase_b": False}
+
+
+def test_phase_b_config_changes_only_self_source_switch():
+    driver = load_driver()
+    config = driver.load_stage3_config(CONFIG)
+    assert config.allow_self_view_source is False
+    assert config.steps == 1000
+    assert config.views == 4
+    assert config.epipolar_attention == "local_band"
+    assert config.epipolar_band == 1.5
+    assert config.target_lr_dropout == 0.5
+
+
+def test_phase_b_pilot_gate_enforces_camera_gain_and_no_self_attention():
+    driver = load_driver()
+    positive = [
+        {"psnr": 0.10, "ssim": 0.001, "lpips": 0.001, "mae": 0.001}
+        for _ in range(4)
+    ]
+    candidate = {
+        "means": {"correct": {"psnr": 30.0, "ssim": 0.95, "lpips": 0.03, "mae": 0.01}},
+        "deltas": {
+            "target_drop": {"psnr": 5.0, "ssim": 0.06, "lpips": 0.02, "mae": 0.01},
+            "shuffle_fusion": {"psnr": 0.10, "ssim": 0.001, "lpips": 0.001, "mae": 0.001},
+            "remove": {"psnr": 0.10, "ssim": 0.001, "lpips": 0.001, "mae": 0.001},
+        },
+        "delta_rows": {"shuffle_fusion": positive, "remove": positive},
+        "repeat_jitter": {metric: 0.0 for metric in driver.METRICS},
+        "same_view_attention_mass": 0.0,
+    }
+    baseline = {
+        "means": {"correct": {"psnr": 30.0, "ssim": 0.95, "lpips": 0.03, "mae": 0.01}},
+        "deltas": {"shuffle_fusion": {"psnr": 0.01, "ssim": 0.0001, "lpips": 0.0, "mae": 0.0}},
+    }
+    assert driver.phase_b_pilot_gate(candidate, baseline, {"pass": True})["pass"]
+    candidate["same_view_attention_mass"] = 1e-4
+    assert not driver.phase_b_pilot_gate(candidate, baseline, {"pass": True})["pass"]

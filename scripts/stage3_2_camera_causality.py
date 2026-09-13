@@ -45,6 +45,20 @@ CELLS = {
     "v4": ("A3_views4_local_band_chair_2000.json", "v4_seen_groups.json"),
     "v8": ("A3_views8_local_band_chair_2000.json", "v8_seen_groups.json"),
 }
+PHASE_B_MODES = (
+    "correct",
+    "correct_repeat",
+    "remove",
+    "target_drop",
+    "shuffle_fusion",
+    "shuffle_geometry",
+    "shuffle_pair",
+)
+EXPECTED_PARAMETER_COUNTS = {
+    "trainable_parameters": 47839104,
+    "frozen_wan_parameters": 1418996800,
+    "frozen_vae_parameters": 126892531,
+}
 
 
 def read_json(path: Path) -> dict:
@@ -766,6 +780,365 @@ def analyze(args) -> dict:
     return result
 
 
+def _mean_metrics(rows: list[dict]) -> dict[str, float]:
+    return {metric: mean(float(row[metric]) for row in rows) for metric in METRICS}
+
+
+def _phase_b_eval_payload(eval_dir: Path) -> dict:
+    rows = read_jsonl(eval_dir / "evaluation_rows.jsonl")
+    diagnostics = read_jsonl(eval_dir / "diagnostics.jsonl")
+    indexed = {(row["condition"], row["group_id"]): row for row in rows}
+    expected = {(mode, group) for mode in PHASE_B_MODES for group in PROBE_IDS}
+    if set(indexed) != expected:
+        raise ValueError("Phase B evaluation identities do not match the frozen probe protocol")
+    delta_rows = {
+        mode: _paired_deltas(rows, "correct", mode)
+        for mode in ("remove", "target_drop", "shuffle_fusion", "shuffle_geometry", "shuffle_pair")
+    }
+    repeat_jitter = {
+        metric: max(
+            abs(float(indexed[("correct", group)][metric]) - float(indexed[("correct_repeat", group)][metric]))
+            for group in PROBE_IDS
+        )
+        for metric in METRICS
+    }
+    same_view_masses = [
+        float(row["fusion_correct"]["fusion"]["same_view_attention_mass"])
+        for row in diagnostics
+    ]
+    return {
+        "means": {
+            mode: _mean_metrics([indexed[(mode, group)] for group in PROBE_IDS])
+            for mode in PHASE_B_MODES
+        },
+        "deltas": {mode: _mean_metrics(values) for mode, values in delta_rows.items()},
+        "delta_rows": delta_rows,
+        "repeat_jitter": repeat_jitter,
+        "same_view_attention_mass": max(same_view_masses, default=math.inf),
+    }
+
+
+def phase_b_pilot_gate(candidate: dict, baseline: dict, integrity: dict) -> dict:
+    correct = candidate["means"]["correct"]
+    baseline_correct = baseline["means"]["correct"]
+    fusion = candidate["deltas"]["shuffle_fusion"]
+    baseline_fusion = baseline["deltas"]["shuffle_fusion"]
+    target = candidate["deltas"]["target_drop"]
+    remove_rows = candidate["delta_rows"]["remove"]
+    fusion_gate = output_gate(candidate["delta_rows"]["shuffle_fusion"])
+    auxiliary = {
+        "psnr_positive_probes": sum(row["psnr"] > 0 for row in remove_rows),
+        "ssim_positive_probes": sum(row["ssim"] > 0 for row in remove_rows),
+        "lpips_mean": mean(row["lpips"] for row in remove_rows),
+        "mae_mean": mean(row["mae"] for row in remove_rows),
+    }
+    checks = {
+        "integrity": bool(integrity.get("pass")),
+        "correct_psnr_nonregression": correct["psnr"] - baseline_correct["psnr"] >= -0.25,
+        "correct_ssim_nonregression": correct["ssim"] - baseline_correct["ssim"] >= -0.005,
+        "correct_lpips_nonregression": correct["lpips"] - baseline_correct["lpips"] <= 0.01,
+        "correct_mae_nonregression": correct["mae"] - baseline_correct["mae"] <= 0.002,
+        "target_drop_psnr": target["psnr"] >= 4.0,
+        "target_drop_ssim": target["ssim"] >= 0.05,
+        "fusion_camera_output_gate": fusion_gate["pass"],
+        "fusion_camera_psnr_improvement": fusion["psnr"] - baseline_fusion["psnr"] >= 0.04,
+        "fusion_camera_ssim_improvement": fusion["ssim"] - baseline_fusion["ssim"] >= 0.0004,
+        "same_view_attention_zero": candidate["same_view_attention_mass"] <= 1e-7,
+        "auxiliary_removal_probe_consistency": (
+            auxiliary["psnr_positive_probes"] >= 3
+            and auxiliary["ssim_positive_probes"] >= 3
+            and auxiliary["lpips_mean"] >= 0
+            and auxiliary["mae_mean"] >= 0
+        ),
+        "repeat_jitter": all(value <= 1e-7 for value in candidate["repeat_jitter"].values()),
+    }
+    return {
+        "pass": all(checks.values()),
+        "checks": checks,
+        "fusion_output_gate": fusion_gate,
+        "auxiliary_removal": auxiliary,
+    }
+
+
+def prepare_phase_b(args) -> dict:
+    root = args.repo_root.resolve()
+    campaign = args.campaign_root.resolve()
+    phase_a_path = campaign / "analysis" / "phase_a_summary.json"
+    phase_a = read_json(phase_a_path)
+    if not phase_a.get("integrity", {}).get("pass") or not phase_a.get("decision", {}).get("proceed_phase_b"):
+        raise RuntimeError("Phase B is gated off by Phase A")
+    revision = _git_revision(root)
+    origin_revision = _origin_master_revision(root)
+    if revision != origin_revision:
+        raise RuntimeError("Phase B must bind a pushed origin/master commit")
+    source_config = root / "configs" / "stage3_2" / "A3_no_self_local_band_chair_1000.json"
+    config_target = campaign / "phase_b" / "config" / source_config.name
+    copy_or_verify(source_config, config_target)
+    config = load_stage3_config(config_target)
+    if (
+        config.allow_self_view_source
+        or config.steps != 1000
+        or config.views != 4
+        or config.epipolar_attention != "local_band"
+        or config.epipolar_band != 1.5
+        or config.target_lr_dropout != 0.5
+    ):
+        raise ValueError("Phase B pilot config drift")
+    phase_a_protocol = read_json(campaign / "protocol.json")
+    seen_manifest = Path(phase_a_protocol["cells"]["v4"]["seen_manifest"])
+    baseline_eval = args.self_allowed_baseline.resolve()
+    baseline_checkpoint = baseline_eval.parent.parent.parent / "train" / "chair" / "seed42" / "stage3_step_1000.pt"
+    required = (
+        seen_manifest,
+        baseline_eval / "evaluation_rows.jsonl",
+        baseline_eval / "evaluation_summary.json",
+        baseline_checkpoint,
+        args.bridge_checkpoint,
+    )
+    for path in required:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    protocol = {
+        "schema_version": 1,
+        "scope": "stage3_2_camera_causality_phase_b_pilot",
+        "git_revision": revision,
+        "origin_master_revision": origin_revision,
+        "training_seed": 42,
+        "inference_seed": INFERENCE_SEED,
+        "steps": 1000,
+        "probe_ids": list(PROBE_IDS),
+        "modes": list(PHASE_B_MODES),
+        "config": str(config_target),
+        "config_sha256": sha256_file(config_target),
+        "seen_manifest": str(seen_manifest),
+        "seen_manifest_sha256": sha256_file(seen_manifest),
+        "baseline_eval": str(baseline_eval),
+        "baseline_evaluation_rows_sha256": sha256_file(baseline_eval / "evaluation_rows.jsonl"),
+        "baseline_checkpoint": str(baseline_checkpoint),
+        "baseline_checkpoint_sha256": sha256_file(baseline_checkpoint),
+        "bridge_checkpoint": str(args.bridge_checkpoint.resolve()),
+        "bridge_checkpoint_sha256": sha256_file(args.bridge_checkpoint),
+        "phase_a_summary_sha256": sha256_file(phase_a_path),
+        "stage4_status": "HOLD",
+        "stage5_4dsr": "preserved; outside this campaign",
+    }
+    write_frozen_json(campaign / "phase_b" / "protocol.json", protocol)
+    return protocol
+
+
+def _run_logged(command: list[str], *, args, log_path: Path, append: bool = False) -> None:
+    _gpu_is_idle(args.gpu)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    environment["PYTHONPATH"] = str(args.repo_root / "src")
+    environment["PYTHONUNBUFFERED"] = "1"
+    with log_path.open("a" if append else "w", encoding="utf-8") as stream:
+        stream.write(shlex.join(command) + "\n")
+        stream.flush()
+        subprocess.run(
+            command,
+            cwd=args.repo_root,
+            env=environment,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+
+
+def train_phase_b_pilot(args) -> Path:
+    protocol = read_json(args.campaign_root / "phase_b" / "protocol.json")
+    output = args.campaign_root / "phase_b" / "train" / "no_self" / "seed42"
+    final = output / "stage3_step_1000.pt"
+    rows_path = output / "train_steps.jsonl"
+    if final.is_file() and rows_path.is_file() and len(read_jsonl(rows_path)) == 1000:
+        return final
+    resume = None
+    if output.exists() and any(output.iterdir()):
+        candidates = sorted(output.glob("stage3_step_*.pt"))
+        if not candidates:
+            raise RuntimeError(f"incomplete Phase B training is not resumable: {output}")
+        resume = candidates[-1]
+    command = [
+        args.python,
+        str(args.repo_root / "scripts" / "stage3_experiment.py"),
+        "train",
+        "--config", protocol["config"],
+        *_runtime_args(args),
+        "--seed", "42",
+        "--output-dir", str(output),
+    ]
+    if resume is not None:
+        command.extend(("--resume", str(resume)))
+    suffix = "resume" if resume is not None else "initial"
+    control = args.campaign_root / "control" / f"phase_b_seed42_train_{suffix}.command.txt"
+    control.parent.mkdir(parents=True, exist_ok=True)
+    text = shlex.join(command) + "\n"
+    if control.is_file() and control.read_text(encoding="utf-8") != text:
+        raise RuntimeError(f"command drift: {control}")
+    control.write_text(text, encoding="utf-8")
+    _run_logged(
+        command,
+        args=args,
+        log_path=args.campaign_root / "logs" / f"phase_b_seed42_train_{suffix}.log",
+        append=resume is not None,
+    )
+    if not final.is_file() or len(read_jsonl(rows_path)) != 1000:
+        raise RuntimeError("Phase B pilot training did not complete 1000 contiguous steps")
+    return final
+
+
+def evaluate_phase_b_pilot(args) -> Path:
+    protocol = read_json(args.campaign_root / "phase_b" / "protocol.json")
+    checkpoint = args.campaign_root / "phase_b" / "train" / "no_self" / "seed42" / "stage3_step_1000.pt"
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    output = args.campaign_root / "phase_b" / "eval" / "no_self" / "seed42"
+    if output.exists() and any(output.iterdir()):
+        summary = output / "evaluation_summary.json"
+        if summary.is_file() and read_json(summary).get("rows") == 28:
+            return output
+        raise RuntimeError(f"refusing to reuse incomplete Phase B evaluation: {output}")
+    command = [
+        args.python,
+        str(args.repo_root / "scripts" / "stage3_experiment.py"),
+        "seen-eval",
+        "--config", protocol["config"],
+        *_runtime_args(args),
+        "--checkpoint", str(checkpoint),
+        "--seen-manifest", protocol["seen_manifest"],
+        "--subset", "probe",
+        "--inference-seeds", str(INFERENCE_SEED),
+        "--modes", *PHASE_B_MODES,
+        "--save-diagnostics",
+        "--save-images",
+        "--output-dir", str(output),
+    ]
+    control = args.campaign_root / "control" / "phase_b_seed42_eval.command.txt"
+    control.parent.mkdir(parents=True, exist_ok=True)
+    control.write_text(shlex.join(command) + "\n", encoding="utf-8")
+    _run_logged(command, args=args, log_path=args.campaign_root / "logs" / "phase_b_seed42_eval.log")
+    return output
+
+
+def _clean_log(path: Path) -> bool:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return not any(marker in text.lower() for marker in ("traceback", "out of memory", "cuda error")) \
+        and re.search(r"\bnan\b", text, flags=re.IGNORECASE) is None
+
+
+def phase_b_integrity(args) -> dict:
+    checks: dict[str, bool] = {}
+    details: dict[str, object] = {}
+    try:
+        protocol = read_json(args.campaign_root / "phase_b" / "protocol.json")
+        config_path = Path(protocol["config"])
+        config = load_stage3_config(config_path)
+        expected_config = read_json(config_path)
+        train_dir = args.campaign_root / "phase_b" / "train" / "no_self" / "seed42"
+        eval_dir = args.campaign_root / "phase_b" / "eval" / "no_self" / "seed42"
+        train_rows = read_jsonl(train_dir / "train_steps.jsonl")
+        manifest = read_json(train_dir / "run_manifest.json")
+        evaluation_rows = read_jsonl(eval_dir / "evaluation_rows.jsonl")
+        baseline_rows = read_jsonl(eval_dir / "baseline_rows.jsonl")
+        diagnostics = read_jsonl(eval_dir / "diagnostics.jsonl")
+        summary = read_json(eval_dir / "evaluation_summary.json")
+        checkpoint_path = train_dir / "stage3_step_1000.pt"
+        checks["pushed_git"] = (
+            protocol["git_revision"] == protocol["origin_master_revision"] == _git_revision(args.repo_root)
+        )
+        checks["config_hash"] = sha256_file(config_path) == protocol["config_sha256"]
+        checks["no_self_config"] = config.allow_self_view_source is False
+        checks["continuous_1000_steps"] = (
+            len(train_rows) == 1000 and [row.get("step") for row in train_rows] == list(range(1, 1001))
+        )
+        checks["training_values_finite"] = all(
+            math.isfinite(float(row[key]))
+            for row in train_rows
+            for key in ("loss", "gradient_norm", "fusion_gradient_norm")
+        )
+        checks["target_dropout_exercised"] = sum(int(row.get("target_lr_drop_count", 0)) for row in train_rows) > 0
+        checks["manifest_config"] = manifest.get("config") == expected_config
+        checks["manifest_seed"] = manifest.get("provenance", {}).get("training_seed") == 42
+        checks["manifest_git"] = manifest.get("provenance", {}).get("git_revision") == protocol["git_revision"]
+        checks["manifest_bridge_hash"] = manifest.get("provenance", {}).get("bridge_checkpoint_sha256") == protocol["bridge_checkpoint_sha256"]
+        checks["parameter_counts"] = all(manifest.get(key) == value for key, value in EXPECTED_PARAMETER_COUNTS.items())
+        checks["checkpoint_exists"] = checkpoint_path.is_file()
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        checks["checkpoint_round_trip"] = payload.get("step") == 1000 and payload.get("config") == expected_config
+        del payload
+        checks["evaluation_rows_28"] = len(evaluation_rows) == summary.get("rows") == 28
+        checks["baseline_rows_8"] = len(baseline_rows) == summary.get("baseline_rows") == 8
+        checks["diagnostic_rows_24"] = len(diagnostics) == summary.get("diagnostic_rows") == 24
+        checks["evaluation_protocol"] = (
+            summary.get("conditions") == list(PHASE_B_MODES)
+            and summary.get("inference_seeds") == [INFERENCE_SEED]
+            and summary.get("groups") == 4
+            and summary.get("seen_manifest_sha256") == protocol["seen_manifest_sha256"]
+        )
+        checks["evaluation_values_finite"] = all(
+            math.isfinite(float(row[metric]))
+            for row in (*evaluation_rows, *baseline_rows)
+            for metric in METRICS
+        )
+        checks["evaluation_images_44"] = len(list((eval_dir / "images").rglob("*.png"))) == 44
+        checks["logs_clean"] = _clean_log(args.campaign_root / "logs" / "phase_b_seed42_train_initial.log") \
+            and _clean_log(args.campaign_root / "logs" / "phase_b_seed42_eval.log")
+        details.update({
+            "train_rows": len(train_rows),
+            "evaluation_rows": len(evaluation_rows),
+            "baseline_rows": len(baseline_rows),
+            "diagnostic_rows": len(diagnostics),
+            "checkpoint_sha256": sha256_file(checkpoint_path),
+        })
+    except Exception as error:
+        checks["artifact_read_complete"] = False
+        details["error"] = f"{type(error).__name__}: {error}"
+    return {"pass": bool(checks) and all(checks.values()), "checks": checks, "details": details}
+
+
+def analyze_phase_b_pilot(args) -> dict:
+    protocol = read_json(args.campaign_root / "phase_b" / "protocol.json")
+    candidate = _phase_b_eval_payload(
+        args.campaign_root / "phase_b" / "eval" / "no_self" / "seed42"
+    )
+    baseline = _phase_b_eval_payload(Path(protocol["baseline_eval"]))
+    integrity = phase_b_integrity(args)
+    gate = phase_b_pilot_gate(candidate, baseline, integrity)
+    result = {
+        "scope": "stage3_2_camera_causality_phase_b_pilot",
+        "claim_limit": "seen-train 3DSR camera-pair causality only",
+        "stage4_status": "HOLD",
+        "candidate": candidate,
+        "self_allowed_baseline": baseline,
+        "integrity": integrity,
+        "gate": gate,
+        "next": "RUN_2000_STEP_REPLICATION" if gate["pass"] else "PROCEED_PHASE_C",
+    }
+    analysis = args.campaign_root / "analysis"
+    write_json(analysis / "phase_b_pilot_summary.json", result)
+    write_json(analysis / "machine_verdict.json", {
+        "CAMERA_FUSION_PASS": False,
+        "STAGE4_READY": False,
+        "phase_a_verdict": "PROCEED_PHASE_B",
+        "phase_b_pilot_pass": gate["pass"],
+        "next": result["next"],
+    })
+    lines = [
+        "# Stage 3.2 camera-pair causality — Phase B pilot",
+        "",
+        "Stage 4 large-scale supervised 3DSR remains **HOLD**. No 4DSR experiment was run.",
+        "",
+        f"Pilot verdict: **{'PASS' if gate['pass'] else 'HOLD'}**",
+        f"Next action: **{result['next']}**",
+        "",
+    ]
+    for name, value in gate["checks"].items():
+        lines.append(f"- `{name}`: `{value}`")
+    (analysis / "phase_b_pilot_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return result
+
+
 def _require_runtime(args) -> None:
     for name in ("dataset_root", "model_dir", "lq_source", "lq_checkpoint", "bridge_checkpoint"):
         path = Path(getattr(args, name))
@@ -776,10 +1149,18 @@ def _require_runtime(args) -> None:
 def build_parser() -> argparse.ArgumentParser:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "audit", "preflight", "evaluate", "analyze", "run"))
+    parser.add_argument("command", choices=(
+        "prepare", "audit", "preflight", "evaluate", "analyze", "run",
+        "phase-b-prepare", "phase-b-train", "phase-b-evaluate", "phase-b-analyze", "phase-b-pilot",
+    ))
     parser.add_argument("--repo-root", type=Path, default=root)
     parser.add_argument("--campaign-root", type=Path, default=root / "artifacts" / "stage3_2_camera_causality_20260913")
     parser.add_argument("--source-campaign", type=Path, default=root / "artifacts" / "stage3_1_views_20260912")
+    parser.add_argument(
+        "--self-allowed-baseline",
+        type=Path,
+        default=root / "artifacts" / "stage3_1_local_band_20260912" / "eval" / "chair" / "seed42",
+    )
     parser.add_argument("--dataset-root", type=Path, default=root / "datasets" / "nerf_synthetic")
     parser.add_argument("--model-dir", type=Path, default=root / "models" / "Wan2.1-T2V-1.3B")
     parser.add_argument("--lq-source", type=Path, default=Path("/home/linzizhuo/rl3dsr-new/data/rl3dsr/external/FlashVSR/examples/WanVSR/utils/utils.py"))
@@ -795,6 +1176,7 @@ def main(argv: list[str] | None = None) -> None:
     args.repo_root = args.repo_root.resolve()
     args.campaign_root = args.campaign_root.resolve()
     args.source_campaign = args.source_campaign.resolve()
+    args.self_allowed_baseline = args.self_allowed_baseline.resolve()
     args.dataset_root = args.dataset_root.resolve()
     if args.command in {"prepare", "audit", "preflight", "evaluate", "run"}:
         _require_runtime(args)
@@ -809,6 +1191,18 @@ def main(argv: list[str] | None = None) -> None:
     if args.command in {"analyze", "run"}:
         result = analyze(args)
         print(json.dumps(result["decision"], indent=2))
+    if args.command in {"phase-b-prepare", "phase-b-pilot"}:
+        _require_runtime(args)
+        prepare_phase_b(args)
+    if args.command in {"phase-b-train", "phase-b-pilot"}:
+        _require_runtime(args)
+        train_phase_b_pilot(args)
+    if args.command in {"phase-b-evaluate", "phase-b-pilot"}:
+        _require_runtime(args)
+        evaluate_phase_b_pilot(args)
+    if args.command in {"phase-b-analyze", "phase-b-pilot"}:
+        result = analyze_phase_b_pilot(args)
+        print(json.dumps({"pilot_pass": result["gate"]["pass"], "next": result["next"]}, indent=2))
 
 
 if __name__ == "__main__":
