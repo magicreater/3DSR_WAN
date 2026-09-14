@@ -198,7 +198,9 @@ def project_camera_directions(camera: CameraBatch, directions: Tensor) -> tuple[
     v = intrinsics[..., 1, 1, None] * y / safe + intrinsics[..., 1, 2, None]
     pixels = torch.stack((u, v), dim=-1)
     valid = valid & torch.isfinite(pixels).all(dim=-1)
-    return torch.where(valid[..., None], pixels, torch.zeros_like(pixels)), denominator
+    pixels = torch.where(valid[..., None], pixels, torch.zeros_like(pixels))
+    denominator = torch.where(valid, denominator, torch.zeros_like(denominator))
+    return pixels, denominator
 
 
 def _canonical_patch_rays(camera: CameraBatch, grid: tuple[int, int]) -> Tensor:
@@ -719,12 +721,13 @@ def convert_official_ucpe_checkpoint(
 ) -> dict[str, str]:
     """Convert one pinned official UCPE adapter checkpoint to format v2.
 
-    The input contract is the adapter-only Lightning ``state_dict`` emitted by
-    UCPE commit :data:`OFFICIAL_UCPE_COMMIT`. Every tensor is mapped by name
-    and checked against the destination module before any file is written.
-    Provenance, including the hash of the completed output, is stored in an
-    adjacent ``.provenance.json`` file because a file cannot contain its own
-    cryptographic digest.
+    The caller must assert that the adapter-only Lightning ``state_dict`` was
+    emitted by UCPE commit :data:`OFFICIAL_UCPE_COMMIT`. That asserted source
+    commit is recorded explicitly as ``asserted_source_commit``. Every tensor
+    is mapped by name and checked against the destination module before any
+    file is written. Provenance, including the hash of the completed output,
+    is stored in an adjacent ``.provenance.json`` file because a file cannot
+    contain its own cryptographic digest.
     """
 
     source = Path(source_path)
@@ -789,7 +792,6 @@ def convert_official_ucpe_checkpoint(
                     "absmap": module.absmap,
                     "world_up": list(module.world_up),
                 },
-                "source_commit": OFFICIAL_UCPE_COMMIT,
                 "asserted_source_commit": asserted_source_commit,
                 "source_checkpoint_sha256": input_sha256,
                 "trainable_parameters": sum(value.numel() for value in module.parameters() if value.requires_grad),

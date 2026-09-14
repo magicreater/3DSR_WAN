@@ -100,6 +100,18 @@ def test_ucm_projection_masks_its_model_denominator_singularity():
     assert torch.equal(pixels, torch.zeros_like(pixels))
 
 
+def test_projection_invalidates_finite_denominator_when_calibration_overflows_pixels():
+    camera = _camera()
+    intrinsics = camera.K.clone()
+    intrinsics[..., 0, 0] = torch.finfo(torch.float32).max
+    camera = replace(camera, K=intrinsics)
+    pixels, denominator = project_camera_directions(
+        camera, torch.tensor([[[[2.0, 0.0, 1.0]]]])
+    )
+    assert torch.equal(pixels, torch.zeros_like(pixels))
+    assert torch.equal(denominator, torch.zeros_like(denominator))
+
+
 def test_world_to_ray_uses_ucm_denominator_for_lat_up_projection():
     intrinsics = torch.tensor(
         [[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]]
@@ -193,6 +205,23 @@ def test_camera_context_preserves_bfloat16_storage_dtype():
     assert rays.dtype == torch.bfloat16
     assert context.world_to_ray.dtype == torch.bfloat16
     assert context.absmap.dtype == torch.bfloat16
+    assert torch.isfinite(rays).all()
+    assert torch.isfinite(context.world_to_ray).all()
+    assert torch.isfinite(context.absmap).all()
+
+
+def test_ucm_camera_rays_and_context_are_finite_in_bfloat16():
+    camera = replace(
+        _camera(dtype=torch.bfloat16),
+        camera_model="ucm",
+        xi=torch.tensor([[0.5]], dtype=torch.bfloat16),
+    )
+    rays, valid = build_camera_rays(camera, (2, 2), return_validity=True)
+    context = build_world_to_ray(camera, (2, 2))
+    assert rays.dtype == torch.bfloat16
+    assert context.world_to_ray.dtype == torch.bfloat16
+    assert context.absmap.dtype == torch.bfloat16
+    assert valid.all()
     assert torch.isfinite(rays).all()
     assert torch.isfinite(context.world_to_ray).all()
     assert torch.isfinite(context.absmap).all()

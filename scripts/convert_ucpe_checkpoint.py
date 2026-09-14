@@ -16,7 +16,7 @@ def main() -> None:
     parser.add_argument(
         "--assert-source-commit",
         required=True,
-        help="official UCPE source commit asserted for this checkpoint",
+        help="asserted official UCPE source commit for this checkpoint",
     )
     args = parser.parse_args()
     print(
