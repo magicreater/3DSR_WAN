@@ -124,8 +124,15 @@ def _json_sha256(value) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _initialization_module_policy(reset_fusion: bool) -> tuple[list[str], list[str]]:
+    if reset_fusion:
+        return ["bridge", "geometry"], ["fusion"]
+    return ["bridge", "geometry", "fusion"], []
+
+
 def _initialization_provenance(path: Path, payload: dict, *, reset_fusion: bool = False) -> dict:
     """Describe a model-only parent without carrying over its run state."""
+    copied_modules, reset_modules = _initialization_module_policy(reset_fusion)
     return {
         "initialization_mode": "model_only",
         "parent_checkpoint": str(Path(path).resolve()),
@@ -133,7 +140,23 @@ def _initialization_provenance(path: Path, payload: dict, *, reset_fusion: bool 
         "parent_saved_step": int(payload["step"]),
         "parent_saved_config_sha256": _json_sha256(payload.get("config") or {}),
         "reset_fusion": bool(reset_fusion),
+        "copied_modules": copied_modules,
+        "reset_modules": reset_modules,
     }
+
+
+def _assert_manifest_initialization(provenance: dict, mode: str, reset_fusion: bool) -> None:
+    """Fail before manifest write if its initialization declaration is ambiguous."""
+    expected_copied, expected_reset = (
+        _initialization_module_policy(reset_fusion)
+        if mode == "model_only" else ([], [])
+    )
+    if provenance.get("initialization_mode") != mode:
+        raise RuntimeError("manifest initialization mode mismatch")
+    if provenance.get("copied_modules") != expected_copied:
+        raise RuntimeError("manifest copied_modules mismatch")
+    if provenance.get("reset_modules") != expected_reset:
+        raise RuntimeError("manifest reset_modules mismatch")
 
 
 def _initialization_mode(resume, init_checkpoint, reset_fusion: bool) -> str:
@@ -796,10 +819,13 @@ def interpolate_fusion_camera_dose(
         or correct.K.dtype != wrong.K.dtype
     ):
         raise ValueError("camera dose endpoints must share metadata, device and dtype")
-    if not torch.equal(correct.K[:, :1], wrong.K[:, :1]) or not torch.equal(
-        correct.T_world_from_camera[:, :1], wrong.T_world_from_camera[:, :1]
+    target = correct.reference_index
+    if not torch.equal(correct.K[:, target], wrong.K[:, target]) or not torch.equal(
+        correct.T_world_from_camera[:, target], wrong.T_world_from_camera[:, target]
     ):
         raise ValueError("camera dose endpoints must preserve the target view")
+    if correct.xi is not None and not torch.equal(correct.xi[:, target], wrong.xi[:, target]):
+        raise ValueError("camera dose endpoints must preserve target xi")
     if alpha == 0:
         return correct
     if alpha == 1:
@@ -816,6 +842,10 @@ def interpolate_fusion_camera_dose(
     transform[..., 3, 3] = 1
     intrinsics = torch.lerp(correct.K, wrong.K, alpha)
     xi = None if correct.xi is None else torch.lerp(correct.xi, wrong.xi, alpha)
+    intrinsics[:, target] = correct.K[:, target]
+    transform[:, target] = correct.T_world_from_camera[:, target]
+    if xi is not None:
+        xi[:, target] = correct.xi[:, target]
     return CameraBatch(
         intrinsics,
         transform,
@@ -836,6 +866,7 @@ def _training_state(optimizer, sigma_cycle, view_generator, noise_generator, ste
                     dropout_generator=None, pairing_generator=None):
     numpy_state = np.random.get_state()
     state = {
+        "format_version": 2,
         "step": step,
         "optimizer": optimizer.state_dict(),
         "sigma_cycle": sigma_cycle.state_dict(),
@@ -877,6 +908,23 @@ def _validate_runtime_inputs(args, *, checkpoint: Path | None = None) -> None:
 
 def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise_generator,
                             dropout_generator=None, pairing_generator=None):
+    version = state.get("format_version", 1)
+    if type(version) is not int or version not in {1, 2}:
+        raise ValueError("unsupported training state format")
+    required = {
+        "step", "optimizer", "sigma_cycle", "view_generator_state",
+        "noise_generator_state", "python_rng_state", "numpy_rng_state",
+        "torch_rng_state",
+    }
+    if pairing_generator is not None:
+        required.add("pairing_generator_state")
+    if version >= 2 and dropout_generator is not None:
+        required.add("dropout_generator_state")
+    if version >= 2 and torch.cuda.is_available():
+        required.add("cuda_rng_state_all")
+    missing = sorted(required - set(state))
+    if missing:
+        raise ValueError(f"resume checkpoint is missing required RNG/training state: {missing}")
     optimizer.load_state_dict(state["optimizer"])
     sigma_cycle.load_state_dict(state["sigma_cycle"])
     view_generator.set_state(state["view_generator_state"])
@@ -884,8 +932,6 @@ def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise
     if dropout_generator is not None and "dropout_generator_state" in state:
         dropout_generator.set_state(state["dropout_generator_state"])
     if pairing_generator is not None:
-        if "pairing_generator_state" not in state:
-            raise ValueError("resume checkpoint is missing camera pairing RNG state")
         pairing_generator.set_state(state["pairing_generator_state"])
     random.setstate(state["python_rng_state"])
     numpy_state = state["numpy_rng_state"]
@@ -1038,12 +1084,15 @@ def _train(args, config: Stage3Config) -> None:
         "rre_checkpoint_sha256": None if args.rre_checkpoint is None else _sha256(args.rre_checkpoint),
         "git_revision": _git_revision(),
         "initialization_mode": initialization_mode,
+        "copied_modules": [],
+        "reset_modules": [],
     }
     if init_checkpoint is not None:
         provenance.update(_initialization_provenance(
             init_checkpoint, init_payload, reset_fusion=init_reset_fusion
         ))
     if resume_checkpoint is None:
+        _assert_manifest_initialization(provenance, initialization_mode, init_reset_fusion)
         manifest = {
             "config": config.to_dict(),
             "provenance": provenance,
@@ -1359,6 +1408,18 @@ def inverse_permute_joint_output(output: torch.Tensor, metadata: dict) -> torch.
     return permute_view_tensor(output, inverse_view_permutation(permutation))
 
 
+def _canonicalize_prepared_views(
+    prepared: torch.Tensor, permutation, views: int
+) -> torch.Tensor:
+    if permutation is None:
+        return prepared
+    if prepared.ndim != 3 or prepared.shape[1] % views:
+        raise ValueError("prepared features do not split into view slots")
+    shaped = prepared.reshape(prepared.shape[0], views, -1, prepared.shape[-1])
+    inverse = inverse_view_permutation(permutation).to(prepared.device)
+    return shaped.index_select(1, inverse).reshape_as(prepared)
+
+
 def _save_frame(path: Path, video: torch.Tensor) -> None:
     from PIL import Image
 
@@ -1396,7 +1457,8 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
                          changed_lr: torch.Tensor, fusion_camera: CameraBatch,
                          geometry_camera: CameraBatch,
                          source_mask: torch.Tensor, group: dict, condition: str,
-                         allow_self_view_source: bool | None = None) -> dict:
+                         allow_self_view_source: bool | None = None,
+                         view_permutation=None) -> dict:
     """Measure how an intervention changes prepared and bridge residual features."""
     fusion_module = getattr(runtime.module, "fusion", None)
     if fusion_module is not None:
@@ -1418,6 +1480,9 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
         (config.image_size, config.image_size),
         source_mask=source_mask,
         allow_self_view_source=allow_self_view_source,
+    )
+    changed = _canonicalize_prepared_views(
+        changed, view_permutation, tuple(clean_shape[2:])[0]
     )
     changed_fusion = _scalar_diagnostics(
         getattr(fusion_module, "last_diagnostics", {})
@@ -1704,6 +1769,7 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                             group,
                             mode,
                             self_source_override,
+                            intervention_metadata.get("permutation"),
                         )
                         diagnostic.update(_trace_delta(mode_diagnostics[reference_mode], mode_diagnostics[mode]))
                         diagnostic.update({

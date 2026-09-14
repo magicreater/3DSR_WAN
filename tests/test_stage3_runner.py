@@ -61,7 +61,17 @@ def test_initialization_provenance_records_resolved_parent_and_saved_config(runn
         "parent_saved_step": 1000,
         "parent_saved_config_sha256": runner._json_sha256(payload["config"]),
         "reset_fusion": True,
+        "copied_modules": ["bridge", "geometry"],
+        "reset_modules": ["fusion"],
     }
+    copied = runner._initialization_provenance(parent, payload, reset_fusion=False)
+    assert copied["copied_modules"] == ["bridge", "geometry", "fusion"]
+    assert copied["reset_modules"] == []
+    runner._assert_manifest_initialization(result, "model_only", True)
+    with pytest.raises(RuntimeError, match="copied_modules"):
+        runner._assert_manifest_initialization(
+            {**result, "copied_modules": ["fusion"]}, "model_only", True
+        )
 
 
 def test_init_reset_fusion_requires_model_only_parent(runner):
@@ -273,6 +283,53 @@ def test_training_state_restores_target_dropout_rng(runner):
     assert torch.equal(torch.rand(3, generator=dropout_generator), expected)
 
 
+def test_current_training_state_requires_dropout_and_cuda_rng_before_mutation(runner, monkeypatch):
+    class Cycle:
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, _state):
+            pytest.fail("validation must precede mutation")
+
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.AdamW([parameter], lr=0.3)
+    view = torch.Generator().manual_seed(1)
+    noise = torch.Generator().manual_seed(2)
+    dropout = torch.Generator().manual_seed(3)
+    state = runner._training_state(optimizer, Cycle(), view, noise, 7, dropout)
+    assert state["format_version"] == 2
+    state.pop("dropout_generator_state")
+    with pytest.raises(ValueError, match="dropout_generator_state"):
+        runner._restore_training_state(state, optimizer, Cycle(), view, noise, dropout)
+    assert optimizer.param_groups[0]["lr"] == 0.3
+
+    state = runner._training_state(optimizer, Cycle(), view, noise, 7)
+    state.pop("cuda_rng_state_all", None)
+    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: True)
+    with pytest.raises(ValueError, match="cuda_rng_state_all"):
+        runner._restore_training_state(state, optimizer, Cycle(), view, noise)
+
+
+def test_legacy_training_state_documents_optional_dropout_rng(runner):
+    class Cycle:
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state):
+            assert state == {}
+
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(()))])
+    view = torch.Generator().manual_seed(1)
+    noise = torch.Generator().manual_seed(2)
+    dropout = torch.Generator().manual_seed(3)
+    state = runner._training_state(optimizer, Cycle(), view, noise, 7, dropout)
+    state.pop("format_version")
+    state.pop("dropout_generator_state")
+    before = dropout.get_state().clone()
+    runner._restore_training_state(state, optimizer, Cycle(), view, noise, dropout)
+    assert torch.equal(dropout.get_state(), before)
+
+
 def test_training_state_restores_pairing_rng(runner):
     class Cycle:
         def state_dict(self):
@@ -472,26 +529,81 @@ def test_joint_permutation_sample_uses_permuted_paired_noise_and_inverse_output(
     )
 
 
+def test_joint_permutation_feature_diagnostics_compare_canonical_view_order(runner):
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+    from rl3dsr.validation.stage3_protocol import Stage3Config
+
+    permutation = torch.tensor([2, 0, 1])
+    lr = torch.arange(3).reshape(1, 1, 3, 1, 1).float()
+    transforms = torch.eye(4).repeat(1, 3, 1, 1)
+    transforms[0, :, 0, 3] = torch.arange(3)
+    camera = CameraBatch(torch.eye(3).repeat(1, 3, 1, 1), transforms, (16, 16), "multiview")
+    permuted = runner.apply_joint_view_permutation(
+        permutation, lr=lr, fusion_camera=camera, geometry_camera=camera
+    )
+
+    class Conditioner:
+        @staticmethod
+        def bridge_residuals(features, _timestep):
+            return {0: features}
+
+    module = SimpleNamespace(
+        fusion=None,
+        conditioner=Conditioner(),
+        prepare_multiview=lambda value, *_args, **_kwargs: value.flatten(2).transpose(1, 2),
+    )
+    result = runner._feature_diagnostics(
+        SimpleNamespace(module=module),
+        lr,
+        camera,
+        (1, 1, 3, 1, 1),
+        Stage3Config(image_size=16, views=3),
+        permuted["lr"],
+        permuted["fusion_camera"],
+        permuted["geometry_camera"],
+        torch.ones(1, 3, dtype=torch.bool),
+        {"id": "chair:000", "scene": "chair", "anchor": 0},
+        "joint_permute",
+        view_permutation=permutation,
+    )
+    assert result["prepared_feature_delta"] == 0
+    assert result["bridge"]["block_0"]["delta_norm"] == 0
+
+
 def test_fusion_camera_dose_uses_valid_se3_and_exact_endpoints(runner):
     from rl3dsr.models.wan.geometry_conditioning import CameraBatch
 
     k = torch.eye(3).repeat(1, 3, 1, 1)
     k[0, :, 0, 0] = torch.tensor([1.0, 2.0, 3.0])
     correct_t = torch.eye(4).repeat(1, 3, 1, 1)
+    angle = torch.tensor(0.37)
+    correct_t[0, 0, :3, :3] = torch.tensor([
+        [torch.cos(angle), -torch.sin(angle), 0.0],
+        [torch.sin(angle), torch.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    correct_t[0, 0, :3, 3] = torch.tensor([0.25, -0.5, 1.5])
     wrong_t = correct_t.clone()
     wrong_t[0, 1, :3, :3] = torch.tensor([[0., -1., 0.], [-1., 0., 0.], [0., 0., -1.]])
     wrong_t[0, 2, :3, :3] = torch.tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
     wrong_t[0, 1:, :3, 3] = torch.tensor([[2., 4., 6.], [4., 8., 12.]])
-    correct = CameraBatch(k, correct_t, (8, 8), "multiview")
+    xi = torch.tensor([[0.2, 0.3, 0.4]])
+    correct = CameraBatch(k, correct_t, (8, 8), "multiview", camera_model="ucm", xi=xi)
     wrong_k = k.clone()
     wrong_k[:, 1:] = k[:, [2, 1]]
-    wrong = CameraBatch(wrong_k, wrong_t, (8, 8), "multiview")
+    wrong_xi = xi.clone()
+    wrong_xi[:, 1:] = xi[:, [2, 1]]
+    wrong = CameraBatch(
+        wrong_k, wrong_t, (8, 8), "multiview", camera_model="ucm", xi=wrong_xi
+    )
     dose0 = runner.interpolate_fusion_camera_dose(correct, wrong, 0.0)
     dose_half = runner.interpolate_fusion_camera_dose(correct, wrong, 0.5)
     dose1 = runner.interpolate_fusion_camera_dose(correct, wrong, 1.0)
     assert torch.equal(dose0.K, correct.K) and torch.equal(dose0.T_world_from_camera, correct.T_world_from_camera)
     assert torch.equal(dose1.K, wrong.K) and torch.equal(dose1.T_world_from_camera, wrong.T_world_from_camera)
     assert torch.equal(dose_half.T_world_from_camera[:, :1], correct.T_world_from_camera[:, :1])
+    assert torch.equal(dose_half.K[:, :1], correct.K[:, :1])
+    assert torch.equal(dose_half.xi[:, :1], correct.xi[:, :1])
     rotation = dose_half.T_world_from_camera[..., :3, :3]
     identity = torch.eye(3).expand_as(rotation)
     assert torch.allclose(rotation.transpose(-1, -2) @ rotation, identity, atol=1e-5)
