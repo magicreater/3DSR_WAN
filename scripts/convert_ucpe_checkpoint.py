@@ -13,8 +13,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="official adapter-only Lightning checkpoint")
     parser.add_argument("destination", type=Path, help="new RL3dSR format-v2 checkpoint")
+    parser.add_argument(
+        "--assert-source-commit",
+        required=True,
+        help="official UCPE source commit asserted for this checkpoint",
+    )
     args = parser.parse_args()
-    print(json.dumps(convert_official_ucpe_checkpoint(args.source, args.destination), sort_keys=True))
+    print(
+        json.dumps(
+            convert_official_ucpe_checkpoint(
+                args.source,
+                args.destination,
+                asserted_source_commit=args.assert_source_commit,
+            ),
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

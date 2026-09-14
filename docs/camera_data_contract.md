@@ -43,6 +43,29 @@ The source dataset is modeled as a centered, square-pixel pinhole camera with
 no skew or distortion. No resize or crop is performed by this adapter; a later
 operation that changes image geometry must update `K` explicitly.
 
+### Model metadata used by UCPE
+
+`CameraBatch.camera_model` makes the projection model explicit at the model
+boundary. It defaults to `pinhole`, for which `xi` must be omitted, so existing
+dataset adapters and call sites retain their previous behavior. `ucm` selects
+the unified camera model and requires a finite, non-negative floating-point
+`xi[B,S]` on the same device as `K`, with one value per view or frame.
+
+For a UCM camera-frame direction `d = (X,Y,Z)`, `K` is interpreted through
+
+```text
+u = fx * X / (Z + xi * ||d||) + cx
+v = fy * Y / (Z + xi * ||d||) + cy
+```
+
+The inverse is defined only where
+`1 + (1 - xi^2) * (mx^2 + my^2) >= 0` for normalized image coordinates
+`(mx,my)`. Values `xi > 1` are supported only over that valid image domain;
+`xi = 0` is the pinhole limit. UCPE ray construction returns an explicit
+validity mask. Invalid inverse-domain rays are kept finite and excluded from
+context: their ray and absolute map are zero and their world-to-ray transform
+is identity. Singular forward projections are masked out of the absolute map.
+
 ## Extrinsic convention
 
 `T_world_from_camera` is camera-to-world:

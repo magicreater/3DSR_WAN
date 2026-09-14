@@ -3,12 +3,16 @@
 from rl3dsr.models.wan.checkpoint import WanCheckpoint
 from rl3dsr.models.wan.dit import WanDiT
 from rl3dsr.models.wan.geometry_conditioning import (
+    OFFICIAL_UCPE_COMMIT,
     CameraBatch,
     FullRREConditioner,
     FullRREContext,
     GeometryConditioner,
+    build_camera_rays,
     build_world_to_ray,
+    convert_official_ucpe_checkpoint,
     load_geometry_checkpoint,
+    project_camera_directions,
     save_geometry_checkpoint,
 )
 from rl3dsr.models.wan.flow import flow_matching_loss, flow_matching_pair
@@ -30,12 +34,16 @@ from rl3dsr.models.wan.stage3 import (
 from rl3dsr.models.wan.vae import WanVAE
 
 __all__ = [
+    "OFFICIAL_UCPE_COMMIT",
     "CameraBatch",
     "FullRREConditioner",
     "FullRREContext",
     "GeometryConditioner",
+    "build_camera_rays",
     "build_world_to_ray",
+    "convert_official_ucpe_checkpoint",
     "load_geometry_checkpoint",
+    "project_camera_directions",
     "save_geometry_checkpoint",
     "CausalLQ4xProjector",
     "FrozenLQConditioner",

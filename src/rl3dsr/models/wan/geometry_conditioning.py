@@ -116,14 +116,20 @@ def _camera_compute_dtype(dtype: torch.dtype) -> torch.dtype:
     return torch.float32 if dtype in {torch.float16, torch.bfloat16} else dtype
 
 
-def build_camera_rays(camera: CameraBatch, grid: tuple[int, int]) -> Tensor:
+def build_camera_rays(
+    camera: CameraBatch,
+    grid: tuple[int, int],
+    *,
+    return_validity: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
     """Return canonical OpenCV camera rays as ``[B,S,P,3]``.
 
     ``K`` is interpreted in pixel coordinates at patch centers. Pinhole rays
     use ``K^-1 [u,v,1]``. UCM rays use the closed-form inverse unified camera
     model with per-observation ``xi``; ``xi=0`` is the pinhole limit.
     Half-precision inputs are evaluated in float32 and returned in their
-    storage dtype so this geometry path remains usable on CPU.
+    storage dtype so this geometry path remains usable on CPU. When requested,
+    the second return value is a ``[B,S,P]`` inverse-domain validity mask.
     """
 
     camera.validate()
@@ -143,25 +149,36 @@ def build_camera_rays(camera: CameraBatch, grid: tuple[int, int]) -> Tensor:
         torch.linalg.inv(camera.K.to(dtype=dtype)),
         pixels.expand(camera.K.shape[0], camera.K.shape[1], -1, -1),
     )
+    valid = torch.isfinite(plane).all(dim=-1)
     if camera.camera_model == "pinhole":
         rays = _normalize(plane)
     else:
         normalized = plane[..., :2] / plane[..., 2:].clamp_min(torch.finfo(dtype).eps)
         radius_squared = normalized.square().sum(dim=-1, keepdim=True)
         xi = camera.xi.to(dtype=dtype)[..., None, None]
+        radicand = 1 + (1 - xi.square()) * radius_squared
+        valid = valid & torch.isfinite(radicand[..., 0]) & (radicand[..., 0] >= 0)
         scale = (
-            xi + torch.sqrt(1 + (1 - xi.square()) * radius_squared)
+            xi + torch.sqrt(radicand.clamp_min(0))
         ) / (1 + radius_squared)
         rays = torch.cat((scale * normalized, scale - xi), dim=-1)
         rays = _normalize(rays)
-    return rays.to(dtype=camera.K.dtype)
+    valid = valid & torch.isfinite(rays).all(dim=-1)
+    rays = torch.where(valid[..., None], rays, torch.zeros_like(rays))
+    rays = rays.to(dtype=camera.K.dtype)
+    if return_validity:
+        return rays, valid
+    return rays
 
 
-def project_camera_directions(camera: CameraBatch, directions: Tensor) -> Tensor:
-    """Project camera-frame directions to pixels as ``[B,S,P,2]``.
+def project_camera_directions(camera: CameraBatch, directions: Tensor) -> tuple[Tensor, Tensor]:
+    """Project camera-frame directions and return pixels plus denominators.
 
     This is the forward model paired with :func:`build_camera_rays` and is
     shared by the UCPE absolute up-map construction and downstream fusion.
+    The denominator is ``[B,S,P]`` and belongs to the active camera model,
+    allowing callers to reject singular projections without assuming pinhole
+    ``z``. Pixels at non-finite or singular denominators are returned as zero.
     """
 
     camera.validate()
@@ -175,10 +192,13 @@ def project_camera_directions(camera: CameraBatch, directions: Tensor) -> Tensor
     else:
         xi = camera.xi.to(dtype=dtype)[..., None]
         denominator = z + xi * directions.norm(dim=-1)
-    safe = torch.where(denominator.abs() > 1e-8, denominator, torch.ones_like(denominator))
+    valid = torch.isfinite(directions).all(dim=-1) & torch.isfinite(denominator) & (denominator.abs() > 1e-8)
+    safe = torch.where(valid, denominator, torch.ones_like(denominator))
     u = intrinsics[..., 0, 0, None] * x / safe + intrinsics[..., 0, 2, None]
     v = intrinsics[..., 1, 1, None] * y / safe + intrinsics[..., 1, 2, None]
-    return torch.stack((u, v), dim=-1)
+    pixels = torch.stack((u, v), dim=-1)
+    valid = valid & torch.isfinite(pixels).all(dim=-1)
+    return torch.where(valid[..., None], pixels, torch.zeros_like(pixels)), denominator
 
 
 def _canonical_patch_rays(camera: CameraBatch, grid: tuple[int, int]) -> Tensor:
@@ -206,7 +226,8 @@ def build_world_to_ray(
         raise ValueError("world_up must be a finite non-zero 3-vector")
     up = _normalize(up)
 
-    rays_camera = build_camera_rays(camera, grid).to(dtype=compute_dtype)
+    rays_camera, ray_valid = build_camera_rays(camera, grid, return_validity=True)
+    rays_camera = rays_camera.to(dtype=compute_dtype)
     c2w = camera.T_world_from_camera.to(dtype=compute_dtype)
     rotation = c2w[..., :3, :3]
     centers = c2w[..., :3, 3]
@@ -232,6 +253,8 @@ def build_world_to_ray(
         "bspij,bspj->bspi", world_to_ray_rotation, expanded_centers
     )
     world_to_ray[..., 3, 3] = 1
+    identity = torch.eye(4, device=camera.K.device, dtype=compute_dtype).reshape(1, 1, 1, 4, 4)
+    world_to_ray = torch.where(ray_valid[..., None, None], world_to_ray, identity)
 
     latitude = torch.asin(torch.einsum("bspj,j->bsp", rays_world, up).clamp(-1, 1))[..., None]
     expanded_up = up.reshape(1, 1, 1, 3).expand_as(rays_world)
@@ -247,8 +270,7 @@ def build_world_to_ray(
     rotated_camera = torch.einsum(
         "bsji,bspj->bspi", rotation, rotated_world
     )
-    projected = project_camera_directions(camera, rotated_camera)
-    z = rotated_camera[..., 2]
+    projected, projection_denominator = project_camera_directions(camera, rotated_camera)
     u = (torch.arange(grid_w, device=camera.K.device, dtype=compute_dtype) + 0.5) * (camera.image_size[1] / grid_w)
     v = (torch.arange(grid_h, device=camera.K.device, dtype=compute_dtype) + 0.5) * (camera.image_size[0] / grid_h)
     vv, uu = torch.meshgrid(v, u, indexing="ij")
@@ -256,9 +278,16 @@ def build_world_to_ray(
         (projected[..., 0] - uu.reshape(1, 1, -1), projected[..., 1] - vv.reshape(1, 1, -1)),
         dim=-1,
     )
-    valid = (axis_norm > 1e-8) & (z.abs()[..., None] > 1e-8) & torch.isfinite(image_up).all(dim=-1, keepdim=True)
+    valid = (
+        ray_valid[..., None]
+        & (axis_norm > 1e-8)
+        & torch.isfinite(projection_denominator[..., None])
+        & (projection_denominator.abs()[..., None] > 1e-8)
+        & torch.isfinite(image_up).all(dim=-1, keepdim=True)
+    )
     image_up = torch.where(valid, _normalize(image_up), torch.zeros_like(image_up))
     absmap = torch.cat((image_up, latitude), dim=-1)
+    absmap = torch.where(ray_valid[..., None], absmap, torch.zeros_like(absmap))
     batch, sequence, patches = rays_world.shape[:3]
     return FullRREContext(
         world_to_ray.to(dtype=output_dtype).reshape(batch, sequence * patches, 4, 4).contiguous(),
@@ -625,6 +654,14 @@ _OFFICIAL_UCPE_LAYER_NAMES = {
     "out_proj": "output",
 }
 
+_CANONICAL_UCPE_ARCHITECTURE = {
+    "feature_dim": 1536,
+    "hidden_dim": 192,
+    "attention_heads": 1,
+    "branch_count": 30,
+    "compression": 8,
+}
+
 
 def _official_ucpe_key_map(module: FullRREConditioner) -> dict[str, str]:
     mapping: dict[str, str] = {}
@@ -637,10 +674,47 @@ def _official_ucpe_key_map(module: FullRREConditioner) -> dict[str, str]:
     return mapping
 
 
+def _canonical_ucpe_target_shapes() -> dict[str, tuple[int, ...]]:
+    shapes: dict[str, tuple[int, ...]] = {}
+    layer_shapes = {
+        "camera_encoder": {"weight": (1536, 3), "bias": (1536,)},
+        "q": {"weight": (192, 1536), "bias": (192,)},
+        "k": {"weight": (192, 1536), "bias": (192,)},
+        "v": {"weight": (192, 1536), "bias": (192,)},
+        "output": {"weight": (1536, 192), "bias": (1536,)},
+    }
+    for branch in range(30):
+        for layer, parameters in layer_shapes.items():
+            for suffix, shape in parameters.items():
+                shapes[f"branches.{branch}.{layer}.{suffix}"] = shape
+    return shapes
+
+
+def _validate_canonical_ucpe_module(module: FullRREConditioner) -> None:
+    actual_architecture = {
+        key: getattr(module, key) for key in _CANONICAL_UCPE_ARCHITECTURE
+    }
+    expected_shapes = _canonical_ucpe_target_shapes()
+    actual_state = module.state_dict()
+    actual_shapes = {name: tuple(value.shape) for name, value in actual_state.items()}
+    if (
+        actual_architecture != _CANONICAL_UCPE_ARCHITECTURE
+        or module.representation != "rre_full"
+        or module.absmap is not True
+        or set(actual_shapes) != set(expected_shapes)
+        or any(actual_shapes[name] != shape for name, shape in expected_shapes.items())
+    ):
+        raise RuntimeError(
+            "canonical official UCPE conversion requires 30 branches with exact "
+            "1536-to-192 relray_absmap tensor shapes, one attention head, and compression 8"
+        )
+
+
 def convert_official_ucpe_checkpoint(
     source_path: str | Path,
     destination_path: str | Path,
     *,
+    asserted_source_commit: str,
     module: FullRREConditioner | None = None,
 ) -> dict[str, str]:
     """Convert one pinned official UCPE adapter checkpoint to format v2.
@@ -656,6 +730,8 @@ def convert_official_ucpe_checkpoint(
     source = Path(source_path)
     destination = Path(destination_path)
     provenance_path = destination.with_suffix(destination.suffix + ".provenance.json")
+    if asserted_source_commit != OFFICIAL_UCPE_COMMIT:
+        raise RuntimeError("official UCPE source commit assertion does not match pinned contract")
     if not source.is_file():
         raise FileNotFoundError(f"official UCPE checkpoint does not exist: {source}")
     if destination.exists() or provenance_path.exists():
@@ -664,6 +740,7 @@ def convert_official_ucpe_checkpoint(
         module = FullRREConditioner()
     if not isinstance(module, FullRREConditioner):
         raise TypeError("module must be FullRREConditioner")
+    _validate_canonical_ucpe_module(module)
 
     payload = torch.load(source, map_location="cpu", weights_only=True)
     state = payload.get("state_dict") if isinstance(payload, Mapping) and "state_dict" in payload else payload
@@ -713,6 +790,7 @@ def convert_official_ucpe_checkpoint(
                     "world_up": list(module.world_up),
                 },
                 "source_commit": OFFICIAL_UCPE_COMMIT,
+                "asserted_source_commit": asserted_source_commit,
                 "source_checkpoint_sha256": input_sha256,
                 "trainable_parameters": sum(value.numel() for value in module.parameters() if value.requires_grad),
             },
@@ -720,7 +798,7 @@ def convert_official_ucpe_checkpoint(
         )
         output_sha256 = _sha256_file(temporary)
         provenance = {
-            "source_commit": OFFICIAL_UCPE_COMMIT,
+            "asserted_source_commit": asserted_source_commit,
             "input_sha256": input_sha256,
             "output_sha256": output_sha256,
         }

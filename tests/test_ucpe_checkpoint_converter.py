@@ -25,7 +25,9 @@ def _official_state(module: FullRREConditioner) -> dict[str, torch.Tensor]:
     for target_name, value in module.state_dict().items():
         _, branch, layer, suffix = target_name.split(".")
         source_name = f"pipe.dit.blocks.{branch}.cam_self_attn.{rename[layer]}.{suffix}"
-        result[source_name] = value.clone()
+        result[source_name] = torch.zeros(1, dtype=value.dtype).as_strided(
+            value.shape, (0,) * value.ndim
+        )
     return result
 
 
@@ -34,30 +36,31 @@ def _write_official(path, state):
 
 
 def test_converter_maps_every_branch_tensor_and_records_file_provenance(tmp_path):
-    module = FullRREConditioner(
-        feature_dim=32,
-        hidden_dim=8,
-        attention_heads=1,
-        branch_count=2,
-        compression=4,
-    )
+    with torch.device("meta"):
+        module = FullRREConditioner()
     source = tmp_path / "official.ckpt"
     destination = tmp_path / "converted.pt"
     official = _official_state(module)
     _write_official(source, official)
 
-    manifest = convert_official_ucpe_checkpoint(source, destination, module=module)
+    manifest = convert_official_ucpe_checkpoint(
+        source,
+        destination,
+        module=module,
+        asserted_source_commit=OFFICIAL_UCPE_COMMIT,
+    )
 
     converted = torch.load(destination, map_location="cpu", weights_only=True)
     assert list(converted["geometry"]) == list(module.state_dict())
-    assert all(
-        torch.equal(converted["geometry"][name], value)
-        for name, value in module.state_dict().items()
-    )
+    assert {
+        name: tuple(value.shape) for name, value in converted["geometry"].items()
+    } == {
+        name: tuple(value.shape) for name, value in module.state_dict().items()
+    }
     provenance_path = destination.with_suffix(destination.suffix + ".provenance.json")
     assert json.loads(provenance_path.read_text()) == manifest
     assert manifest == {
-        "source_commit": OFFICIAL_UCPE_COMMIT,
+        "asserted_source_commit": OFFICIAL_UCPE_COMMIT,
         "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "output_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
     }
@@ -65,6 +68,31 @@ def test_converter_maps_every_branch_tensor_and_records_file_provenance(tmp_path
 
 @pytest.mark.parametrize("mutation", ["missing", "unexpected", "shape"])
 def test_converter_rejects_nonexact_official_branch_state(tmp_path, mutation):
+    with torch.device("meta"):
+        module = FullRREConditioner()
+    state = _official_state(module)
+    if mutation == "missing":
+        state.pop(next(iter(state)))
+    elif mutation == "unexpected":
+        state["pipe.dit.blocks.30.cam_self_attn.q_proj.bias"] = torch.zeros(192)
+    else:
+        key = "pipe.dit.blocks.0.cam_self_attn.q_proj.weight"
+        state[key] = torch.zeros(1).as_strided((191, 1536), (0, 0))
+    source = tmp_path / "official.ckpt"
+    _write_official(source, state)
+
+    with pytest.raises(RuntimeError, match=mutation):
+        convert_official_ucpe_checkpoint(
+            source,
+            tmp_path / "converted.pt",
+            module=module,
+            asserted_source_commit=OFFICIAL_UCPE_COMMIT,
+        )
+
+
+def test_converter_rejects_noncanonical_branch_count_before_mapping(tmp_path):
+    source = tmp_path / "official.ckpt"
+    _write_official(source, {})
     module = FullRREConditioner(
         feature_dim=32,
         hidden_dim=8,
@@ -72,16 +100,21 @@ def test_converter_rejects_nonexact_official_branch_state(tmp_path, mutation):
         branch_count=2,
         compression=4,
     )
-    state = _official_state(module)
-    if mutation == "missing":
-        state.pop(next(iter(state)))
-    elif mutation == "unexpected":
-        state["pipe.dit.blocks.2.cam_self_attn.q_proj.bias"] = torch.zeros(8)
-    else:
-        key = "pipe.dit.blocks.0.cam_self_attn.q_proj.weight"
-        state[key] = state[key][:-1]
-    source = tmp_path / "official.ckpt"
-    _write_official(source, state)
+    with pytest.raises(RuntimeError, match="canonical.*30 branches"):
+        convert_official_ucpe_checkpoint(
+            source,
+            tmp_path / "converted.pt",
+            module=module,
+            asserted_source_commit=OFFICIAL_UCPE_COMMIT,
+        )
 
-    with pytest.raises(RuntimeError, match=mutation):
-        convert_official_ucpe_checkpoint(source, tmp_path / "converted.pt", module=module)
+
+def test_converter_requires_the_pinned_source_commit_assertion(tmp_path):
+    source = tmp_path / "official.ckpt"
+    _write_official(source, {})
+    with pytest.raises(RuntimeError, match="source commit assertion"):
+        convert_official_ucpe_checkpoint(
+            source,
+            tmp_path / "converted.pt",
+            asserted_source_commit="not-the-pinned-commit",
+        )

@@ -10,6 +10,7 @@ from rl3dsr.models.wan.geometry_conditioning import (
     FullRREConditioner,
     build_camera_rays,
     build_world_to_ray,
+    project_camera_directions,
 )
 
 
@@ -63,6 +64,83 @@ def test_ucm_nonzero_xi_changes_off_axis_ray_by_the_literal_inverse_model():
         [[[0.0, 0.0, 1.0], [0.9114378, 0.0, 0.4114378]]]
     ).reshape(1, 1, 2, 3)
     assert torch.allclose(actual, expected, atol=1e-6, rtol=0)
+
+
+def test_ucm_projection_round_trips_patch_centers_and_reports_validity():
+    intrinsics = torch.tensor(
+        [[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]]
+    ).reshape(1, 1, 3, 3)
+    camera = CameraBatch(
+        intrinsics,
+        torch.eye(4).reshape(1, 1, 4, 4),
+        (1, 2),
+        "multiview",
+        camera_model="ucm",
+        xi=torch.tensor([[0.5]]),
+    )
+    pixels, denominator = project_camera_directions(camera, build_camera_rays(camera, (1, 2)))
+    assert torch.allclose(
+        pixels,
+        torch.tensor([[[[0.5, 0.5], [1.5, 0.5]]]]),
+        atol=1e-6,
+        rtol=0,
+    )
+    assert torch.isfinite(denominator).all()
+    assert torch.all(denominator.abs() > 1e-8)
+
+
+def test_ucm_projection_masks_its_model_denominator_singularity():
+    camera = replace(
+        _camera(), camera_model="ucm", xi=torch.ones(1, 1)
+    )
+    pixels, denominator = project_camera_directions(
+        camera, torch.tensor([[[[0.0, 0.0, -1.0]]]])
+    )
+    assert torch.equal(denominator, torch.zeros_like(denominator))
+    assert torch.equal(pixels, torch.zeros_like(pixels))
+
+
+def test_world_to_ray_uses_ucm_denominator_for_lat_up_projection():
+    intrinsics = torch.tensor(
+        [[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]]
+    ).reshape(1, 1, 3, 3)
+    camera = CameraBatch(
+        intrinsics,
+        torch.eye(4).reshape(1, 1, 4, 4),
+        (1, 2),
+        "multiview",
+        camera_model="ucm",
+        xi=torch.ones(1, 1),
+    )
+    context = build_world_to_ray(camera, (1, 2), world_up=(0.0, 1.0, 0.0))
+    assert torch.allclose(
+        context.absmap[0, 1, :2],
+        torch.tensor([-0.0499792, 0.9987503]),
+        atol=1e-5,
+        rtol=0,
+    )
+
+
+def test_ucm_out_of_inverse_domain_is_finitely_masked_from_context():
+    intrinsics = torch.tensor(
+        [[0.25, 0.0, 0.5], [0.0, 0.25, 0.5], [0.0, 0.0, 1.0]]
+    ).reshape(1, 1, 3, 3)
+    camera = CameraBatch(
+        intrinsics,
+        torch.eye(4).reshape(1, 1, 4, 4),
+        (1, 2),
+        "multiview",
+        camera_model="ucm",
+        xi=torch.tensor([[2.0]]),
+    )
+    rays, valid = build_camera_rays(camera, (1, 2), return_validity=True)
+    context = build_world_to_ray(camera, (1, 2))
+    assert torch.equal(valid, torch.tensor([[[True, False]]]))
+    assert torch.equal(rays[0, 0, 1], torch.zeros(3))
+    assert torch.equal(context.world_to_ray[0, 1], torch.eye(4))
+    assert torch.equal(context.absmap[0, 1], torch.zeros(3))
+    assert torch.isfinite(context.world_to_ray).all()
+    assert torch.isfinite(context.absmap).all()
 
 
 @pytest.mark.parametrize(
@@ -142,3 +220,11 @@ def test_full_rre_disabled_is_noop_even_with_nonzero_output_weights():
         torch.zeros_like(tokens),
     )
     assert module.last_diagnostics == {}
+
+
+def test_public_wan_package_exports_ucpe_contract_surface():
+    from rl3dsr.models import wan
+
+    assert wan.build_camera_rays is build_camera_rays
+    assert wan.project_camera_directions is project_camera_directions
+    assert callable(wan.convert_official_ucpe_checkpoint)
