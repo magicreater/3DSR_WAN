@@ -5,7 +5,12 @@ from torch import nn
 
 from rl3dsr.models.wan.lq_conditioning import FrozenLQConditioner, save_adapter_checkpoint, load_adapter_checkpoint
 from rl3dsr.models.wan.geometry_conditioning import CameraBatch
-from rl3dsr.models.wan.stage3 import Stage3Conditioning, save_stage3_checkpoint, load_stage3_checkpoint
+from rl3dsr.models.wan.stage3 import (
+    Stage3Conditioning,
+    load_stage3_checkpoint,
+    load_stage3_initialization_checkpoint,
+    save_stage3_checkpoint,
+)
 
 
 class Projector(nn.Module):
@@ -87,6 +92,66 @@ def test_checkpoint_roundtrip_and_mismatch_rejected_before_loading(tmp_path):
     assert torch.equal(target.fusion.offset, module.fusion.offset)
     with pytest.raises(FileExistsError):
         save_stage3_checkpoint(path, module, config={}, step=9, provenance={})
+
+
+def test_model_only_initialization_permits_config_change_and_validates_exact_state(tmp_path):
+    parent = bundle()
+    path = tmp_path / "parent.pt"
+    save_stage3_checkpoint(
+        path,
+        parent,
+        config={"arm": "A3", "camera_rank_weight": 0.1},
+        step=1000,
+        provenance={},
+        training_state={"optimizer": {"poison": True}, "torch_rng_state": torch.tensor([255])},
+    )
+    target = bundle()
+    with torch.no_grad():
+        target.fusion.offset.fill_(17)
+    payload = load_stage3_initialization_checkpoint(path, target)
+    assert payload["step"] == 1000
+    assert payload["config"]["arm"] == "A3"
+    assert torch.equal(target.fusion.offset, parent.fusion.offset)
+
+    poisoned = torch.load(path, map_location="cpu", weights_only=True)
+    poisoned["adapters"]["unexpected"] = None
+    bad = tmp_path / "extra.pt"
+    torch.save(poisoned, bad)
+    untouched = bundle()
+    with torch.no_grad():
+        untouched.fusion.offset.fill_(19)
+    with pytest.raises(ValueError, match="adapter set"):
+        load_stage3_initialization_checkpoint(bad, untouched)
+    assert untouched.fusion.offset.item() == 19
+
+    poisoned = torch.load(path, map_location="cpu", weights_only=True)
+    poisoned["adapters"]["fusion"]["offset"] = torch.tensor(float("nan"))
+    bad = tmp_path / "nonfinite.pt"
+    torch.save(poisoned, bad)
+    with pytest.raises(ValueError, match="nonfinite"):
+        load_stage3_initialization_checkpoint(bad, bundle())
+
+
+def test_model_only_initialization_can_explicitly_reset_fusion_only(tmp_path):
+    parent = bundle()
+    parent.geometry = nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        parent.conditioner.bridge.weight.fill_(2)
+        parent.geometry.weight.fill_(3)
+        parent.fusion.offset.fill_(4)
+    path = tmp_path / "a3-parent.pt"
+    save_stage3_checkpoint(path, parent, config={"arm": "A3"}, step=1000, provenance={})
+
+    target = bundle()
+    target.geometry = nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        target.conditioner.bridge.weight.fill_(7)
+        target.geometry.weight.fill_(8)
+        target.fusion.offset.fill_(0)
+    load_stage3_initialization_checkpoint(path, target, reset_fusion=True)
+    assert torch.all(target.conditioner.bridge.weight == 2)
+    assert torch.all(target.geometry.weight == 3)
+    assert target.fusion.offset.item() == 0
 
 
 def test_old_checkpoint_config_defaults_new_dropout_field(tmp_path):

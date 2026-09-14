@@ -145,3 +145,57 @@ def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config:
         if item is not None:
             item.load_state_dict(states[name], strict=True)
     return payload
+
+
+def load_stage3_initialization_checkpoint(
+    path, module: Stage3Conditioning, *, reset_fusion: bool = False
+):
+    """Load adapter parameters without restoring config or training progress.
+
+    This is the model-only initialization path for a new experiment.  It
+    deliberately permits compatible configuration changes, but requires the
+    checkpoint to contain exactly the current Stage 3 adapter set.  The normal
+    loader then validates every key, shape and value before mutating ``module``.
+    """
+    path = Path(path)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    states = payload.get("adapters")
+    if not isinstance(states, dict) or set(states) != set(_states(module)):
+        raise ValueError("Stage 3 checkpoint adapter set mismatch")
+    for name, item in _states(module).items():
+        saved = states[name]
+        if item is None:
+            if saved is not None:
+                raise ValueError(f"Stage 3 {name} presence mismatch")
+        elif not isinstance(saved, dict) or any(
+            not isinstance(key, str) or not isinstance(value, Tensor)
+            for key, value in saved.items()
+        ):
+            raise ValueError(f"Stage 3 {name} parameter state is malformed")
+    if reset_fusion:
+        expected_arch = {
+            "blocks": list(module.conditioner.bridge_blocks),
+            "time_conditioning": module.conditioner.bridge_time_conditioning,
+        }
+        if payload.get("format") != "rl3dsr-stage3" or payload.get("format_version") != 1:
+            raise ValueError("unsupported Stage 3 checkpoint")
+        if payload.get("bridge_architecture") != expected_arch:
+            raise ValueError("Stage 3 bridge architecture mismatch")
+        selected = {"bridge": module.conditioner.bridge, "geometry": module.geometry}
+        for name, item in selected.items():
+            saved = states[name]
+            if (item is None) != (saved is None):
+                raise ValueError(f"Stage 3 {name} presence mismatch")
+            if item is not None:
+                current = item.state_dict()
+                if current.keys() != saved.keys() or any(
+                    current[key].shape != saved[key].shape for key in current
+                ):
+                    raise ValueError(f"Stage 3 {name} architecture mismatch")
+                if any(not torch.isfinite(value).all() for value in saved.values()):
+                    raise ValueError(f"Stage 3 {name} contains nonfinite parameters")
+        for name, item in selected.items():
+            if item is not None:
+                item.load_state_dict(states[name], strict=True)
+        return payload
+    return load_stage3_checkpoint(path, module, expected_config=None)

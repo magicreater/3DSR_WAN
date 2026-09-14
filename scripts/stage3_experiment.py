@@ -42,6 +42,7 @@ from rl3dsr.models.wan import (
     sample_conditioned_flow,
     save_stage3_checkpoint,
 )
+from rl3dsr.models.wan.stage3 import load_stage3_initialization_checkpoint
 from rl3dsr.models.wan.sampling import SigmaCycle
 from rl3dsr.validation.decoded_space import frame_metrics
 from rl3dsr.validation.stage3_protocol import (
@@ -117,6 +118,32 @@ def _sha256_tree(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _json_sha256(value) -> str:
+    """Hash JSON-compatible data using one stable canonical encoding."""
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _initialization_provenance(path: Path, payload: dict, *, reset_fusion: bool = False) -> dict:
+    """Describe a model-only parent without carrying over its run state."""
+    return {
+        "initialization_mode": "model_only",
+        "parent_checkpoint": str(Path(path).resolve()),
+        "parent_checkpoint_sha256": _sha256(Path(path)),
+        "parent_saved_step": int(payload["step"]),
+        "parent_saved_config_sha256": _json_sha256(payload.get("config") or {}),
+        "reset_fusion": bool(reset_fusion),
+    }
+
+
+def _initialization_mode(resume, init_checkpoint, reset_fusion: bool) -> str:
+    if resume is not None and init_checkpoint is not None:
+        raise ValueError("--resume and --init-checkpoint are mutually exclusive")
+    if reset_fusion and init_checkpoint is None:
+        raise ValueError("--init-reset-fusion requires --init-checkpoint")
+    return "resume" if resume is not None else "model_only" if init_checkpoint is not None else "scratch"
+
+
 def _seed_all(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -177,6 +204,8 @@ def load_runtime(
     device: str | torch.device,
     rre_checkpoint: Path | None = None,
     stage3_checkpoint: Path | None = None,
+    model_only_initialization: bool = False,
+    reset_initialization_fusion: bool = False,
 ) -> Runtime:
     device = torch.device(device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -216,9 +245,14 @@ def load_runtime(
     module = Stage3Conditioning(conditioner, geometry, fusion).to(device)
     payload = None
     if stage3_checkpoint is not None:
-        payload = load_stage3_checkpoint(
-            stage3_checkpoint, module, expected_config=config.to_dict()
-        )
+        if model_only_initialization:
+            payload = load_stage3_initialization_checkpoint(
+                stage3_checkpoint, module, reset_fusion=reset_initialization_fusion
+            )
+        else:
+            payload = load_stage3_checkpoint(
+                stage3_checkpoint, module, expected_config=config.to_dict()
+            )
     return Runtime(module, vae, dit, device, payload)
 
 
@@ -233,6 +267,11 @@ def _camera_digest(camera: CameraBatch) -> str:
     digest.update(str(camera.image_size).encode("ascii"))
     digest.update(camera.sequence_kind.encode("ascii"))
     digest.update(str(camera.reference_index).encode("ascii"))
+    digest.update(camera.camera_model.encode("ascii"))
+    if camera.xi is not None:
+        xi = camera.xi.detach().float().cpu().contiguous()
+        digest.update(str(tuple(xi.shape)).encode("ascii"))
+        digest.update(xi.numpy().tobytes())
     return digest.hexdigest()
 
 
@@ -274,6 +313,7 @@ def sample_latents(
     sampling_shift: float = 5.0,
     dtype: torch.dtype = torch.bfloat16,
     return_diagnostics: bool = False,
+    view_permutation: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, dict]:
     latent_shape = tuple(initial_shape[2:])
     fusion_camera = camera if fusion_camera is None else fusion_camera
@@ -291,6 +331,11 @@ def sample_latents(
     )
     generator = torch.Generator(device=runtime.device).manual_seed(seed)
     noise = torch.randn(initial_shape, generator=generator, device=runtime.device, dtype=dtype)
+    inverse_permutation = None
+    if view_permutation is not None:
+        view_permutation = _validate_view_permutation(view_permutation, initial_shape[2])
+        inverse_permutation = inverse_view_permutation(view_permutation)
+        noise = permute_view_tensor(noise, view_permutation)
     context = torch.zeros(
         initial_shape[0], 512, 4096, device=runtime.device, dtype=dtype
     )
@@ -309,7 +354,10 @@ def sample_latents(
             latent_shape,
         )
         if return_diagnostics:
-            velocity_trace.append(velocity.detach().float().cpu())
+            traced = velocity if inverse_permutation is None else permute_view_tensor(
+                velocity, inverse_permutation
+            )
+            velocity_trace.append(traced.detach().float().cpu())
             geometry_trace.append(_scalar_diagnostics(getattr(runtime.module.geometry, "last_diagnostics", {})))
             injection_trace.append(_scalar_diagnostics(getattr(runtime.dit, "last_injection_stats", {})))
         return velocity
@@ -321,6 +369,9 @@ def sample_latents(
         predict_velocity=predict_velocity,
         config=FlowSamplingConfig(sampling_steps, sampling_shift),
     )
+    canonical_noise = noise
+    if inverse_permutation is not None:
+        canonical_noise = permute_view_tensor(noise, inverse_permutation)
     if not return_diagnostics:
         return sampled
     return sampled, {
@@ -331,7 +382,7 @@ def sample_latents(
         "velocity_trace": velocity_trace,
         "geometry_trace": geometry_trace,
         "injection_trace": injection_trace,
-        "initial_noise": noise.detach().float().cpu(),
+        "initial_noise": canonical_noise.detach().float().cpu(),
         "fusion_camera_sha256": _camera_digest(fusion_camera),
         "geometry_camera_sha256": _camera_digest(geometry_camera),
     }
@@ -547,24 +598,232 @@ def camera_pair_ranking_loss(prediction_correct, prediction_wrong, target, *, ma
     return e_correct, e_wrong, rank
 
 
+def _deranged_auxiliary_indices(views: int, generator: torch.Generator) -> torch.Tensor:
+    if views < 3:
+        raise ValueError("camera pairing requires at least two auxiliary views")
+    auxiliary = list(range(1, views))
+    shift = int(torch.randint(1, len(auxiliary), (), generator=generator))
+    return torch.tensor([0, *(auxiliary[shift:] + auxiliary[:shift])], dtype=torch.long)
+
+
+def _camera_index_select(camera: CameraBatch, indices: torch.Tensor) -> CameraBatch:
+    camera.validate()
+    indices = _validate_view_permutation(indices, camera.K.shape[1])
+    indices = indices.to(device=camera.K.device)
+    reference = int((indices == camera.reference_index).nonzero(as_tuple=False).item())
+    xi = None if camera.xi is None else camera.xi.index_select(1, indices)
+    return CameraBatch(
+        camera.K.index_select(1, indices),
+        camera.T_world_from_camera.index_select(1, indices),
+        camera.image_size,
+        camera.sequence_kind,
+        reference_index=reference,
+        camera_model=camera.camera_model,
+        xi=xi,
+    )
+
+
+def _camera_with_auxiliary_permutation(
+    camera: CameraBatch, indices: torch.Tensor
+) -> CameraBatch:
+    """Reassign auxiliary camera data while keeping its target slot fixed."""
+    if int(indices[0]) != 0:
+        raise ValueError("auxiliary permutation must preserve target slot zero")
+    selected = _camera_index_select(camera, indices)
+    return CameraBatch(
+        selected.K,
+        selected.T_world_from_camera,
+        selected.image_size,
+        selected.sequence_kind,
+        reference_index=camera.reference_index,
+        camera_model=selected.camera_model,
+        xi=selected.xi,
+    )
+
+
 def derange_auxiliary_fusion_camera(camera: CameraBatch, generator: torch.Generator) -> CameraBatch:
     """Cyclically derange auxiliary camera slots while preserving target view zero."""
     camera.validate()
     if camera.sequence_kind != "multiview" or camera.K.shape[1] < 3:
         raise ValueError("camera ranking requires at least two auxiliary multiview cameras")
-    auxiliary = list(range(1, camera.K.shape[1]))
-    shift = int(torch.randint(1, len(auxiliary), (), generator=generator))
-    shuffled = auxiliary[shift:] + auxiliary[:shift]
-    k = camera.K.clone()
-    transform = camera.T_world_from_camera.clone()
-    k[:, auxiliary] = camera.K[:, shuffled]
-    transform[:, auxiliary] = camera.T_world_from_camera[:, shuffled]
+    return _camera_with_auxiliary_permutation(
+        camera, _deranged_auxiliary_indices(camera.K.shape[1], generator)
+    )
+
+
+def _validate_view_permutation(permutation: torch.Tensor, views: int | None = None) -> torch.Tensor:
+    permutation = torch.as_tensor(permutation, dtype=torch.long)
+    if permutation.ndim != 1 or permutation.numel() < 1:
+        raise ValueError("view permutation must be a non-empty vector")
+    views = permutation.numel() if views is None else views
+    if permutation.numel() != views or not torch.equal(
+        torch.sort(permutation.cpu()).values, torch.arange(views)
+    ):
+        raise ValueError("invalid view permutation")
+    return permutation
+
+
+def inverse_view_permutation(permutation: torch.Tensor) -> torch.Tensor:
+    permutation = _validate_view_permutation(permutation)
+    inverse = torch.empty_like(permutation)
+    inverse[permutation] = torch.arange(permutation.numel(), device=permutation.device)
+    return inverse
+
+
+def permute_view_tensor(value: torch.Tensor, permutation: torch.Tensor, *, view_dim: int = 2):
+    permutation = _validate_view_permutation(permutation, value.shape[view_dim])
+    return value.index_select(view_dim, permutation.to(value.device))
+
+
+def _permutation_digest(permutation: torch.Tensor) -> str:
+    permutation = _validate_view_permutation(permutation)
+    return hashlib.sha256(permutation.cpu().numpy().tobytes()).hexdigest()
+
+
+def apply_joint_view_permutation(
+    permutation: torch.Tensor,
+    *,
+    lr: torch.Tensor,
+    fusion_camera: CameraBatch,
+    geometry_camera: CameraBatch,
+    target: torch.Tensor | None = None,
+    latent: torch.Tensor | None = None,
+    source_mask: torch.Tensor | None = None,
+    noise: torch.Tensor | None = None,
+) -> dict:
+    """Apply one view relabeling to every view-indexed model input."""
+    permutation = _validate_view_permutation(permutation, lr.shape[2])
+    result = {
+        "lr": permute_view_tensor(lr, permutation),
+        "fusion_camera": _camera_index_select(fusion_camera, permutation),
+        "geometry_camera": _camera_index_select(geometry_camera, permutation),
+        "target_index": int((permutation == 0).nonzero(as_tuple=False).item()),
+        "permutation": permutation.clone(),
+        "inverse_permutation": inverse_view_permutation(permutation),
+        "permutation_sha256": _permutation_digest(permutation),
+    }
+    for name, value in (("target", target), ("latent", latent), ("noise", noise)):
+        result[name] = None if value is None else permute_view_tensor(value, permutation)
+    result["source_mask"] = (
+        None if source_mask is None
+        else source_mask.index_select(1, permutation.to(source_mask.device))
+    )
+    return result
+
+
+def _rotation_to_quaternion(rotation: torch.Tensor) -> torch.Tensor:
+    """Convert valid rotation matrices to normalized ``(w,x,y,z)`` quaternions."""
+    m00, m11, m22 = rotation[..., 0, 0], rotation[..., 1, 1], rotation[..., 2, 2]
+    magnitudes = torch.sqrt(torch.stack((
+        1 + m00 + m11 + m22,
+        1 + m00 - m11 - m22,
+        1 - m00 + m11 - m22,
+        1 - m00 - m11 + m22,
+    ), dim=-1).clamp_min(0))
+    candidates = torch.stack((
+        torch.stack((
+            magnitudes[..., 0].square(),
+            rotation[..., 2, 1] - rotation[..., 1, 2],
+            rotation[..., 0, 2] - rotation[..., 2, 0],
+            rotation[..., 1, 0] - rotation[..., 0, 1],
+        ), dim=-1),
+        torch.stack((
+            rotation[..., 2, 1] - rotation[..., 1, 2],
+            magnitudes[..., 1].square(),
+            rotation[..., 1, 0] + rotation[..., 0, 1],
+            rotation[..., 0, 2] + rotation[..., 2, 0],
+        ), dim=-1),
+        torch.stack((
+            rotation[..., 0, 2] - rotation[..., 2, 0],
+            rotation[..., 1, 0] + rotation[..., 0, 1],
+            magnitudes[..., 2].square(),
+            rotation[..., 2, 1] + rotation[..., 1, 2],
+        ), dim=-1),
+        torch.stack((
+            rotation[..., 1, 0] - rotation[..., 0, 1],
+            rotation[..., 0, 2] + rotation[..., 2, 0],
+            rotation[..., 2, 1] + rotation[..., 1, 2],
+            magnitudes[..., 3].square(),
+        ), dim=-1),
+    ), dim=-2)
+    candidates = candidates / (2 * magnitudes[..., :, None].clamp_min(1e-7))
+    index = magnitudes.argmax(dim=-1)
+    selector = index[..., None, None].expand(*index.shape, 1, 4)
+    quaternion = candidates.gather(-2, selector).squeeze(-2)
+    return F.normalize(quaternion, dim=-1)
+
+
+def _quaternion_to_rotation(quaternion: torch.Tensor) -> torch.Tensor:
+    q = F.normalize(quaternion, dim=-1)
+    w, x, y, z = q.unbind(dim=-1)
+    return torch.stack((
+        1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+        2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+        2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y),
+    ), dim=-1).reshape(*q.shape[:-1], 3, 3)
+
+
+def _slerp_rotations(start: torch.Tensor, end: torch.Tensor, alpha: float) -> torch.Tensor:
+    q0, q1 = _rotation_to_quaternion(start), _rotation_to_quaternion(end)
+    dot = (q0 * q1).sum(dim=-1, keepdim=True)
+    q1 = torch.where(dot < 0, -q1, q1)
+    dot = dot.abs().clamp(max=1)
+    theta = torch.acos(dot)
+    sine = torch.sin(theta)
+    scalar = torch.as_tensor(alpha, dtype=start.dtype, device=start.device)
+    slerp = (
+        torch.sin((1 - scalar) * theta) / sine.clamp_min(1e-7) * q0
+        + torch.sin(scalar * theta) / sine.clamp_min(1e-7) * q1
+    )
+    linear = F.normalize((1 - scalar) * q0 + scalar * q1, dim=-1)
+    return _quaternion_to_rotation(torch.where(sine.abs() < 1e-6, linear, slerp))
+
+
+def interpolate_fusion_camera_dose(
+    correct: CameraBatch, wrong: CameraBatch, alpha: float
+) -> CameraBatch:
+    """Geodesically interpolate fusion cameras while preserving target slot zero."""
+    correct.validate()
+    wrong.validate()
+    if not 0 <= alpha <= 1 or correct.camera_model != wrong.camera_model:
+        raise ValueError("camera dose requires matching models and alpha in [0,1]")
+    if correct.K.shape != wrong.K.shape or correct.image_size != wrong.image_size:
+        raise ValueError("camera dose endpoints must have matching shapes and image size")
+    if (
+        correct.sequence_kind != wrong.sequence_kind
+        or correct.reference_index != wrong.reference_index
+        or correct.K.device != wrong.K.device
+        or correct.K.dtype != wrong.K.dtype
+    ):
+        raise ValueError("camera dose endpoints must share metadata, device and dtype")
+    if not torch.equal(correct.K[:, :1], wrong.K[:, :1]) or not torch.equal(
+        correct.T_world_from_camera[:, :1], wrong.T_world_from_camera[:, :1]
+    ):
+        raise ValueError("camera dose endpoints must preserve the target view")
+    if alpha == 0:
+        return correct
+    if alpha == 1:
+        return wrong
+    transform = torch.zeros_like(correct.T_world_from_camera)
+    transform[..., :3, :3] = _slerp_rotations(
+        correct.T_world_from_camera[..., :3, :3],
+        wrong.T_world_from_camera[..., :3, :3],
+        alpha,
+    )
+    transform[..., :3, 3] = torch.lerp(
+        correct.T_world_from_camera[..., :3, 3], wrong.T_world_from_camera[..., :3, 3], alpha
+    )
+    transform[..., 3, 3] = 1
+    intrinsics = torch.lerp(correct.K, wrong.K, alpha)
+    xi = None if correct.xi is None else torch.lerp(correct.xi, wrong.xi, alpha)
     return CameraBatch(
-        k,
+        intrinsics,
         transform,
-        camera.image_size,
-        camera.sequence_kind,
-        reference_index=camera.reference_index,
+        correct.image_size,
+        correct.sequence_kind,
+        reference_index=correct.reference_index,
+        camera_model=correct.camera_model,
+        xi=xi,
     )
 
 
@@ -642,18 +901,72 @@ def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise
         torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
 
 
+def _maybe_restore_training_progress(
+    checkpoint,
+    initialization_mode,
+    optimizer,
+    sigma_cycle,
+    view_generator,
+    noise_generator,
+    dropout_generator=None,
+    pairing_generator=None,
+    *,
+    expected_step=None,
+):
+    """Restore continuation state only for an explicit resume operation."""
+    if initialization_mode in {"scratch", "model_only"}:
+        return
+    if initialization_mode != "resume":
+        raise ValueError("unknown Stage 3 initialization mode")
+    state = None if checkpoint is None else checkpoint.get("training_state")
+    if not isinstance(state, dict) or (
+        expected_step is not None and state.get("step") != expected_step
+    ):
+        raise ValueError("resume checkpoint has no matching training state")
+    _restore_training_state(
+        state,
+        optimizer,
+        sigma_cycle,
+        view_generator,
+        noise_generator,
+        dropout_generator,
+        pairing_generator,
+    )
+
+
+def _fresh_training_start(output: Path, init_checkpoint: Path | None):
+    """Create an empty run boundary and inspect only parent model metadata."""
+    prepare_output(output)
+    if init_checkpoint is None:
+        return 1, [], None
+    payload = torch.load(init_checkpoint, map_location="cpu", weights_only=True)
+    if payload.get("format") != "rl3dsr-stage3" or payload.get("format_version") != 1:
+        raise ValueError("initialization checkpoint is not Stage 3")
+    if type(payload.get("step")) is not int or payload["step"] < 0:
+        raise ValueError("initialization checkpoint has invalid saved step")
+    return 1, [], payload
+
+
 def _train(args, config: Stage3Config) -> None:
     if args.seed not in config.training_seeds:
         raise ValueError("--seed must be listed in training_seeds")
-    _validate_runtime_inputs(args, checkpoint=args.resume)
+    resume_checkpoint = getattr(args, "resume", None)
+    init_checkpoint = getattr(args, "init_checkpoint", None)
+    init_reset_fusion = bool(getattr(args, "init_reset_fusion", False))
+    parent_checkpoint = resume_checkpoint if resume_checkpoint is not None else init_checkpoint
+    initialization_mode = _initialization_mode(
+        resume_checkpoint, init_checkpoint, init_reset_fusion
+    )
+    _validate_runtime_inputs(args, checkpoint=parent_checkpoint)
     _seed_all(args.seed)
     output = Path(args.output_dir).resolve()
     start_step, rows = 1, []
     resume_payload = None
-    if args.resume is None:
-        prepare_output(output)
+    init_payload = None
+    if resume_checkpoint is None:
+        start_step, rows, init_payload = _fresh_training_start(output, init_checkpoint)
     else:
-        resume_payload = torch.load(args.resume, map_location="cpu", weights_only=True)
+        resume_payload = torch.load(resume_checkpoint, map_location="cpu", weights_only=True)
         if resume_payload.get("format") != "rl3dsr-stage3":
             raise ValueError("resume checkpoint is not Stage 3")
         resume_step = int(resume_payload.get("step", -1))
@@ -680,7 +993,9 @@ def _train(args, config: Stage3Config) -> None:
         lq_checkpoint=args.lq_checkpoint,
         bridge_checkpoint=args.bridge_checkpoint,
         rre_checkpoint=args.rre_checkpoint,
-        stage3_checkpoint=args.resume,
+        stage3_checkpoint=parent_checkpoint,
+        model_only_initialization=initialization_mode == "model_only",
+        reset_initialization_fusion=init_reset_fusion,
         device=args.device,
     )
     runtime.module.train()
@@ -703,14 +1018,17 @@ def _train(args, config: Stage3Config) -> None:
         torch.Generator().manual_seed(args.seed + 5000)
         if config.camera_rank_weight > 0 else None
     )
-    if runtime.checkpoint is not None:
-        state = runtime.checkpoint.get("training_state")
-        if not isinstance(state, dict) or state.get("step") != start_step - 1:
-            raise ValueError("resume checkpoint has no matching training state")
-        _restore_training_state(
-            state, optimizer, sigma_cycle, view_generator, noise_generator,
-            dropout_generator, pairing_generator,
-        )
+    _maybe_restore_training_progress(
+        runtime.checkpoint,
+        initialization_mode,
+        optimizer,
+        sigma_cycle,
+        view_generator,
+        noise_generator,
+        dropout_generator,
+        pairing_generator,
+        expected_step=start_step - 1,
+    )
     provenance = {
         "training_seed": args.seed,
         "dataset_root": str(args.dataset_root.resolve()),
@@ -719,8 +1037,13 @@ def _train(args, config: Stage3Config) -> None:
         "rre_checkpoint": None if args.rre_checkpoint is None else str(args.rre_checkpoint.resolve()),
         "rre_checkpoint_sha256": None if args.rre_checkpoint is None else _sha256(args.rre_checkpoint),
         "git_revision": _git_revision(),
+        "initialization_mode": initialization_mode,
     }
-    if args.resume is None:
+    if init_checkpoint is not None:
+        provenance.update(_initialization_provenance(
+            init_checkpoint, init_payload, reset_fusion=init_reset_fusion
+        ))
+    if resume_checkpoint is None:
         manifest = {
             "config": config.to_dict(),
             "provenance": provenance,
@@ -893,25 +1216,84 @@ class _PerFrameLPIPS(torch.nn.Module):
         )
 
 
-def _intervention(lr, camera, mode, generator, *, far_camera=None):
+def _intervention(lr, camera, mode, generator, *, far_camera=None, return_metadata=False):
     """Return LR, fusion camera, geometry camera and source mask.
 
     The old ``shuffle_camera`` name is retained as a compatibility alias for
     the historical fusion-only intervention. New audits should use the
     explicit ``shuffle_fusion``, ``shuffle_geometry`` or ``shuffle_all`` modes.
+    ``shuffle_pair`` is likewise retained only as a historical corruption
+    label; it is not a permutation-equivariance control.
     """
+    metadata = {"requested_mode": mode}
+
+    def finish(changed, fusion_camera, geometry_camera, mask):
+        values = (changed, fusion_camera, geometry_camera, mask)
+        return (*values, metadata) if return_metadata else values
+
     if mode.startswith("no_self_"):
         mode = mode.removeprefix("no_self_")
     if mode in {"correct", "correct_repeat"}:
         changed, changed_camera, mask = intervene_lr(
             lr, camera, "correct", target=0, generator=generator
         )
-        return changed, changed_camera, changed_camera, mask
+        return finish(changed, changed_camera, changed_camera, mask)
     if mode == "target_drop":
         changed = lr.clone()
         changed[:, :, 0] = 0
         mask = torch.ones(lr.shape[0], lr.shape[2], dtype=torch.bool, device=lr.device)
-        return changed, camera, camera, mask
+        return finish(changed, camera, camera, mask)
+    if mode in {"mispaired_lr", "mispaired_camera", "target_drop_shuffle_fusion"}:
+        indices = _deranged_auxiliary_indices(lr.shape[2], generator)
+        metadata.update({
+            "auxiliary_permutation": indices.tolist(),
+            "auxiliary_permutation_sha256": _permutation_digest(indices),
+        })
+        changed = lr.clone()
+        fusion_camera = camera
+        if mode == "mispaired_lr":
+            changed = permute_view_tensor(changed, indices)
+        else:
+            fusion_camera = _camera_with_auxiliary_permutation(camera, indices)
+            if mode == "target_drop_shuffle_fusion":
+                changed[:, :, 0] = 0
+        mask = torch.ones(lr.shape[0], lr.shape[2], dtype=torch.bool, device=lr.device)
+        return finish(changed, fusion_camera, camera, mask)
+    if mode == "joint_permute":
+        views = lr.shape[2]
+        if views < 2:
+            raise ValueError("joint permutation requires at least two views")
+        permutation = torch.randperm(views, generator=generator)
+        if torch.equal(permutation, torch.arange(views)):
+            permutation = permutation.roll(1)
+        mask = torch.ones(lr.shape[0], views, dtype=torch.bool, device=lr.device)
+        result = apply_joint_view_permutation(
+            permutation,
+            lr=lr,
+            fusion_camera=camera,
+            geometry_camera=camera,
+            source_mask=mask,
+        )
+        metadata.update({
+            "permutation": permutation.tolist(),
+            "inverse_permutation": result["inverse_permutation"].tolist(),
+            "permutation_sha256": result["permutation_sha256"],
+            "target_index": result["target_index"],
+        })
+        return finish(
+            result["lr"], result["fusion_camera"], result["geometry_camera"],
+            result["source_mask"],
+        )
+    if mode in {"fusion_camera_dose_0", "fusion_camera_dose_half", "fusion_camera_dose_full"}:
+        wrong = derange_auxiliary_fusion_camera(camera, generator)
+        alpha = {
+            "fusion_camera_dose_0": 0.0,
+            "fusion_camera_dose_half": 0.5,
+            "fusion_camera_dose_full": 1.0,
+        }[mode]
+        metadata.update({"camera_dose_alpha": alpha, "wrong_camera_sha256": _camera_digest(wrong)})
+        mask = torch.ones(lr.shape[0], lr.shape[2], dtype=torch.bool, device=lr.device)
+        return finish(lr.clone(), interpolate_fusion_camera_dose(camera, wrong, alpha), camera, mask)
     if mode == "far_shuffle_fusion":
         if far_camera is None:
             raise ValueError("far_shuffle_fusion requires a frozen donor camera")
@@ -923,7 +1305,7 @@ def _intervention(lr, camera, mode, generator, *, far_camera=None):
         ):
             raise ValueError("far donor camera must preserve the target camera")
         mask = torch.ones(lr.shape[0], lr.shape[2], dtype=torch.bool, device=lr.device)
-        return lr.clone(), far_camera, camera, mask
+        return finish(lr.clone(), far_camera, camera, mask)
     if mode in {"shuffle_fusion", "shuffle_geometry", "shuffle_all", "shuffle_camera"}:
         _, shuffled_camera, mask = intervene_lr(
             lr, camera, "shuffle_camera", target=0, generator=generator
@@ -936,12 +1318,12 @@ def _intervention(lr, camera, mode, generator, *, far_camera=None):
             fusion_camera = shuffled_camera
         else:
             fusion_camera = camera
-        return lr.clone(), fusion_camera, geometry_camera, mask
+        return finish(lr.clone(), fusion_camera, geometry_camera, mask)
     if mode == "shuffle_pair":
         changed, shuffled_camera, mask = shuffle_auxiliary_pairs(
             lr, camera, target=0, generator=generator
         )
-        return changed, shuffled_camera, shuffled_camera, mask
+        return finish(changed, shuffled_camera, shuffled_camera, mask)
     if mode == "local_patch":
         h, w = lr.shape[-2:]
         changed, changed_camera, mask = intervene_lr(
@@ -953,11 +1335,28 @@ def _intervention(lr, camera, mode, generator, *, far_camera=None):
             box=(h // 4, w // 4, max(h // 4 + 1, h // 2), max(w // 4 + 1, w // 2)),
             generator=generator,
         )
-        return changed, changed_camera, changed_camera, mask
+        return finish(changed, changed_camera, changed_camera, mask)
     changed, changed_camera, mask = intervene_lr(
         lr, camera, mode, target=0, generator=generator
     )
-    return changed, changed_camera, changed_camera, mask
+    return finish(changed, changed_camera, changed_camera, mask)
+
+
+def _unpack_intervention(result, mode: str):
+    """Accept the historical four-tuple and the metadata-bearing five-tuple."""
+    if len(result) == 4:
+        return (*result, {"requested_mode": mode})
+    if len(result) == 5:
+        return result
+    raise ValueError("intervention must return four or five values")
+
+
+def inverse_permute_joint_output(output: torch.Tensor, metadata: dict) -> torch.Tensor:
+    """Return a jointly permuted prediction to the original view labeling."""
+    permutation = metadata.get("permutation")
+    if permutation is None:
+        return output
+    return permute_view_tensor(output, inverse_view_permutation(permutation))
 
 
 def _save_frame(path: Path, video: torch.Tensor) -> None:
@@ -1224,11 +1623,16 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                 mode_diagnostics = {}
                 mode_interventions = {}
                 for mode_index, mode in enumerate(args.modes):
+                    intervention_offset = 0 if mode.startswith("fusion_camera_dose_") else mode_index
                     intervention_generator = torch.Generator().manual_seed(
-                        sample_seed * 10 + mode_index
+                        sample_seed * 10 + intervention_offset
                     )
-                    changed_lr, fusion_camera, geometry_camera, source_mask = _intervention(
-                        lr, camera, mode, intervention_generator, far_camera=far_camera
+                    changed_lr, fusion_camera, geometry_camera, source_mask, intervention_metadata = _unpack_intervention(
+                        _intervention(
+                            lr, camera, mode, intervention_generator, far_camera=far_camera,
+                            return_metadata=True,
+                        ),
+                        mode,
                     )
                     self_source_override = False if mode.startswith("no_self_") else None
                     sampled = sample_latents(
@@ -1246,18 +1650,20 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                         sampling_shift=config.sampling_shift,
                         dtype=torch.bfloat16,
                         return_diagnostics=getattr(args, "save_diagnostics", False),
+                        view_permutation=intervention_metadata.get("permutation"),
                     )
                     if getattr(args, "save_diagnostics", False):
                         latent, mode_diagnostics[mode] = sampled
                         mode_interventions[mode] = (
                             changed_lr, fusion_camera, geometry_camera, source_mask,
-                            self_source_override,
+                            self_source_override, intervention_metadata,
                         )
                     else:
                         latent = sampled
-                    decoded = runtime.vae.decode_multiview(latent)[:, :, :1]
+                    decoded = runtime.vae.decode_multiview(latent)
+                    decoded = inverse_permute_joint_output(decoded, intervention_metadata)[:, :, :1]
                     item = frame_metrics(decoded, target, perceptual_metric=metric)[0]
-                    rows.append(_metric_row(
+                    metric_row = _metric_row(
                         item,
                         config=config,
                         training_seed=training_seed,
@@ -1266,7 +1672,9 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                         inference_seed=inference_seed,
                         group=group,
                         condition=mode,
-                    ))
+                    )
+                    metric_row["intervention"] = intervention_metadata
+                    rows.append(metric_row)
                     if args.save_images:
                         image_path = (
                             output / "images" / group["scene"] / f"view_{group['anchor']:03d}"
@@ -1277,7 +1685,7 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                     for mode, intervention in mode_interventions.items():
                         if mode in {"correct", "no_self_correct"}:
                             continue
-                        changed_lr, fusion_camera, geometry_camera, source_mask, self_source_override = intervention
+                        changed_lr, fusion_camera, geometry_camera, source_mask, self_source_override, intervention_metadata = intervention
                         reference_mode = (
                             "no_self_correct"
                             if mode.startswith("no_self_") and "no_self_correct" in mode_diagnostics
@@ -1302,6 +1710,7 @@ def _evaluate_seen(args, config: Stage3Config) -> None:
                             "inference_seed": inference_seed,
                             "sample_seed": sample_seed,
                             "reference_condition": reference_mode,
+                            "intervention": intervention_metadata,
                         })
                         diagnostic_rows.append(diagnostic)
     expected = len(groups) * len(args.inference_seeds) * len(args.modes)
@@ -1381,11 +1790,15 @@ def _evaluate(
                 with torch.inference_mode():
                     latent_shape = tuple(runtime.vae.encode_multiview(hr).shape)
                     for mode_index, mode in enumerate(modes):
+                        intervention_offset = 0 if mode.startswith("fusion_camera_dose_") else mode_index
                         intervention_generator = torch.Generator().manual_seed(
-                            inference_seed * 1000000 + scene_index * 10000 + group * 100 + mode_index
+                            inference_seed * 1000000 + scene_index * 10000 + group * 100 + intervention_offset
                         )
-                        changed_lr, fusion_camera, geometry_camera, source_mask = _intervention(
-                            lr, camera, mode, intervention_generator
+                        changed_lr, fusion_camera, geometry_camera, source_mask, intervention_metadata = _unpack_intervention(
+                            _intervention(
+                                lr, camera, mode, intervention_generator, return_metadata=True
+                            ),
+                            mode,
                         )
                         latent = sample_latents(
                             runtime,
@@ -1400,8 +1813,11 @@ def _evaluate(
                             seed=inference_seed * 10000 + group,
                             sampling_shift=config.sampling_shift,
                             dtype=torch.bfloat16,
+                            view_permutation=intervention_metadata.get("permutation"),
                         )
-                        decoded = runtime.vae.decode_multiview(latent)
+                        decoded = inverse_permute_joint_output(
+                            runtime.vae.decode_multiview(latent), intervention_metadata
+                        )
                         metrics = frame_metrics(decoded, hr, perceptual_metric=metric)
                         selected = metrics if modes == ("correct",) else metrics[:1]
                         for item in selected:
@@ -1416,6 +1832,7 @@ def _evaluate(
                                     "scene": scene,
                                     "split": "test" if phase == "test" else "validation",
                                     "condition": mode,
+                                    "intervention": intervention_metadata,
                                     "group": group,
                                     "view_position": position,
                                     "view_index": indices[position],
@@ -1482,7 +1899,10 @@ def _parser() -> argparse.ArgumentParser:
     _add_runtime_paths(train)
     train.add_argument("--output-dir", type=Path, required=True)
     train.add_argument("--seed", type=int, required=True)
-    train.add_argument("--resume", type=Path)
+    restart = train.add_mutually_exclusive_group()
+    restart.add_argument("--resume", type=Path)
+    restart.add_argument("--init-checkpoint", type=Path)
+    train.add_argument("--init-reset-fusion", action="store_true")
     validate = subparsers.add_parser("validate")
     validate.add_argument("--config", type=Path, required=True)
     _add_runtime_paths(validate)
@@ -1499,6 +1919,9 @@ def _parser() -> argparse.ArgumentParser:
         choices=(
             "correct", "remove", "duplicate", "shuffle_camera", "shuffle_fusion",
             "shuffle_geometry", "shuffle_all", "shuffle_pair", "local_patch",
+            "target_drop", "target_drop_shuffle_fusion", "mispaired_lr",
+            "mispaired_camera", "joint_permute", "fusion_camera_dose_0",
+            "fusion_camera_dose_half", "fusion_camera_dose_full",
         ),
         default=("correct", "remove", "duplicate", "shuffle_camera", "local_patch"),
     )
@@ -1520,6 +1943,9 @@ def _parser() -> argparse.ArgumentParser:
             "shuffle_camera", "shuffle_fusion", "shuffle_geometry", "shuffle_all",
             "shuffle_pair", "far_shuffle_fusion", "no_self_correct",
             "no_self_shuffle_fusion", "no_self_far_shuffle_fusion",
+            "target_drop_shuffle_fusion", "mispaired_lr", "mispaired_camera",
+            "joint_permute", "fusion_camera_dose_0", "fusion_camera_dose_half",
+            "fusion_camera_dose_full",
         ),
         default=("correct",),
     )

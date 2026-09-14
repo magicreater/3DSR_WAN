@@ -34,6 +34,94 @@ def test_missing_inputs_fail_before_runtime(runner, tmp_path, monkeypatch):
         runner.main(["train", "--config", str(config)])
 
 
+def test_train_init_checkpoint_is_mutually_exclusive_with_resume(runner):
+    parser = runner._parser()
+    common = [
+        "train", "--config", "config.json", "--dataset-root", "data",
+        "--model-dir", "model", "--lq-source", "lq.py",
+        "--lq-checkpoint", "lq.pt", "--bridge-checkpoint", "bridge.pt",
+        "--output-dir", "out", "--seed", "42",
+    ]
+    parsed = parser.parse_args(common + ["--init-checkpoint", "parent.pt", "--init-reset-fusion"])
+    assert parsed.init_checkpoint == Path("parent.pt") and parsed.resume is None
+    assert parsed.init_reset_fusion is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(common + ["--resume", "resume.pt", "--init-checkpoint", "parent.pt"])
+
+
+def test_initialization_provenance_records_resolved_parent_and_saved_config(runner, tmp_path):
+    parent = tmp_path / "parent.pt"
+    parent.write_bytes(b"stage3-parent")
+    payload = {"step": 1000, "config": {"camera_rank_weight": 0.1, "arm": "A3"}}
+    result = runner._initialization_provenance(parent, payload, reset_fusion=True)
+    assert result == {
+        "initialization_mode": "model_only",
+        "parent_checkpoint": str(parent.resolve()),
+        "parent_checkpoint_sha256": runner._sha256(parent),
+        "parent_saved_step": 1000,
+        "parent_saved_config_sha256": runner._json_sha256(payload["config"]),
+        "reset_fusion": True,
+    }
+
+
+def test_init_reset_fusion_requires_model_only_parent(runner):
+    assert runner._initialization_mode(None, Path("parent.pt"), True) == "model_only"
+    with pytest.raises(ValueError, match="init-reset-fusion"):
+        runner._initialization_mode(None, None, True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        runner._initialization_mode(Path("resume.pt"), Path("parent.pt"), False)
+
+
+def test_model_only_initialization_never_restores_poisoned_training_state(runner, tmp_path):
+    parameter = torch.nn.Parameter(torch.tensor(3.0))
+    optimizer = torch.optim.AdamW([parameter], lr=0.2)
+
+    class Cycle:
+        def __init__(self):
+            self.value = 11
+
+        def load_state_dict(self, _state):
+            self.value = -1
+
+    cycle = Cycle()
+    view = torch.Generator().manual_seed(101)
+    noise = torch.Generator().manual_seed(102)
+    expected_view = torch.rand(3, generator=torch.Generator().manual_seed(101))
+    expected_noise = torch.rand(3, generator=torch.Generator().manual_seed(102))
+    poisoned = {
+        "format": "rl3dsr-stage3",
+        "format_version": 1,
+        "step": 1000,
+        "config": {"arm": "A3"},
+        "training_state": {
+            "step": 1000,
+            "optimizer": {"poison": True},
+            "sigma_cycle": {"poison": True},
+            "view_generator_state": torch.Generator().manual_seed(999).get_state(),
+            "noise_generator_state": torch.Generator().manual_seed(999).get_state(),
+        }
+    }
+    runner._maybe_restore_training_progress(
+        poisoned, "model_only", optimizer, cycle, view, noise
+    )
+    assert optimizer.param_groups[0]["lr"] == 0.2
+    assert cycle.value == 11
+    assert torch.equal(torch.rand(3, generator=view), expected_view)
+    assert torch.equal(torch.rand(3, generator=noise), expected_noise)
+
+    parent_dir = tmp_path / "parent"
+    parent_dir.mkdir()
+    (parent_dir / "train_steps.jsonl").write_text('{"step":1000,"poison":true}\n')
+    parent_checkpoint = parent_dir / "stage3_step_1000.pt"
+    torch.save(poisoned, parent_checkpoint)
+    fresh_output = tmp_path / "fresh"
+    start_step, rows, loaded = runner._fresh_training_start(
+        fresh_output, parent_checkpoint
+    )
+    assert start_step == 1 and rows == [] and loaded["step"] == 1000
+    assert list(fresh_output.iterdir()) == []
+
+
 def test_split_routes_do_not_touch_test_during_development(runner):
     from rl3dsr.validation.stage3_protocol import Stage3Config
     config = Stage3Config()
@@ -290,6 +378,137 @@ def test_camera_intervention_scopes_are_explicit(runner):
         else:
             assert fusion_camera.T_world_from_camera.equal(geometry_camera.T_world_from_camera)
             assert fusion_camera.T_world_from_camera.equal(camera.T_world_from_camera) is False
+
+
+def test_new_mispairing_interventions_have_exact_scopes(runner):
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+
+    lr = torch.arange(1 * 1 * 4 * 1 * 1).reshape(1, 1, 4, 1, 1).float()
+    transforms = torch.eye(4).repeat(1, 4, 1, 1)
+    transforms[0, :, 0, 3] = torch.arange(4)
+    camera = CameraBatch(torch.eye(3).repeat(1, 4, 1, 1), transforms, (4, 4), "multiview")
+
+    changed, fusion, geometry, _ = runner._intervention(
+        lr, camera, "mispaired_lr", torch.Generator().manual_seed(7)
+    )
+    assert torch.equal(changed[:, :, :1], lr[:, :, :1])
+    assert all(not torch.equal(changed[:, :, i], lr[:, :, i]) for i in range(1, 4))
+    assert fusion is camera and geometry is camera
+
+    changed, fusion, geometry, _ = runner._intervention(
+        lr, camera, "mispaired_camera", torch.Generator().manual_seed(7)
+    )
+    assert torch.equal(changed, lr)
+    assert geometry is camera
+    assert torch.equal(fusion.T_world_from_camera[:, :1], camera.T_world_from_camera[:, :1])
+    assert not torch.equal(fusion.T_world_from_camera[:, 1:], camera.T_world_from_camera[:, 1:])
+
+    changed, fusion, geometry, _ = runner._intervention(
+        lr, camera, "target_drop_shuffle_fusion", torch.Generator().manual_seed(7)
+    )
+    assert changed[:, :, 0].count_nonzero() == 0
+    assert torch.equal(changed[:, :, 1:], lr[:, :, 1:])
+    assert geometry is camera
+    assert not torch.equal(fusion.T_world_from_camera[:, 1:], camera.T_world_from_camera[:, 1:])
+
+
+def test_joint_permutation_covers_all_view_slots_and_roundtrips(runner):
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+
+    permutation = torch.tensor([2, 0, 3, 1])
+    inverse = runner.inverse_view_permutation(permutation)
+    lr = torch.arange(4).reshape(1, 1, 4, 1, 1)
+    latent = torch.arange(8).reshape(1, 1, 4, 1, 2)
+    mask = torch.tensor([[True, False, True, False]])
+    transforms = torch.eye(4).repeat(1, 4, 1, 1)
+    transforms[0, :, 0, 3] = torch.arange(4)
+    camera = CameraBatch(torch.eye(3).repeat(1, 4, 1, 1), transforms, (4, 4), "multiview")
+    result = runner.apply_joint_view_permutation(
+        permutation,
+        lr=lr,
+        fusion_camera=camera,
+        geometry_camera=camera,
+        target=latent,
+        latent=latent,
+        source_mask=mask,
+        noise=latent,
+    )
+    assert result["target_index"] == 1
+    assert torch.equal(result["lr"], lr.index_select(2, permutation))
+    assert torch.equal(result["source_mask"], mask.index_select(1, permutation))
+    assert torch.equal(result["fusion_camera"].T_world_from_camera, transforms.index_select(1, permutation))
+    assert torch.equal(runner.permute_view_tensor(result["latent"], inverse), latent)
+    assert result["permutation_sha256"] == runner._permutation_digest(permutation)
+    with pytest.raises(ValueError, match="permutation"):
+        runner.inverse_view_permutation(torch.tensor([0, 0, 2, 3]))
+
+
+def test_joint_permutation_sample_uses_permuted_paired_noise_and_inverse_output(runner):
+    permutation = torch.tensor([2, 0, 1])
+    captured = {}
+    module = SimpleNamespace(
+        fusion=None,
+        geometry=SimpleNamespace(last_diagnostics={}),
+        prepare_multiview=lambda *args, **kwargs: torch.zeros(1, 3, 1),
+        predict=lambda _dit, sample, *_args, **_kwargs: torch.zeros_like(sample),
+    )
+    runtime = SimpleNamespace(module=module, dit=SimpleNamespace(last_injection_stats={}), device=torch.device("cpu"))
+
+    def sampler(noise, prepared, context, *, predict_velocity, config):
+        captured["noise"] = noise.clone()
+        return noise
+
+    shape = (1, 1, 3, 1, 2)
+    base = torch.randn(shape, generator=torch.Generator().manual_seed(19))
+    sampled = runner.sample_latents(
+        runtime, torch.zeros(1, 1, 3, 1, 1), object(), shape, 1, 4,
+        sampler=sampler, seed=19, dtype=torch.float32, view_permutation=permutation,
+    )
+    assert torch.equal(captured["noise"], base.index_select(2, permutation))
+    assert torch.equal(sampled, base.index_select(2, permutation))
+    assert torch.equal(
+        runner.inverse_permute_joint_output(sampled, {"permutation": permutation.tolist()}),
+        base,
+    )
+
+
+def test_fusion_camera_dose_uses_valid_se3_and_exact_endpoints(runner):
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+
+    k = torch.eye(3).repeat(1, 3, 1, 1)
+    k[0, :, 0, 0] = torch.tensor([1.0, 2.0, 3.0])
+    correct_t = torch.eye(4).repeat(1, 3, 1, 1)
+    wrong_t = correct_t.clone()
+    wrong_t[0, 1, :3, :3] = torch.tensor([[0., -1., 0.], [-1., 0., 0.], [0., 0., -1.]])
+    wrong_t[0, 2, :3, :3] = torch.tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+    wrong_t[0, 1:, :3, 3] = torch.tensor([[2., 4., 6.], [4., 8., 12.]])
+    correct = CameraBatch(k, correct_t, (8, 8), "multiview")
+    wrong_k = k.clone()
+    wrong_k[:, 1:] = k[:, [2, 1]]
+    wrong = CameraBatch(wrong_k, wrong_t, (8, 8), "multiview")
+    dose0 = runner.interpolate_fusion_camera_dose(correct, wrong, 0.0)
+    dose_half = runner.interpolate_fusion_camera_dose(correct, wrong, 0.5)
+    dose1 = runner.interpolate_fusion_camera_dose(correct, wrong, 1.0)
+    assert torch.equal(dose0.K, correct.K) and torch.equal(dose0.T_world_from_camera, correct.T_world_from_camera)
+    assert torch.equal(dose1.K, wrong.K) and torch.equal(dose1.T_world_from_camera, wrong.T_world_from_camera)
+    assert torch.equal(dose_half.T_world_from_camera[:, :1], correct.T_world_from_camera[:, :1])
+    rotation = dose_half.T_world_from_camera[..., :3, :3]
+    identity = torch.eye(3).expand_as(rotation)
+    assert torch.allclose(rotation.transpose(-1, -2) @ rotation, identity, atol=1e-5)
+    assert torch.allclose(torch.linalg.det(rotation), torch.ones_like(torch.linalg.det(rotation)), atol=1e-5)
+    axis_scale = 2 ** -0.5
+    expected_mixed_axis_half = torch.tensor([
+        [0.5, -0.5, -axis_scale],
+        [-0.5, 0.5, -axis_scale],
+        [axis_scale, axis_scale, 0.0],
+    ])
+    assert torch.allclose(rotation[0, 1], expected_mixed_axis_half, atol=1e-5)
+    scores = [
+        (dose.T_world_from_camera - correct.T_world_from_camera).square().sum().item()
+        + (dose.K - correct.K).square().sum().item()
+        for dose in (dose0, dose_half, dose1)
+    ]
+    assert scores[0] < scores[1] < scores[2]
 
 
 def test_far_fusion_camera_intervention_keeps_lr_target_and_geometry(runner):
