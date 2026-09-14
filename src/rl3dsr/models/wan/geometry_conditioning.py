@@ -8,6 +8,7 @@ kept explicit in the camera representation and manifest.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -15,6 +16,9 @@ from typing import Any, Mapping
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+
+OFFICIAL_UCPE_COMMIT = "d992f1807803ba99331e807e8f018ed552886afd"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +30,8 @@ class CameraBatch:
     image_size: tuple[int, int]
     sequence_kind: str
     reference_index: int = 0
+    camera_model: str = "pinhole"
+    xi: Tensor | None = None
 
     def validate(self, batch: int | None = None) -> None:
         if self.K.ndim != 4 or self.K.shape[-2:] != (3, 3):
@@ -38,6 +44,8 @@ class CameraBatch:
             raise ValueError(f"camera batch must have B={batch}")
         if not torch.is_floating_point(self.K) or not torch.is_floating_point(self.T_world_from_camera):
             raise ValueError("camera tensors must be floating point")
+        if self.K.device != self.T_world_from_camera.device or self.K.dtype != self.T_world_from_camera.dtype:
+            raise ValueError("K and T_world_from_camera must share device and dtype")
         if not torch.isfinite(self.K).all() or not torch.isfinite(self.T_world_from_camera).all():
             raise ValueError("camera tensors must be finite")
         height, width = self.image_size
@@ -45,6 +53,26 @@ class CameraBatch:
             raise ValueError("image_size must be positive")
         if self.sequence_kind not in {"multiview", "temporal"}:
             raise ValueError("sequence_kind must be multiview or temporal")
+        if self.camera_model not in {"pinhole", "ucm"}:
+            raise ValueError("camera_model must be pinhole or ucm")
+        if self.camera_model == "pinhole":
+            if self.xi is not None:
+                raise ValueError("xi must be omitted for pinhole cameras")
+        else:
+            if self.xi is None:
+                raise ValueError("xi is required for ucm cameras")
+            if not isinstance(self.xi, Tensor):
+                raise ValueError("xi must be a tensor")
+            if self.xi.shape != self.K.shape[:2]:
+                raise ValueError("xi must have shape [B,S]")
+            if not torch.is_floating_point(self.xi):
+                raise ValueError("xi must be floating point")
+            if not torch.isfinite(self.xi).all():
+                raise ValueError("xi must be finite")
+            if (self.xi < 0).any():
+                raise ValueError("xi must be non-negative")
+            if self.xi.device != self.K.device:
+                raise ValueError("xi must be on the same device as K")
         if not 0 <= self.reference_index < self.K.shape[1]:
             raise ValueError("reference_index is outside the sequence")
         if (self.K[..., 0, 0] <= 0).any() or (self.K[..., 1, 1] <= 0).any():
@@ -84,23 +112,79 @@ def _invert_se3(transform: Tensor) -> Tensor:
     return result
 
 
-def _canonical_patch_rays(camera: CameraBatch, grid: tuple[int, int]) -> Tensor:
-    """Return normalized pinhole rays in camera coordinates as [B,S,P,3]."""
+def _camera_compute_dtype(dtype: torch.dtype) -> torch.dtype:
+    return torch.float32 if dtype in {torch.float16, torch.bfloat16} else dtype
+
+
+def build_camera_rays(camera: CameraBatch, grid: tuple[int, int]) -> Tensor:
+    """Return canonical OpenCV camera rays as ``[B,S,P,3]``.
+
+    ``K`` is interpreted in pixel coordinates at patch centers. Pinhole rays
+    use ``K^-1 [u,v,1]``. UCM rays use the closed-form inverse unified camera
+    model with per-observation ``xi``; ``xi=0`` is the pinhole limit.
+    Half-precision inputs are evaluated in float32 and returned in their
+    storage dtype so this geometry path remains usable on CPU.
+    """
+
+    camera.validate()
 
     grid_h, grid_w = grid
+    if grid_h < 1 or grid_w < 1:
+        raise ValueError("latent token grid must be positive")
     height, width = camera.image_size
-    device, dtype = camera.K.device, camera.K.dtype
+    device = camera.K.device
+    dtype = _camera_compute_dtype(camera.K.dtype)
     u = (torch.arange(grid_w, device=device, dtype=dtype) + 0.5) * (width / grid_w)
     v = (torch.arange(grid_h, device=device, dtype=dtype) + 0.5) * (height / grid_h)
     vv, uu = torch.meshgrid(v, u, indexing="ij")
     pixels = torch.stack((uu, vv, torch.ones_like(uu)), dim=-1).reshape(1, 1, -1, 3)
-    return _normalize(
-        torch.einsum(
-            "bsij,bspj->bspi",
-            torch.linalg.inv(camera.K),
-            pixels.expand(camera.K.shape[0], camera.K.shape[1], -1, -1),
-        )
+    plane = torch.einsum(
+        "bsij,bspj->bspi",
+        torch.linalg.inv(camera.K.to(dtype=dtype)),
+        pixels.expand(camera.K.shape[0], camera.K.shape[1], -1, -1),
     )
+    if camera.camera_model == "pinhole":
+        rays = _normalize(plane)
+    else:
+        normalized = plane[..., :2] / plane[..., 2:].clamp_min(torch.finfo(dtype).eps)
+        radius_squared = normalized.square().sum(dim=-1, keepdim=True)
+        xi = camera.xi.to(dtype=dtype)[..., None, None]
+        scale = (
+            xi + torch.sqrt(1 + (1 - xi.square()) * radius_squared)
+        ) / (1 + radius_squared)
+        rays = torch.cat((scale * normalized, scale - xi), dim=-1)
+        rays = _normalize(rays)
+    return rays.to(dtype=camera.K.dtype)
+
+
+def project_camera_directions(camera: CameraBatch, directions: Tensor) -> Tensor:
+    """Project camera-frame directions to pixels as ``[B,S,P,2]``.
+
+    This is the forward model paired with :func:`build_camera_rays` and is
+    shared by the UCPE absolute up-map construction and downstream fusion.
+    """
+
+    camera.validate()
+    if directions.ndim != 4 or directions.shape[:2] != camera.K.shape[:2] or directions.shape[-1] != 3:
+        raise ValueError("directions must have shape [B,S,P,3] matching the camera")
+    dtype = directions.dtype
+    intrinsics = camera.K.to(dtype=dtype)
+    x, y, z = directions.unbind(dim=-1)
+    if camera.camera_model == "pinhole":
+        denominator = z
+    else:
+        xi = camera.xi.to(dtype=dtype)[..., None]
+        denominator = z + xi * directions.norm(dim=-1)
+    safe = torch.where(denominator.abs() > 1e-8, denominator, torch.ones_like(denominator))
+    u = intrinsics[..., 0, 0, None] * x / safe + intrinsics[..., 0, 2, None]
+    v = intrinsics[..., 1, 1, None] * y / safe + intrinsics[..., 1, 2, None]
+    return torch.stack((u, v), dim=-1)
+
+
+def _canonical_patch_rays(camera: CameraBatch, grid: tuple[int, int]) -> Tensor:
+    """Compatibility alias for the former private pinhole ray builder."""
+
+    return build_camera_rays(camera, grid)
 
 
 def build_world_to_ray(
@@ -115,13 +199,15 @@ def build_world_to_ray(
     grid_h, grid_w = grid
     if grid_h < 1 or grid_w < 1:
         raise ValueError("latent token grid must be positive")
-    up = torch.tensor(world_up, device=camera.K.device, dtype=camera.K.dtype)
+    output_dtype = camera.K.dtype
+    compute_dtype = _camera_compute_dtype(output_dtype)
+    up = torch.tensor(world_up, device=camera.K.device, dtype=compute_dtype)
     if up.shape != (3,) or not torch.isfinite(up).all() or float(up.norm()) < 1e-6:
         raise ValueError("world_up must be a finite non-zero 3-vector")
     up = _normalize(up)
 
-    rays_camera = _canonical_patch_rays(camera, grid)
-    c2w = camera.T_world_from_camera
+    rays_camera = build_camera_rays(camera, grid).to(dtype=compute_dtype)
+    c2w = camera.T_world_from_camera.to(dtype=compute_dtype)
     rotation = c2w[..., :3, :3]
     centers = c2w[..., :3, 3]
     rays_world = _normalize(torch.einsum("bsij,bspj->bspi", rotation, rays_camera))
@@ -139,7 +225,7 @@ def build_world_to_ray(
     world_to_ray = torch.zeros(
         (*rays_world.shape[:-1], 4, 4),
         device=camera.K.device,
-        dtype=camera.K.dtype,
+        dtype=compute_dtype,
     )
     world_to_ray[..., :3, :3] = world_to_ray_rotation
     world_to_ray[..., :3, 3] = -torch.einsum(
@@ -152,7 +238,7 @@ def build_world_to_ray(
     axis = torch.cross(rays_world, expanded_up, dim=-1)
     axis_norm = axis.norm(dim=-1, keepdim=True)
     axis = axis / axis_norm.clamp_min(1e-8)
-    delta = torch.tensor(0.1, device=camera.K.device, dtype=camera.K.dtype)
+    delta = torch.tensor(0.1, device=camera.K.device, dtype=compute_dtype)
     rotated_world = (
         rays_world * delta.cos()
         + torch.cross(axis, rays_world, dim=-1) * delta.sin()
@@ -161,15 +247,13 @@ def build_world_to_ray(
     rotated_camera = torch.einsum(
         "bsji,bspj->bspi", rotation, rotated_world
     )
+    projected = project_camera_directions(camera, rotated_camera)
     z = rotated_camera[..., 2]
-    safe_z = torch.where(z.abs() > 1e-8, z, torch.ones_like(z))
-    projected_u = camera.K[..., 0, 0, None] * rotated_camera[..., 0] / safe_z + camera.K[..., 0, 2, None]
-    projected_v = camera.K[..., 1, 1, None] * rotated_camera[..., 1] / safe_z + camera.K[..., 1, 2, None]
-    u = (torch.arange(grid_w, device=camera.K.device, dtype=camera.K.dtype) + 0.5) * (camera.image_size[1] / grid_w)
-    v = (torch.arange(grid_h, device=camera.K.device, dtype=camera.K.dtype) + 0.5) * (camera.image_size[0] / grid_h)
+    u = (torch.arange(grid_w, device=camera.K.device, dtype=compute_dtype) + 0.5) * (camera.image_size[1] / grid_w)
+    v = (torch.arange(grid_h, device=camera.K.device, dtype=compute_dtype) + 0.5) * (camera.image_size[0] / grid_h)
     vv, uu = torch.meshgrid(v, u, indexing="ij")
     image_up = torch.stack(
-        (projected_u - uu.reshape(1, 1, -1), projected_v - vv.reshape(1, 1, -1)),
+        (projected[..., 0] - uu.reshape(1, 1, -1), projected[..., 1] - vv.reshape(1, 1, -1)),
         dim=-1,
     )
     valid = (axis_norm > 1e-8) & (z.abs()[..., None] > 1e-8) & torch.isfinite(image_up).all(dim=-1, keepdim=True)
@@ -177,8 +261,8 @@ def build_world_to_ray(
     absmap = torch.cat((image_up, latitude), dim=-1)
     batch, sequence, patches = rays_world.shape[:3]
     return FullRREContext(
-        world_to_ray.reshape(batch, sequence * patches, 4, 4).contiguous(),
-        absmap.reshape(batch, sequence * patches, 3).contiguous(),
+        world_to_ray.to(dtype=output_dtype).reshape(batch, sequence * patches, 4, 4).contiguous(),
+        absmap.to(dtype=output_dtype).reshape(batch, sequence * patches, 3).contiguous(),
         (grid_h, grid_w),
     )
 
@@ -249,9 +333,7 @@ def _ray_features(camera: CameraBatch, grid: tuple[int, int], representation: st
     u = (torch.arange(grid_w, device=device, dtype=dtype) + 0.5) * (width / grid_w)
     v = (torch.arange(grid_h, device=device, dtype=dtype) + 0.5) * (height / grid_h)
     vv, uu = torch.meshgrid(v, u, indexing="ij")
-    pixels = torch.stack((uu, vv, torch.ones_like(uu)), dim=-1).reshape(1, 1, -1, 3)
-    inverse_k = torch.linalg.inv(camera.K)
-    rays_cam = _normalize(torch.einsum("bsij,bspj->bspi", inverse_k, pixels.expand(batch, sequence, -1, -1)))
+    rays_cam = build_camera_rays(camera, grid)
 
     reference = camera.T_world_from_camera[:, camera.reference_index]
     relative = torch.linalg.inv(reference)[:, None] @ camera.T_world_from_camera
@@ -533,6 +615,125 @@ class FullRREConditioner(nn.Module):
             nn.init.zeros_(branch.output.weight)
             nn.init.zeros_(branch.output.bias)
         self.last_diagnostics = {}
+
+
+_OFFICIAL_UCPE_LAYER_NAMES = {
+    "cam_encoder": "camera_encoder",
+    "q_proj": "q",
+    "k_proj": "k",
+    "v_proj": "v",
+    "out_proj": "output",
+}
+
+
+def _official_ucpe_key_map(module: FullRREConditioner) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for branch in range(module.branch_count):
+        for source_layer, target_layer in _OFFICIAL_UCPE_LAYER_NAMES.items():
+            for suffix in ("weight", "bias"):
+                source = f"pipe.dit.blocks.{branch}.cam_self_attn.{source_layer}.{suffix}"
+                target = f"branches.{branch}.{target_layer}.{suffix}"
+                mapping[source] = target
+    return mapping
+
+
+def convert_official_ucpe_checkpoint(
+    source_path: str | Path,
+    destination_path: str | Path,
+    *,
+    module: FullRREConditioner | None = None,
+) -> dict[str, str]:
+    """Convert one pinned official UCPE adapter checkpoint to format v2.
+
+    The input contract is the adapter-only Lightning ``state_dict`` emitted by
+    UCPE commit :data:`OFFICIAL_UCPE_COMMIT`. Every tensor is mapped by name
+    and checked against the destination module before any file is written.
+    Provenance, including the hash of the completed output, is stored in an
+    adjacent ``.provenance.json`` file because a file cannot contain its own
+    cryptographic digest.
+    """
+
+    source = Path(source_path)
+    destination = Path(destination_path)
+    provenance_path = destination.with_suffix(destination.suffix + ".provenance.json")
+    if not source.is_file():
+        raise FileNotFoundError(f"official UCPE checkpoint does not exist: {source}")
+    if destination.exists() or provenance_path.exists():
+        raise FileExistsError("converted checkpoint or provenance file already exists")
+    if module is None:
+        module = FullRREConditioner()
+    if not isinstance(module, FullRREConditioner):
+        raise TypeError("module must be FullRREConditioner")
+
+    payload = torch.load(source, map_location="cpu", weights_only=True)
+    state = payload.get("state_dict") if isinstance(payload, Mapping) and "state_dict" in payload else payload
+    if not isinstance(state, Mapping) or not all(isinstance(name, str) for name in state):
+        raise RuntimeError("official UCPE checkpoint must contain a tensor state_dict")
+
+    key_map = _official_ucpe_key_map(module)
+    actual_keys = set(state)
+    expected_keys = set(key_map)
+    missing = sorted(expected_keys - actual_keys)
+    unexpected = sorted(actual_keys - expected_keys)
+    if missing:
+        raise RuntimeError(f"missing official UCPE branch tensors: {missing}")
+    if unexpected:
+        raise RuntimeError(f"unexpected official UCPE checkpoint keys: {unexpected}")
+
+    expected_state = module.state_dict()
+    converted: dict[str, Tensor] = {}
+    for source_name, target_name in key_map.items():
+        value = state[source_name]
+        if not isinstance(value, Tensor):
+            raise RuntimeError(f"official UCPE value is not a tensor: {source_name}")
+        expected_shape = expected_state[target_name].shape
+        if value.shape != expected_shape:
+            raise RuntimeError(
+                f"shape mismatch for {source_name}: expected {tuple(expected_shape)}, got {tuple(value.shape)}"
+            )
+        converted[target_name] = value.detach().cpu()
+
+    input_sha256 = _sha256_file(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    provenance_temporary = provenance_path.with_suffix(provenance_path.suffix + ".tmp")
+    try:
+        torch.save(
+            {
+                "format_version": 2,
+                "geometry": converted,
+                "config": {
+                    "representation": module.representation,
+                    "feature_dim": module.feature_dim,
+                    "hidden_dim": module.hidden_dim,
+                    "attention_heads": module.attention_heads,
+                    "branch_count": module.branch_count,
+                    "compression": module.compression,
+                    "absmap": module.absmap,
+                    "world_up": list(module.world_up),
+                },
+                "source_commit": OFFICIAL_UCPE_COMMIT,
+                "source_checkpoint_sha256": input_sha256,
+                "trainable_parameters": sum(value.numel() for value in module.parameters() if value.requires_grad),
+            },
+            temporary,
+        )
+        output_sha256 = _sha256_file(temporary)
+        provenance = {
+            "source_commit": OFFICIAL_UCPE_COMMIT,
+            "input_sha256": input_sha256,
+            "output_sha256": output_sha256,
+        }
+        provenance_temporary.write_text(
+            json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+        provenance_temporary.replace(provenance_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+        provenance_temporary.unlink(missing_ok=True)
+    return provenance
 
 
 def _sha256_file(path: Path) -> str:
