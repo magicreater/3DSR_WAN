@@ -352,6 +352,67 @@ def _apply_prope(
     )
 
 
+def invert_se3(transform: Tensor) -> Tensor:
+    """Public UCPE helper shared by camera-aware attention branches."""
+
+    return _invert_se3(transform)
+
+
+def patch_prope_coefficients(
+    patch_grid: tuple[int, int],
+    sequence: int,
+    feature_dim: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[tuple[Tensor, Tensor], tuple[Tensor, Tensor]]:
+    """Return repeated row/column RoPE coefficients for a view-token grid."""
+
+    grid_h, grid_w = patch_grid
+    if (
+        type(grid_h) is not int
+        or type(grid_w) is not int
+        or min(grid_h, grid_w) < 1
+        or type(sequence) is not int
+        or sequence < 1
+    ):
+        raise ValueError("patch_grid and sequence must be positive integers")
+    return (
+        _rope_coefficients(
+            torch.tile(torch.arange(grid_w, device=device), (grid_h * sequence,)),
+            feature_dim,
+            dtype,
+        ),
+        _rope_coefficients(
+            torch.tile(
+                torch.repeat_interleave(torch.arange(grid_h, device=device), grid_w),
+                (sequence,),
+            ),
+            feature_dim,
+            dtype,
+        ),
+    )
+
+
+def apply_prope(
+    value: Tensor,
+    matrix: Tensor,
+    coeff_x: tuple[Tensor, Tensor],
+    coeff_y: tuple[Tensor, Tensor],
+    *,
+    inverse_rope: bool = False,
+) -> Tensor:
+    """Apply the shared half-RRE, half-2-D-RoPE UCPE transform."""
+
+    return _apply_prope(
+        value,
+        matrix,
+        coeff_x,
+        coeff_y,
+        inverse_rope=inverse_rope,
+    )
+
+
 def _ray_features(camera: CameraBatch, grid: tuple[int, int], representation: str) -> Tensor:
     camera.validate()
     batch, sequence = camera.K.shape[:2]
@@ -547,24 +608,18 @@ class FullRREAttentionBlock(nn.Module):
         matrices = context.world_to_ray.to(device=tokens.device, dtype=q.dtype)
         inverse = _invert_se3(matrices)
         sequence = token_count // patches
-        coeff_x = _rope_coefficients(
-            torch.tile(torch.arange(grid_w, device=tokens.device), (grid_h * sequence,)),
+        coeff_x, coeff_y = patch_prope_coefficients(
+            (grid_h, grid_w),
+            sequence,
             self.head_dim // 4,
-            q.dtype,
+            device=tokens.device,
+            dtype=q.dtype,
         )
-        coeff_y = _rope_coefficients(
-            torch.tile(
-                torch.repeat_interleave(torch.arange(grid_h, device=tokens.device), grid_w),
-                (sequence,),
-            ),
-            self.head_dim // 4,
-            q.dtype,
-        )
-        q = _apply_prope(q, matrices.transpose(-1, -2), coeff_x, coeff_y)
-        k = _apply_prope(k, inverse, coeff_x, coeff_y)
-        v = _apply_prope(v, inverse, coeff_x, coeff_y)
+        q = apply_prope(q, matrices.transpose(-1, -2), coeff_x, coeff_y)
+        k = apply_prope(k, inverse, coeff_x, coeff_y)
+        v = apply_prope(v, inverse, coeff_x, coeff_y)
         attended = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
-        attended = _apply_prope(attended, matrices, coeff_x, coeff_y, inverse_rope=True)
+        attended = apply_prope(attended, matrices, coeff_x, coeff_y, inverse_rope=True)
         attended = attended.transpose(1, 2).reshape(batch, token_count, self.hidden_dim)
         return self.output(attended)
 

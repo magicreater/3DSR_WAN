@@ -19,7 +19,13 @@ from torch import Tensor
 from rl3dsr.models.wan.geometry_conditioning import CameraBatch
 
 
-ARM_MODES = {"A0": "off", "A1": "same_view", "A2": "visual", "A3": "epipolar"}
+ARM_MODES = {
+    "A0": "off",
+    "A1": "same_view",
+    "A2": "visual",
+    "A3": "epipolar",
+    "A4": "rre_epipolar",
+}
 
 
 @dataclass(frozen=True)
@@ -58,7 +64,7 @@ class Stage3Config:
 
     def __post_init__(self):
         if self.arm not in ARM_MODES:
-            raise ValueError("arm must be A0, A1, A2 or A3")
+            raise ValueError("arm must be A0, A1, A2, A3 or A4")
         groups = (self.train_scenes, self.validation_scenes, self.test_scenes)
         for group in groups:
             if not isinstance(group, tuple) or not group or any(not isinstance(s, str) or not s for s in group):
@@ -103,6 +109,15 @@ class Stage3Config:
             raise ValueError("image_size must align with Wan VAE/patch grid and SR scale")
         if self.fusion_dim % self.fusion_heads:
             raise ValueError("fusion_dim must be divisible by fusion_heads")
+        if self.arm == "A4":
+            if self.fusion_dim != 192:
+                raise ValueError("A4 requires fusion_dim=192")
+            if self.fusion_heads != 1:
+                raise ValueError("A4 requires fusion_heads=1")
+            if self.epipolar_attention != "local_band":
+                raise ValueError("A4 requires epipolar_attention=local_band")
+            if self.allow_self_view_source:
+                raise ValueError("A4 requires allow_self_view_source=false")
         if self.nearest_views < self.views - 1:
             raise ValueError("nearest_views must cover all auxiliary views")
 

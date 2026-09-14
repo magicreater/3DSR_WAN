@@ -51,6 +51,41 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
         replace(Stage3Config(), camera_rank_margin_ratio=0.0)
 
 
+def test_a4_maps_to_rre_epipolar_and_enforces_production_contract():
+    config = Stage3Config(
+        arm="A4",
+        fusion_dim=192,
+        fusion_heads=1,
+        epipolar_attention="local_band",
+        allow_self_view_source=False,
+    )
+    assert config.fusion_mode == "rre_epipolar"
+    with pytest.raises(ValueError, match="fusion_dim=192"):
+        replace(config, fusion_dim=96)
+    with pytest.raises(ValueError, match="fusion_heads=1"):
+        replace(config, fusion_heads=3)
+    with pytest.raises(ValueError, match="local_band"):
+        replace(config, epipolar_attention="global_bias")
+    with pytest.raises(ValueError, match="allow_self_view_source=false"):
+        replace(config, allow_self_view_source=True)
+
+
+def test_legacy_arm_mapping_and_serialized_config_are_unchanged(tmp_path):
+    expected = {
+        "A0": "off",
+        "A1": "same_view",
+        "A2": "visual",
+        "A3": "epipolar",
+    }
+    for arm, mode in expected.items():
+        config = Stage3Config(arm=arm)
+        path = tmp_path / f"{arm}.json"
+        path.write_text(json.dumps(config.to_dict()))
+        loaded = load_stage3_config(path)
+        assert loaded == config
+        assert loaded.fusion_mode == mode
+
+
 def test_interventions_preserve_target_and_inputs():
     lr = torch.arange(1 * 3 * 4 * 8 * 8).reshape(1, 3, 4, 8, 8).float()
     cam = camera()

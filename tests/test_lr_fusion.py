@@ -25,6 +25,25 @@ def active(mode='epipolar', chunk=3):
     return net
 
 
+def active_rre(chunk=3):
+    net = LRViewFusion(
+        12,
+        8,
+        1,
+        mode='rre_epipolar',
+        query_chunk_size=chunk,
+        allow_self_view_source=False,
+    )
+    with torch.no_grad():
+        net.qkv.weight.copy_(
+            torch.arange(net.qkv.weight.numel()).reshape_as(net.qkv.weight) / 1000
+        )
+        net.output.weight.copy_(
+            torch.arange(net.output.weight.numel()).reshape_as(net.output.weight) / 1000
+        )
+    return net
+
+
 class FusionTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(7)
@@ -184,6 +203,86 @@ class FusionTests(unittest.TestCase):
             model(self.x * float('nan'), self.cam, (2, 3))
         with self.assertRaises(ValueError):
             model(self.x, self.cam, (2, 3), source_mask=torch.ones(1, 3))
+
+    def test_rre_epipolar_requires_one_head_and_no_self(self):
+        with self.assertRaisesRegex(ValueError, 'one attention head'):
+            LRViewFusion(12, 16, 2, mode='rre_epipolar', allow_self_view_source=False)
+        with self.assertRaisesRegex(ValueError, 'self-view'):
+            LRViewFusion(12, 8, 1, mode='rre_epipolar')
+        with self.assertRaisesRegex(ValueError, 'divisible by 8'):
+            LRViewFusion(12, 12, 1, mode='rre_epipolar', allow_self_view_source=False)
+
+    def test_rre_epipolar_zero_init_shape_and_exact_noop(self):
+        model = LRViewFusion(
+            12, 8, 1, mode='rre_epipolar', allow_self_view_source=False
+        )
+        actual = model(self.x, self.cam, (2, 3))
+        self.assertEqual(actual.shape, self.x.shape)
+        self.assertTrue(torch.equal(actual, self.x))
+        self.assertEqual(float(model.output.weight.count_nonzero()), 0.0)
+        off = LRViewFusion(12, 8, 1, mode='off')
+        self.assertIs(off(self.x, self.cam, (2, 3)), self.x)
+
+    def test_rre_epipolar_no_self_null_fallback_and_pairing_diagnostics(self):
+        model = active_rre()
+        model.record_diagnostics = True
+        model(self.x, self.cam, (2, 3))
+        stats = model.last_diagnostics['fusion']
+        self.assertEqual(float(stats['same_view_attention_mass']), 0.0)
+        self.assertGreater(float(stats['cross_view_attention_mass']), 0.0)
+        pairing = model.last_diagnostics['pairing']
+        self.assertEqual(pairing['query'].shape, (1, 1, 18, 8))
+        self.assertEqual(pairing['key'].shape, (1, 1, 18, 8))
+        self.assertEqual(pairing['allowed'].shape, (1, 18, 18))
+        self.assertFalse(pairing['query'].requires_grad)
+        self.assertFalse(pairing['key'].requires_grad)
+        self.assertFalse(bool(pairing['allowed'].reshape(1, 3, 6, 3, 6).diagonal(dim1=1, dim2=3).any()))
+
+        empty = torch.zeros(1, 3, dtype=torch.bool)
+        self.assertTrue(torch.equal(
+            model(self.x, self.cam, (2, 3), source_mask=empty), self.x
+        ))
+        self.assertAlmostEqual(
+            float(model.last_diagnostics['fusion']['null_attention_mass']), 1.0, places=6
+        )
+        with self.assertRaisesRegex(ValueError, 'cannot enable self-view'):
+            model(self.x, self.cam, (2, 3), allow_self_view_source=True)
+
+    def test_rre_epipolar_changes_when_only_camera_pairing_changes(self):
+        model = active_rre()
+        expected = model(self.x, self.cam, (2, 3))
+        order = torch.tensor([0, 2, 1])
+        changed_camera = replace(
+            self.cam,
+            K=self.cam.K[:, order],
+            T_world_from_camera=self.cam.T_world_from_camera[:, order],
+        )
+        actual = model(self.x, changed_camera, (2, 3))
+        self.assertFalse(torch.allclose(expected, actual, atol=1e-7, rtol=1e-7))
+
+    def test_rre_epipolar_is_jointly_view_permutation_equivariant(self):
+        model = active_rre(chunk=5)
+        expected = model(self.x, self.cam, (2, 3))
+        order = torch.tensor([2, 0, 1])
+        permuted_camera = replace(
+            self.cam,
+            K=self.cam.K[:, order],
+            T_world_from_camera=self.cam.T_world_from_camera[:, order],
+        )
+        actual = model(self.x[:, order], permuted_camera, (2, 3))
+        inverse = torch.argsort(order)
+        self.assertTrue(torch.allclose(expected, actual[:, inverse], atol=2e-5, rtol=2e-5))
+
+    def test_rre_addition_does_not_change_legacy_parameter_contract(self):
+        expected_keys = {'qkv.weight', 'output.weight'}
+        for mode in ('off', 'same_view', 'visual', 'epipolar', 'epipolar_local'):
+            model = LRViewFusion(12, 12, 3, mode=mode)
+            self.assertEqual(set(model.state_dict()), expected_keys)
+            clone = LRViewFusion(12, 12, 3, mode=mode)
+            clone.load_state_dict(model.state_dict(), strict=True)
+            self.assertTrue(torch.equal(
+                model(self.x, self.cam, (2, 3)), clone(self.x, self.cam, (2, 3))
+            ))
 
 
 if __name__ == '__main__':

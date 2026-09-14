@@ -11,7 +11,13 @@ import math
 import torch
 from torch import Tensor, nn
 
-from .geometry_conditioning import CameraBatch
+from .geometry_conditioning import (
+    CameraBatch,
+    apply_prope,
+    build_world_to_ray,
+    invert_se3,
+    patch_prope_coefficients,
+)
 
 
 def patch_fundamental_matrices(
@@ -137,7 +143,7 @@ class LRViewFusion(nn.Module):
         allow_self_view_source: bool = True,
     ) -> None:
         super().__init__()
-        if mode not in {'off', 'same_view', 'visual', 'epipolar', 'epipolar_local'}:
+        if mode not in {'off', 'same_view', 'visual', 'epipolar', 'epipolar_local', 'rre_epipolar'}:
             raise ValueError('invalid LR fusion mode')
         dimensions = (feature_dim, hidden_dim, heads, query_chunk_size)
         if any(type(value) is not int or value < 1 for value in dimensions):
@@ -150,6 +156,13 @@ class LRViewFusion(nn.Module):
             raise ValueError('epipolar_band must be finite and positive')
         if type(allow_self_view_source) is not bool:
             raise ValueError('allow_self_view_source must be boolean')
+        if mode == 'rre_epipolar':
+            if heads != 1:
+                raise ValueError('rre_epipolar requires one attention head')
+            if hidden_dim % 8:
+                raise ValueError('rre_epipolar head dimension must be divisible by 8')
+            if allow_self_view_source:
+                raise ValueError('rre_epipolar forbids self-view sources')
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         self.heads = heads
@@ -196,6 +209,8 @@ class LRViewFusion(nn.Module):
             if allow_self_view_source is None
             else allow_self_view_source
         )
+        if self.mode == 'rre_epipolar' and allow_self:
+            raise ValueError('rre_epipolar cannot enable self-view sources')
         if self.mode == 'off':
             return features
         if camera is not None:
@@ -206,8 +221,8 @@ class LRViewFusion(nn.Module):
                 return features
         if views == 1:
             return features
-        if self.mode == 'epipolar' and camera is None:
-            raise ValueError('epipolar fusion requires cameras')
+        if self.mode in {'epipolar', 'epipolar_local', 'rre_epipolar'} and camera is None:
+            raise ValueError('camera-aware fusion requires cameras')
         if camera is not None and (camera.K.device != features.device or camera.T_world_from_camera.device != features.device):
             raise ValueError('camera and LR features must share a device')
 
@@ -219,6 +234,26 @@ class LRViewFusion(nn.Module):
         q, k, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         with torch.autocast(device_type=features.device.type, enabled=False):
             q, k, value = q.float(), k.float(), value.float()
+            rre_matrices = None
+            coeff_x = coeff_y = None
+            if self.mode == 'rre_epipolar':
+                context = build_world_to_ray(camera, patch_grid)
+                rre_matrices = context.world_to_ray.to(device=features.device, dtype=q.dtype)
+                inverse = invert_se3(rre_matrices)
+                coeff_x, coeff_y = patch_prope_coefficients(
+                    patch_grid,
+                    views,
+                    head_dim // 4,
+                    device=features.device,
+                    dtype=q.dtype,
+                )
+                q = apply_prope(
+                    q, rre_matrices.transpose(-1, -2), coeff_x, coeff_y
+                )
+                k = apply_prope(k, inverse, coeff_x, coeff_y)
+                value = apply_prope(value, inverse, coeff_x, coeff_y)
+                pairing_q = q.detach()
+                pairing_k = k.detach()
             # A fixed null key has logit zero and contributes no evidence.
             null = k.new_zeros((b, self.heads, 1, head_dim))
             k = torch.cat((k, null), dim=2)
@@ -236,12 +271,13 @@ class LRViewFusion(nn.Module):
                 aux_source_ratio = source_mask[:, 1:].float().mean()
             pixels = _patch_centers(features.device, patch_grid)
             matrices, valid = (None, None)
-            if self.mode in {'epipolar', 'epipolar_local'}:
+            if self.mode in {'epipolar', 'epipolar_local', 'rre_epipolar'}:
                 matrices, valid = patch_fundamental_matrices(camera, patch_grid)
             key_allowed = None
             if source_mask is not None:
                 key_allowed = source_mask.repeat_interleave(patches, dim=1)
             chunks = []
+            pairing_allowed = []
             for start in range(0, tokens, self.query_chunk_size):
                 stop = min(tokens, start + self.query_chunk_size)
                 query_views = view_ids[start:stop]
@@ -262,7 +298,7 @@ class LRViewFusion(nn.Module):
                         band=self.epipolar_band,
                     )
                     logits[..., :tokens] = logits[..., :tokens] + bias.reshape(b, stop - start, tokens)[:, None]
-                    if self.mode == 'epipolar_local':
+                    if self.mode in {'epipolar_local', 'rre_epipolar'}:
                         # Keep a null candidate and fall back to global keys for
                         # degenerate camera pairs; otherwise restrict each query
                         # to a finite epipolar band in source patch coordinates.
@@ -297,8 +333,19 @@ class LRViewFusion(nn.Module):
                     retained_key_ratio = retained_key_ratio + allowed_keys.float().mean() * (b * (stop - start))
                     attention_count += b * self.heads * (stop - start)
                     key_count += b * (stop - start)
+                    if self.mode == 'rre_epipolar':
+                        pairing_allowed.append(allowed_keys.detach())
                 chunks.append(weights @ value)
-            fused = torch.cat(chunks, dim=2).transpose(1, 2).reshape(b, views, patches, self.hidden_dim)
+            attended = torch.cat(chunks, dim=2)
+            if rre_matrices is not None:
+                attended = apply_prope(
+                    attended,
+                    rre_matrices,
+                    coeff_x,
+                    coeff_y,
+                    inverse_rope=True,
+                )
+            fused = attended.transpose(1, 2).reshape(b, views, patches, self.hidden_dim)
             if record:
                 self.last_diagnostics = {
                     'fusion': {
@@ -310,5 +357,11 @@ class LRViewFusion(nn.Module):
                         'active_auxiliary_source_ratio': aux_source_ratio.detach(),
                     }
                 }
+                if self.mode == 'rre_epipolar':
+                    self.last_diagnostics['pairing'] = {
+                        'query': pairing_q,
+                        'key': pairing_k,
+                        'allowed': torch.cat(pairing_allowed, dim=1),
+                    }
         residual = self.output(fused.to(self.output.weight.dtype)).to(features.dtype)
         return features + residual
