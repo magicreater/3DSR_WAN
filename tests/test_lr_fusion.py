@@ -260,6 +260,21 @@ class FusionTests(unittest.TestCase):
         actual = model(self.x, changed_camera, (2, 3))
         self.assertFalse(torch.allclose(expected, actual, atol=1e-7, rtol=1e-7))
 
+    def test_rre_epipolar_accepts_only_the_ucm_pinhole_limit(self):
+        model = active_rre()
+        pinhole = model(self.x, self.cam, (2, 3))
+        zero_ucm = replace(
+            self.cam,
+            camera_model='ucm',
+            xi=torch.zeros(self.cam.K.shape[:2]),
+        )
+        self.assertTrue(torch.allclose(
+            pinhole, model(self.x, zero_ucm, (2, 3)), atol=1e-6, rtol=1e-6
+        ))
+        distorted_ucm = replace(zero_ucm, xi=torch.full(self.cam.K.shape[:2], .2))
+        with self.assertRaisesRegex(ValueError, 'nonzero UCM'):
+            model(self.x, distorted_ucm, (2, 3))
+
     def test_rre_epipolar_is_jointly_view_permutation_equivariant(self):
         model = active_rre(chunk=5)
         expected = model(self.x, self.cam, (2, 3))

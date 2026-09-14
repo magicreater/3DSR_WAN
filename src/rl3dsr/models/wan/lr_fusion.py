@@ -217,6 +217,14 @@ class LRViewFusion(nn.Module):
             camera.validate(batch=b)
             if camera.K.shape[1] != views:
                 raise ValueError('camera views must match LR views')
+            if (
+                self.mode == 'rre_epipolar'
+                and camera.camera_model == 'ucm'
+                and bool((camera.xi != 0).any())
+            ):
+                raise ValueError(
+                    'rre_epipolar does not support nonzero UCM distortion in its pinhole epipolar band'
+                )
             if camera.sequence_kind == 'temporal':
                 return features
         if views == 1:
