@@ -101,6 +101,28 @@ def test_pair_coverage_fails_closed_for_any_valid_view_pair():
         )
 
 
+def test_unusable_query_rows_cannot_form_pairs_and_remain_in_coverage_denominator():
+    features = torch.tensor([[[[1., 0.], [0., 1.], [-1., 0.]],
+                              [[1., 0.], [0., 1.], [-1., 0.]]]])
+    allowed = torch.zeros(1, 6, 6, dtype=torch.bool)
+    for patch in range(3):
+        allowed[0, patch, 3 + patch] = True
+        allowed[0, 3 + patch, patch] = True
+    usable = torch.ones(1, 6, 2, dtype=torch.bool)
+    usable[0, 1, 1] = False
+
+    pairs = mutual_epipolar_patch_pairs(
+        features, allowed, usable, minimum_coverage=0.5
+    )
+    forward = next(
+        row for row in pairs
+        if row["target_view"] == 0 and row["source_view"] == 1
+    )
+    assert forward["coverage"] == pytest.approx(2 / 3)
+    assert torch.equal(forward["target_patches"], torch.tensor([0, 2]))
+    assert torch.equal(forward["source_patches"], torch.tensor([0, 2]))
+
+
 def _manual_pairing_state(correct_positive: bool):
     q = torch.tensor([[[[1., 0.], [0., 1.], [0., 0.], [0., 0.]]]], requires_grad=True)
     if correct_positive:
@@ -209,6 +231,55 @@ def test_prepare_multiview_pairing_is_opt_in_and_keeps_default_return_type():
     assert state["pairs"]
 
 
+def test_flow_target_dropout_does_not_change_pairing_matches_or_qk_state():
+    class Conditioner(torch.nn.Module):
+        def multiview_features(self, lr, **_kwargs):
+            values = lr[:, 0, :, 0, 0]
+            return values[:, :, None, None].expand(-1, -1, 6, 12).reshape(1, 18, 12)
+
+    torch.manual_seed(13)
+    module = Stage3Conditioning(
+        Conditioner(),
+        fusion=LRViewFusion(12, 8, 1, mode="rre_epipolar", allow_self_view_source=False),
+    )
+    correct = camera()
+    wrong = replace(
+        correct,
+        K=correct.K[:, torch.tensor([0, 2, 1])],
+        T_world_from_camera=correct.T_world_from_camera[:, torch.tensor([0, 2, 1])],
+    )
+    original = torch.ones(1, 3, 3, 8, 8)
+    original[:, 0, 1] = 2
+    original[:, 0, 2] = 3
+    dropped = original.clone()
+    dropped[:, :, 0] = 0
+
+    original_prepared, original_state = module.prepare_multiview(
+        original, correct, (3, 4, 6), (24, 32), pairing_camera=wrong
+    )
+    dropped_prepared, dropped_state = module.prepare_multiview(
+        dropped,
+        correct,
+        (3, 4, 6),
+        (24, 32),
+        pairing_camera=wrong,
+        pairing_lr=original,
+    )
+
+    assert not torch.equal(original_prepared, dropped_prepared)
+    for key in ("query", "key", "wrong_key"):
+        assert torch.equal(original_state[key], dropped_state[key])
+    assert [
+        (row["batch_index"], row["target_view"], row["source_view"],
+         row["target_patches"].tolist(), row["source_patches"].tolist())
+        for row in original_state["pairs"]
+    ] == [
+        (row["batch_index"], row["target_view"], row["source_view"],
+         row["target_patches"].tolist(), row["source_patches"].tolist())
+        for row in dropped_state["pairs"]
+    ]
+
+
 def test_calibration_is_deterministic_and_clips_without_parameter_mutation(runner):
     parameter = torch.nn.Parameter(torch.tensor(1.0))
 
@@ -231,6 +302,9 @@ def test_calibration_is_deterministic_and_clips_without_parameter_mutation(runne
     assert first == second
     assert first["raw_weight"] == pytest.approx(0.125)
     assert first["weight"] == pytest.approx(0.125)
+    assert first["gradient_reduction"] == "mean_gradient_over_8_batches_then_global_l2"
+    assert first["flow_gradient_norm"] == pytest.approx(4.5)
+    assert first["pairing_gradient_norm"] == pytest.approx(9.0)
     assert [row["seed"] for row in first["batches"]] == list(range(6000, 6008))
     assert parameter.item() == 1.0 and parameter.grad is None
 
@@ -248,6 +322,26 @@ def test_calibration_is_deterministic_and_clips_without_parameter_mutation(runne
     )
     assert maximum["weight"] == 10.0
     assert minimum["weight"] == 0.01
+
+
+def test_calibration_norms_the_reduced_gradient_vector_not_mean_batch_norms(runner):
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    with pytest.raises(ValueError, match="pairing gradient"):
+        runner.calibrate_pairing_weight(
+            lambda index: {
+                "flow_loss": parameter,
+                "pairing_loss": parameter * (1 if index < 4 else -1),
+                "metadata": {
+                    "seed": index,
+                    "coverage_min": 1.0,
+                    "batch_sha256": str(index),
+                },
+            },
+            [parameter],
+            batch_count=8,
+            target_gradient_ratio=0.25,
+            weight_clip=(0.01, 10.0),
+        )
 
 
 def test_resume_preserves_pairing_weight_and_rng_while_init_recalibrates(runner):
@@ -279,6 +373,44 @@ def test_resume_preserves_pairing_weight_and_rng_while_init_recalibrates(runner)
     )
     assert state["pairing_weight"] == 0.4
     assert torch.equal(state["pairing_generator_state"], pairing.get_state())
+
+
+def test_a5_resume_validates_protocol_weight_and_preflight_hash(runner, tmp_path):
+    config = a5_config()
+    artifact = tmp_path / "pairing_preflight.json"
+    artifact.write_text(runner.json.dumps({
+        "protocol": config.pairing_protocol,
+        "calibration": {"weight": 0.4},
+    }))
+    manifest = {"pairing": {
+        "enabled": True,
+        "weight": 0.4,
+        "protocol": config.pairing_protocol,
+        "preflight": str(artifact),
+        "preflight_sha256": runner._sha256(artifact),
+    }}
+    checkpoint = {"training_state": {"pairing_weight": 0.4}}
+    assert runner.validate_pairing_resume(manifest, checkpoint, config) == 0.4
+
+    artifact.write_text("{}")
+    with pytest.raises(ValueError, match="hash"):
+        runner.validate_pairing_resume(manifest, checkpoint, config)
+    artifact.unlink()
+    with pytest.raises(ValueError, match="missing"):
+        runner.validate_pairing_resume(manifest, checkpoint, config)
+
+    artifact.write_text(runner.json.dumps({
+        "protocol": config.pairing_protocol,
+        "calibration": {"weight": 0.4},
+    }))
+    manifest["pairing"]["preflight_sha256"] = runner._sha256(artifact)
+    manifest["pairing"]["protocol"] = {**config.pairing_protocol, "temperature": 0.08}
+    with pytest.raises(ValueError, match="protocol"):
+        runner.validate_pairing_resume(manifest, checkpoint, config)
+    manifest["pairing"]["protocol"] = config.pairing_protocol
+    manifest["pairing"]["weight"] = 11.0
+    with pytest.raises(ValueError, match="weight"):
+        runner.validate_pairing_resume(manifest, checkpoint, config)
 
 
 def test_pairing_preflight_is_immutable_and_manifest_binds_its_hash(runner, tmp_path):
@@ -322,9 +454,14 @@ def test_a5_preflight_uses_eight_private_seeds_without_mutating_parameters(
             super().__init__()
             self.fusion = Fusion()
             self.register_buffer("running_probe", torch.tensor(0.0))
+            self.cache = {"token": torch.tensor(3.0)}
+            self.last_diagnostics = {"before": torch.tensor(4.0)}
 
         def prepare_multiview(self, lr, camera, latent_shape, size, **kwargs):
             self.running_probe.add_(1)
+            self.cache = {"token": torch.tensor(30.0)}
+            self.last_diagnostics = {"after": torch.tensor(40.0)}
+            self.training = False
             torch.rand(())
             runner.random.random()
             runner.np.random.rand()
@@ -346,12 +483,30 @@ def test_a5_preflight_uses_eight_private_seeds_without_mutating_parameters(
             }
 
         def predict(self, _dit, noisy, *_args, **_kwargs):
+            _dit.running_probe.add_(1)
+            _dit.last_diagnostics = {"after": torch.tensor(80.0)}
+            _dit.last_injection_stats = {"after": torch.tensor(90.0)}
+            _dit.training = False
             return noisy * 0 + self.fusion.weight
 
-    class VAE:
-        @staticmethod
-        def encode_multiview(hr):
+    class VAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("running_probe", torch.tensor(5.0))
+            self.cache = {"token": torch.tensor(6.0)}
+
+        def encode_multiview(self, hr):
+            self.running_probe.add_(1)
+            self.cache = {"token": torch.tensor(60.0)}
+            self.training = False
             return hr
+
+    class DIT(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("running_probe", torch.tensor(7.0))
+            self.last_diagnostics = {"before": torch.tensor(8.0)}
+            self.last_injection_stats = {"before": torch.tensor(9.0)}
 
     transform = torch.eye(4).repeat(1, 3, 1, 1)
     transform[0, :, 0, 3] = torch.arange(3)
@@ -362,10 +517,17 @@ def test_a5_preflight_uses_eight_private_seeds_without_mutating_parameters(
         lambda _root, _scene, _split, _config, generator, _device:
             ([int(torch.randint(0, 1000, (), generator=generator))], hr, hr, cam),
     )
-    runtime = runner.Runtime(Module(), VAE(), object(), torch.device("cpu"))
+    runtime = runner.Runtime(Module(), VAE(), DIT(), torch.device("cpu"))
     args = type("Args", (), {"seed": 42, "dataset_root": tmp_path})()
     before = parameter.detach().clone()
     buffer_before = runtime.module.running_probe.detach().clone()
+    module_cache_before = runtime.module.cache["token"].clone()
+    module_diagnostics_before = runtime.module.last_diagnostics["before"].clone()
+    vae_buffer_before = runtime.vae.running_probe.clone()
+    vae_cache_before = runtime.vae.cache["token"].clone()
+    dit_buffer_before = runtime.dit.running_probe.clone()
+    dit_diagnostics_before = runtime.dit.last_diagnostics["before"].clone()
+    dit_injection_before = runtime.dit.last_injection_stats["before"].clone()
     python_rng_before = runner.random.getstate()
     numpy_rng_before = runner.np.random.get_state()
     torch_rng_before = torch.get_rng_state()
@@ -380,6 +542,16 @@ def test_a5_preflight_uses_eight_private_seeds_without_mutating_parameters(
     assert torch.equal(parameter, before)
     assert parameter.grad is None
     assert torch.equal(runtime.module.running_probe, buffer_before)
+    assert runtime.module.training is True
+    assert torch.equal(runtime.module.cache["token"], module_cache_before)
+    assert torch.equal(runtime.module.last_diagnostics["before"], module_diagnostics_before)
+    assert runtime.vae.training is True
+    assert torch.equal(runtime.vae.running_probe, vae_buffer_before)
+    assert torch.equal(runtime.vae.cache["token"], vae_cache_before)
+    assert runtime.dit.training is True
+    assert torch.equal(runtime.dit.running_probe, dit_buffer_before)
+    assert torch.equal(runtime.dit.last_diagnostics["before"], dit_diagnostics_before)
+    assert torch.equal(runtime.dit.last_injection_stats["before"], dit_injection_before)
     assert runner.random.getstate() == python_rng_before
     numpy_rng_after = runner.np.random.get_state()
     assert numpy_rng_after[0] == numpy_rng_before[0]
@@ -398,9 +570,9 @@ def test_a5_step_telemetry_keeps_losses_and_fusion_gradients_separate(runner):
         pair_counts=[5, 7],
         coverage_minima=[0.1, 0.2],
         pairing_weight=0.5,
-        flow_gradient_norms=[2.0, 4.0],
-        rank_gradient_norms=[0.2, 0.4],
-        pairing_gradient_norms=[1.0, 3.0],
+        flow_gradient_norm=4.0,
+        rank_gradient_norm=0.4,
+        pairing_gradient_norm=3.0,
         final_fusion_gradient_norm=6.0,
     )
     assert row == {
@@ -411,10 +583,11 @@ def test_a5_step_telemetry_keeps_losses_and_fusion_gradients_separate(runner):
         "pair_count": 12,
         "pairing_coverage_min": 0.1,
         "pairing_weight": 0.5,
-        "flow_fusion_gradient_norm": 3.0,
-        "rank_fusion_gradient_norm": pytest.approx(0.3),
-        "pairing_fusion_gradient_norm": 2.0,
+        "flow_fusion_gradient_norm": 4.0,
+        "rank_fusion_gradient_norm": 0.4,
+        "pairing_fusion_gradient_norm": 3.0,
         "final_fusion_gradient_norm": 6.0,
+        "fusion_gradient_reduction": "sum_of_microbatch_mean_loss_gradients_then_global_l2",
     }
 
 

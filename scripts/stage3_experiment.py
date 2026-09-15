@@ -865,37 +865,105 @@ def _tensor_gradient_norm(gradients) -> float:
     return float(torch.stack(values).sum().sqrt()) if values else 0.0
 
 
+def _accumulate_gradient_vectors(accumulated, gradients):
+    """Componentwise-add detached parameter gradients, preserving unused slots."""
+    if accumulated is None:
+        accumulated = [None] * len(gradients)
+    if len(accumulated) != len(gradients):
+        raise ValueError("gradient accumulator shape mismatch")
+    for index, gradient in enumerate(gradients):
+        if gradient is None:
+            continue
+        value = gradient.detach().float()
+        accumulated[index] = (
+            value.clone() if accumulated[index] is None
+            else accumulated[index] + value
+        )
+    return accumulated
+
+
+def _clone_preflight_value(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {key: _clone_preflight_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_preflight_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_preflight_value(item) for item in value)
+    return value
+
+
+def _pairing_preflight_objects(runtime: Runtime) -> list[object]:
+    """Collect conditioning, VAE, and DiT wrappers/modules without broad graph walking."""
+    queue = [runtime.module, runtime.vae, runtime.dit]
+    result = []
+    seen = set()
+    while queue:
+        value = queue.pop(0)
+        if value is None or id(value) in seen:
+            continue
+        seen.add(id(value))
+        result.append(value)
+        child_model = getattr(value, "model", None)
+        if child_model is not None and child_model is not value:
+            queue.append(child_model)
+        if isinstance(value, torch.nn.Module):
+            queue.extend(value.children())
+    return result
+
+
 @contextmanager
-def _preserve_pairing_preflight_state(module: torch.nn.Module):
-    """Restore global RNG, module modes, and mutable buffers after A5 preflight."""
+def _preserve_pairing_preflight_state(objects):
+    """Restore RNG plus mutable conditioning/VAE/DiT state after A5 preflight."""
     python_state = random.getstate()
     numpy_state = np.random.get_state()
     numpy_state = (numpy_state[0], numpy_state[1].copy(), *numpy_state[2:])
     torch_state = torch.get_rng_state()
     cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    modes = [(child, child.training) for child in module.modules()]
-    buffers = {
-        name: value.detach().clone()
-        for name, value in module.named_buffers()
-    }
-    parameter_versions = [(parameter, parameter._version) for parameter in module.parameters()]
+    modules = [value for value in objects if isinstance(value, torch.nn.Module)]
+    modes = [(module, module.training) for module in modules]
+    buffers = [
+        (module, name, value.detach().clone())
+        for module in modules
+        for name, value in module.named_buffers(recurse=False)
+    ]
+    parameter_versions = [
+        (parameter, parameter._version)
+        for module in modules
+        for parameter in module.parameters(recurse=False)
+    ]
+    mutable_attributes = [
+        (value, name, _clone_preflight_value(getattr(value, name)))
+        for value in objects
+        for name in ("cache", "last_diagnostics", "last_injection_stats")
+        if hasattr(value, name)
+    ]
     try:
         yield
         if any(parameter._version != version for parameter, version in parameter_versions):
             raise RuntimeError("A5 preflight mutated a model parameter")
     finally:
-        current_buffers = dict(module.named_buffers())
-        for name, value in buffers.items():
+        restoration_error = None
+        for module, name, value in buffers:
+            current_buffers = dict(module.named_buffers(recurse=False))
             if name not in current_buffers or current_buffers[name].shape != value.shape:
-                raise RuntimeError(f"A5 preflight changed module buffer structure: {name}")
-            current_buffers[name].copy_(value)
-        for child, training in modes:
-            child.training = training
+                restoration_error = RuntimeError(
+                    f"A5 preflight changed module buffer structure: {name}"
+                )
+            else:
+                current_buffers[name].copy_(value)
+        for value, name, state in mutable_attributes:
+            setattr(value, name, _clone_preflight_value(state))
+        for module, training in modes:
+            module.training = training
         random.setstate(python_state)
         np.random.set_state(numpy_state)
         torch.set_rng_state(torch_state)
         if cuda_state is not None:
             torch.cuda.set_rng_state_all(cuda_state)
+        if restoration_error is not None:
+            raise restoration_error
 
 
 def calibrate_pairing_weight(
@@ -909,6 +977,7 @@ def calibrate_pairing_weight(
     """Calibrate one fixed A5 weight from deterministic, side-effect-free losses."""
     parameters = tuple(fusion_parameters)
     rows = []
+    flow_accumulated = pairing_accumulated = None
     for index in range(batch_count):
         batch = batch_factory(index)
         flow_gradients = torch.autograd.grad(
@@ -923,17 +992,40 @@ def calibrate_pairing_weight(
             raise ValueError("A5 preflight main flow gradient is zero or nonfinite")
         if not math.isfinite(pairing_norm) or pairing_norm <= 0:
             raise ValueError("A5 preflight pairing gradient is zero or nonfinite")
+        flow_accumulated = _accumulate_gradient_vectors(
+            flow_accumulated, tuple(
+                None if gradient is None else gradient / batch_count
+                for gradient in flow_gradients
+            )
+        )
+        pairing_accumulated = _accumulate_gradient_vectors(
+            pairing_accumulated, tuple(
+                None if gradient is None else gradient / batch_count
+                for gradient in pairing_gradients
+            )
+        )
         metadata = dict(batch["metadata"])
         rows.append({**metadata, "flow_gradient_norm": flow_norm,
                      "pairing_gradient_norm": pairing_norm})
-    flow_mean = float(np.mean([row["flow_gradient_norm"] for row in rows]))
-    pairing_mean = float(np.mean([row["pairing_gradient_norm"] for row in rows]))
-    raw = float(target_gradient_ratio * flow_mean / pairing_mean)
+    flow_norm = _tensor_gradient_norm(flow_accumulated)
+    pairing_norm = _tensor_gradient_norm(pairing_accumulated)
+    if not math.isfinite(flow_norm) or flow_norm <= 0:
+        raise ValueError("A5 reduced main flow gradient is zero or nonfinite")
+    if not math.isfinite(pairing_norm) or pairing_norm <= 0:
+        raise ValueError("A5 reduced pairing gradient is zero or nonfinite")
+    raw = float(target_gradient_ratio * flow_norm / pairing_norm)
     weight = float(np.clip(raw, weight_clip[0], weight_clip[1]))
     return {
         "batches": rows,
-        "flow_gradient_norm_mean": flow_mean,
-        "pairing_gradient_norm_mean": pairing_mean,
+        "gradient_reduction": "mean_gradient_over_8_batches_then_global_l2",
+        "flow_gradient_norm": flow_norm,
+        "pairing_gradient_norm": pairing_norm,
+        "flow_batch_gradient_norm_mean": float(np.mean([
+            row["flow_gradient_norm"] for row in rows
+        ])),
+        "pairing_batch_gradient_norm_mean": float(np.mean([
+            row["pairing_gradient_norm"] for row in rows
+        ])),
         "raw_weight": raw,
         "weight": weight,
     }
@@ -957,6 +1049,44 @@ def resolve_pairing_weight(enabled, initialization_mode, manifest, checkpoint, c
     weight = result.get("weight")
     if not isinstance(weight, (int, float)) or not math.isfinite(weight):
         raise ValueError("A5 calibration returned an invalid weight")
+    return float(weight)
+
+
+def validate_pairing_resume(manifest: dict, checkpoint: dict, config: Stage3Config) -> float:
+    """Validate immutable A5 protocol/calibration provenance before state restore."""
+    section = manifest.get("pairing")
+    if not isinstance(section, dict) or section.get("enabled") is not True:
+        raise ValueError("A5 resume pairing manifest is missing or disabled")
+    if section.get("protocol") != config.pairing_protocol:
+        raise ValueError("A5 resume pairing protocol mismatch")
+    weight = section.get("weight")
+    if (
+        isinstance(weight, bool)
+        or not isinstance(weight, (int, float))
+        or not math.isfinite(weight)
+        or not config.pairing_weight_min <= weight <= config.pairing_weight_max
+    ):
+        raise ValueError("A5 resume pairing weight is invalid")
+    path_value = section.get("preflight")
+    path = Path(path_value) if isinstance(path_value, str) else None
+    if path is None or not path.is_file():
+        raise ValueError("A5 resume pairing preflight artifact is missing")
+    if section.get("preflight_sha256") != _sha256(path):
+        raise ValueError("A5 resume pairing preflight hash mismatch")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("A5 resume pairing preflight artifact is invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("A5 resume pairing preflight artifact is invalid")
+    if payload.get("protocol") != config.pairing_protocol:
+        raise ValueError("A5 resume preflight protocol mismatch")
+    calibration = payload.get("calibration")
+    if not isinstance(calibration, dict) or calibration.get("weight") != weight:
+        raise ValueError("A5 resume preflight weight mismatch")
+    state_weight = ((checkpoint.get("training_state") or {}).get("pairing_weight"))
+    if state_weight != weight:
+        raise ValueError("A5 resume checkpoint pairing weight mismatch")
     return float(weight)
 
 
@@ -991,6 +1121,7 @@ def _calibrate_a5_pairing(runtime: Runtime, args, config: Stage3Config) -> dict:
         indices, hr, lr, camera = _load_group(
             args.dataset_root, scene, "train", config, view_generator, runtime.device
         )
+        pairing_lr = lr
         dropped = (
             config.target_lr_dropout > 0
             and float(torch.rand((), generator=dropout_generator)) < config.target_lr_dropout
@@ -1008,6 +1139,7 @@ def _calibrate_a5_pairing(runtime: Runtime, args, config: Stage3Config) -> dict:
             (config.image_size, config.image_size),
             pairing_camera=wrong_camera,
             pairing_minimum_coverage=config.pairing_minimum_coverage,
+            pairing_lr=pairing_lr if dropped else None,
         )
         sigma = torch.rand(1, generator=sigma_generator).to(runtime.device)
         noise = torch.randn(
@@ -1045,7 +1177,7 @@ def _calibrate_a5_pairing(runtime: Runtime, args, config: Stage3Config) -> dict:
             "wrong_camera_sha256": _camera_digest(wrong_camera),
         }
         digest = hashlib.sha256(_json_sha256(metadata).encode("ascii"))
-        for tensor in (hr, lr, clean, noise):
+        for tensor in (hr, pairing_lr, lr, clean, noise):
             value = tensor.detach().cpu().contiguous()
             digest.update(str(value.dtype).encode("ascii"))
             digest.update(str(tuple(value.shape)).encode("ascii"))
@@ -1053,7 +1185,7 @@ def _calibrate_a5_pairing(runtime: Runtime, args, config: Stage3Config) -> dict:
         metadata["batch_sha256"] = digest.hexdigest()
         return {"flow_loss": flow_loss, "pairing_loss": pairing_loss, "metadata": metadata}
 
-    with _preserve_pairing_preflight_state(runtime.module):
+    with _preserve_pairing_preflight_state(_pairing_preflight_objects(runtime)):
         calibration = calibrate_pairing_weight(
             batch_factory,
             fusion_parameters,
@@ -1072,9 +1204,9 @@ def a5_step_telemetry(
     pair_counts,
     coverage_minima,
     pairing_weight,
-    flow_gradient_norms,
-    rank_gradient_norms,
-    pairing_gradient_norms,
+    flow_gradient_norm,
+    rank_gradient_norm,
+    pairing_gradient_norm,
     final_fusion_gradient_norm,
 ) -> dict:
     """Return explicit, non-aggregated A5 loss and fusion-gradient telemetry."""
@@ -1088,10 +1220,13 @@ def a5_step_telemetry(
         "pair_count": int(sum(pair_counts)),
         "pairing_coverage_min": float(min(coverage_minima)),
         "pairing_weight": float(pairing_weight),
-        "flow_fusion_gradient_norm": average(flow_gradient_norms),
-        "rank_fusion_gradient_norm": average(rank_gradient_norms),
-        "pairing_fusion_gradient_norm": average(pairing_gradient_norms),
+        "flow_fusion_gradient_norm": float(flow_gradient_norm),
+        "rank_fusion_gradient_norm": float(rank_gradient_norm),
+        "pairing_fusion_gradient_norm": float(pairing_gradient_norm),
         "final_fusion_gradient_norm": float(final_fusion_gradient_norm),
+        "fusion_gradient_reduction": (
+            "sum_of_microbatch_mean_loss_gradients_then_global_l2"
+        ),
     }
 
 
@@ -1270,6 +1405,8 @@ def _train(args, config: Stage3Config) -> None:
         manifest_config.setdefault("pairing_weight_max", 10.0)
         if manifest_config != expected_config or manifest.get("provenance", {}).get("training_seed") != args.seed:
             raise ValueError("resume manifest does not match config and training seed")
+        if config.pairing_supervision:
+            validate_pairing_resume(manifest, resume_payload, config)
         start_step = resume_step + 1
         if start_step > config.steps:
             raise ValueError("resume checkpoint already reached configured steps")
@@ -1290,6 +1427,13 @@ def _train(args, config: Stage3Config) -> None:
     runtime.vae.model.model.eval().requires_grad_(False)
     torch.cuda.reset_peak_memory_stats(runtime.device)
     trainable = [parameter for parameter in runtime.module.parameters() if parameter.requires_grad]
+    fusion_parameters = (
+        tuple(runtime.module.fusion.parameters()) if config.pairing_supervision else ()
+    )
+    trainable_positions = {id(parameter): index for index, parameter in enumerate(trainable)}
+    fusion_trainable_indices = tuple(
+        trainable_positions[id(parameter)] for parameter in fusion_parameters
+    )
     optimizer = torch.optim.AdamW(
         trainable, lr=config.learning_rate, weight_decay=config.weight_decay
     )
@@ -1366,12 +1510,10 @@ def _train(args, config: Stage3Config) -> None:
         step_started = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         losses, scenes, view_groups, sigmas, target_lr_dropped = [], [], [], [], []
-        correct_flow_losses, wrong_flow_losses = [], []
+        main_flow_losses, correct_flow_losses, wrong_flow_losses = [], [], []
         rank_losses, rank_active_fractions, rank_gradient_norms = [], [], []
         pairing_losses, pair_counts, pairing_coverage_minima = [], [], []
-        flow_fusion_gradient_norms, rank_fusion_gradient_norms = [], []
-        pairing_fusion_gradient_norms = []
-        fusion_parameters = tuple(runtime.module.fusion.parameters()) if config.pairing_supervision else ()
+        flow_fusion_gradients = rank_fusion_gradients = pairing_fusion_gradients = None
         for micro in range(config.gradient_accumulation):
             scene = config.train_scenes[
                 ((step - 1) * config.gradient_accumulation + micro) % len(config.train_scenes)
@@ -1379,6 +1521,7 @@ def _train(args, config: Stage3Config) -> None:
             indices, hr, lr, camera = _load_group(
                 args.dataset_root, scene, "train", config, view_generator, runtime.device
             )
+            pairing_lr = lr
             dropped = (
                 config.target_lr_dropout > 0
                 and float(torch.rand((), generator=dropout_generator)) < config.target_lr_dropout
@@ -1397,6 +1540,7 @@ def _train(args, config: Stage3Config) -> None:
                 **({
                     "pairing_camera": wrong_camera,
                     "pairing_minimum_coverage": config.pairing_minimum_coverage,
+                    "pairing_lr": pairing_lr if dropped else None,
                 } if config.pairing_supervision else {}),
             )
             if config.pairing_supervision:
@@ -1456,29 +1600,28 @@ def _train(args, config: Stage3Config) -> None:
                 rank_losses.append(float(rank.mean().detach()))
                 rank_active_fractions.append(float((rank.detach() > 0).float().mean()))
                 rank_gradient_norms.append(_tensor_gradient_norm(rank_gradients))
+                micro_rank_fusion_gradients = tuple(
+                    rank_gradients[index] for index in fusion_trainable_indices
+                )
                 flow_term = e_correct.mean()
             else:
                 flow_term = flow_matching_loss(prediction, target)
                 rank_term = prediction.new_zeros(())
                 loss = flow_term
+                micro_rank_fusion_gradients = ()
+            main_flow_losses.append(float(flow_term.detach()))
             if config.pairing_supervision:
                 assert pairing_state is not None
                 pairing_term = pairing_info_nce_loss(
                     pairing_state, temperature=config.pairing_temperature
                 )
-                flow_gradients = torch.autograd.grad(
+                micro_flow_gradients = torch.autograd.grad(
                     flow_term / config.gradient_accumulation,
                     fusion_parameters,
                     retain_graph=True,
                     allow_unused=True,
                 )
-                rank_fusion_gradients = torch.autograd.grad(
-                    rank_term / config.gradient_accumulation,
-                    fusion_parameters,
-                    retain_graph=True,
-                    allow_unused=True,
-                ) if rank_term.requires_grad else ()
-                pairing_gradients = torch.autograd.grad(
+                micro_pairing_gradients = torch.autograd.grad(
                     pairing_term / config.gradient_accumulation,
                     fusion_parameters,
                     retain_graph=True,
@@ -1492,9 +1635,15 @@ def _train(args, config: Stage3Config) -> None:
                 pairing_coverage_minima.append(min(
                     float(row["coverage"]) for row in pairing_state["pairs"]
                 ))
-                flow_fusion_gradient_norms.append(_tensor_gradient_norm(flow_gradients))
-                rank_fusion_gradient_norms.append(_tensor_gradient_norm(rank_fusion_gradients))
-                pairing_fusion_gradient_norms.append(_tensor_gradient_norm(pairing_gradients))
+                flow_fusion_gradients = _accumulate_gradient_vectors(
+                    flow_fusion_gradients, micro_flow_gradients
+                )
+                rank_fusion_gradients = _accumulate_gradient_vectors(
+                    rank_fusion_gradients, micro_rank_fusion_gradients
+                )
+                pairing_fusion_gradients = _accumulate_gradient_vectors(
+                    pairing_fusion_gradients, micro_pairing_gradients
+                )
             (loss / config.gradient_accumulation).backward()
             losses.append(float(loss.detach()))
             scenes.append(scene)
@@ -1538,18 +1687,15 @@ def _train(args, config: Stage3Config) -> None:
             })
         if config.pairing_supervision:
             row.update(a5_step_telemetry(
-                flow_losses=correct_flow_losses if correct_flow_losses else [
-                    losses[index] - pairing_weight * pairing_losses[index]
-                    for index in range(len(pairing_losses))
-                ],
+                flow_losses=main_flow_losses,
                 rank_losses=rank_losses,
                 pairing_losses=pairing_losses,
                 pair_counts=pair_counts,
                 coverage_minima=pairing_coverage_minima,
                 pairing_weight=pairing_weight,
-                flow_gradient_norms=flow_fusion_gradient_norms,
-                rank_gradient_norms=rank_fusion_gradient_norms,
-                pairing_gradient_norms=pairing_fusion_gradient_norms,
+                flow_gradient_norm=_tensor_gradient_norm(flow_fusion_gradients),
+                rank_gradient_norm=_tensor_gradient_norm(rank_fusion_gradients or ()),
+                pairing_gradient_norm=_tensor_gradient_norm(pairing_fusion_gradients),
                 final_fusion_gradient_norm=fusion_gradient_norm,
             ))
         rows.append(row)

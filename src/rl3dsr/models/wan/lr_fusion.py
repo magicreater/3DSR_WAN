@@ -154,7 +154,11 @@ def mutual_epipolar_patch_pairs(
                 if source == target or not bool(usable[batch, target_slice, source].any()):
                     continue
                 source_slice = slice(source * patches, (source + 1) * patches)
-                candidate_mask = allowed[batch, target_slice, source_slice]
+                pair_usable = usable[batch, target_slice, source]
+                candidate_mask = (
+                    allowed[batch, target_slice, source_slice]
+                    & pair_usable[:, None]
+                )
                 similarity = discovery[batch, target] @ discovery[batch, source].transpose(0, 1)
                 masked = similarity.masked_fill(~candidate_mask, -torch.inf)
                 target_has_candidate = candidate_mask.any(dim=1)

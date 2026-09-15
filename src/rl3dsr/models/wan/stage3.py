@@ -26,13 +26,16 @@ class Stage3Conditioning(nn.Module):
                           latent_shape: tuple[int, int, int],
                           conditioning_size: tuple[int, int], *, source_mask=None,
                           allow_self_view_source=None, pairing_camera=None,
-                          pairing_minimum_coverage=0.05) -> Tensor | tuple[Tensor, dict]:
+                          pairing_minimum_coverage=0.05,
+                          pairing_lr: Tensor | None = None) -> Tensor | tuple[Tensor, dict]:
         """Encode independent LR views and fuse once, returning [B,V*P,D].
 
         Retain this tensor for the full inference trajectory. During training
         prepare again after each parameter update; never cache a learned graph.
         Supplying ``pairing_camera`` opts into a differentiable A5 Q/K state
-        and returns ``(features, pairing_state)``.
+        and returns ``(features, pairing_state)``. ``pairing_lr`` optionally
+        supplies the original undropped LR solely for that state while ``lr``
+        remains the flow-conditioning input.
         """
         if camera.sequence_kind != "multiview":
             raise ValueError("Stage 3 preparation requires multiview; use video_features for temporal input")
@@ -56,9 +59,21 @@ class Stage3Conditioning(nn.Module):
         )
         prepared = fused.reshape_as(features)
         if pairing_camera is None:
+            if pairing_lr is not None:
+                raise ValueError("pairing_lr requires pairing_camera")
             return prepared
+        pairing_shaped = shaped
+        if pairing_lr is not None:
+            pairing_features = self.conditioner.multiview_features(
+                pairing_lr,
+                conditioning_size=conditioning_size,
+                latent_shape=latent_shape,
+            )
+            pairing_shaped = pairing_features.reshape(
+                pairing_features.shape[0], views, -1, pairing_features.shape[-1]
+            )
         pairing = self.fusion.build_pairing_state(
-            shaped,
+            pairing_shaped,
             camera,
             pairing_camera,
             (height // 2, width // 2),
