@@ -1,0 +1,89 @@
+# Task 4 report: gated A5 direct pairing supervision
+
+## Inherited-state audit
+
+- Started from commit `3d51bf3` with uncommitted partial Task 4 work in exactly four owned production files plus untracked `tests/test_stage3_pairing.py`.
+- Preserved that work and Tasks 1-3. No server, Stage 3.2, Task 5, GitHub, or experiment state was touched.
+- Read `AGENTS.md`, `docs/PROJECT_SPEC.md`, the full Stage 3.3 plan, and the enriched Task 4 brief before editing. Used CodeGraph to trace Stage 3 config, fusion, conditioning, checkpoint, and training paths.
+- The inherited implementation already contained test-first coverage for A5 activation, mutual-nearest pairing, fail-closed coverage, InfoNCE, detached feature discovery, calibration, persistence, resume state, and telemetry. The first local command used the worktree `.venv` and was blocked during collection because that environment lacks torch. After the controller supplied the established local PyTorch environment, all focused tests ran successfully.
+
+## Completed implementation
+
+- Added explicit `A5` configuration while preserving A4 and A0-A3 inference behavior. The fixed protocol is surfaced in config and manifest: temperature `0.07`, minimum per-pair coverage `0.05`, 8 calibration batches, target gradient ratio `0.25`, and clip `[0.01, 10]`.
+- Added detached cosine mutual-nearest correspondence discovery inside the correct local epipolar band for every valid ordered batch/target/source pair. Any required pair below coverage fails closed.
+- Added an opt-in differentiable A5 pairing state. LR features are detached before Q/K projection, so correspondence discovery and pairing loss cannot reach the frozen LR encoder, while Q/K projection weights receive gradients. Nonzero-distortion UCM inputs are rejected because the candidate band is pinhole-only.
+- Added InfoNCE over correct-camera transformed Q/K positives with wrong-camera transformed/band-admitted hard negatives.
+- Added deterministic eight-batch calibration and immutable preflight artifact/manifest binding. Preflight uses private view, camera-pairing, noise, sigma, and dropout generators; hashes actual HR/LR/latent/noise batch tensors and camera provenance; and restores Python, NumPy, CPU/CUDA torch RNG, module modes, and mutable buffers. It asserts no model parameter mutation and never steps or mutates the optimizer.
+- Added fixed-weight resume semantics and model-only/scratch recalibration. Checkpoints preserve pairing RNG state and calibrated weight while legacy/default-off paths retain zero pairing weight.
+- Added separate JSONL/CSV telemetry for main flow, output rank, unweighted/weighted pairing loss, count/coverage, fixed weight, per-component fusion gradient norms, and final combined fusion gradient norm.
+- Corrected A5-specific configuration diagnostics and documented the opt-in tuple return contract on `prepare_multiview`.
+
+## Verification
+
+- `C:\Users\22973\miniconda3\envs\pytorch\python.exe -m pytest -q tests/test_stage3_pairing.py` -> `12 passed` before the added UCM guard test, then included in broader runs.
+- Focused/adjacent: `tests/test_stage3_pairing.py tests/test_lr_fusion.py tests/test_stage3_conditioning.py tests/test_stage3_protocol.py tests/test_stage3_runner.py` -> `86 passed in 2.97s`.
+- All Stage 3-focused tests plus LR fusion -> `120 passed in 3.18s`.
+- `python -m compileall -q src scripts tests` -> PASS.
+- `git diff --check` -> PASS (only Git's informational LF-to-CRLF warnings).
+- The local all-suite attempt reached 17 tests and then the known Windows MKL abort in `tests/test_colmap_camera.py`; no Python assertion failure was reported. Controller should run the authoritative full suite in the server environment.
+
+## Files
+
+- `src/rl3dsr/models/wan/lr_fusion.py`
+- `src/rl3dsr/models/wan/stage3.py`
+- `src/rl3dsr/validation/stage3_protocol.py`
+- `scripts/stage3_experiment.py`
+- `tests/test_stage3_pairing.py`
+
+## Review fix round 1
+
+Addressed every scoped review finding on top of `179d148`:
+
+- Split A5 flow conditioning from pairing evidence under target LR dropout. Flow fusion receives the dropped LR, while mutual-nearest discovery and differentiable Q/K use the original frozen LR features. Added a test proving matches and Q/K state are identical with and without flow target dropout.
+- Changed calibration from mean-of-per-batch norms to the global L2 norm of the componentwise mean of all eight gradient vectors. Per-batch norms remain diagnostics and the exact reduction is persisted.
+- Changed step telemetry to accumulate the already loss-reduced microbatch gradient vectors componentwise before taking flow/rank/pairing norms. These are now directly comparable with the final combined fusion gradient norm. Rank fusion gradients are sliced from the existing all-trainable rank traversal, eliminating the duplicate rank autograd pass.
+- Intersected correspondence candidates with per-query/source `usable`; unusable target rows cannot match and still remain in the coverage denominator.
+- Added fail-before-restore A5 resume validation for exact protocol equality, clipped finite weight, preflight existence/hash, artifact protocol/weight, and checkpoint weight.
+- Expanded preflight isolation across conditioning, VAE, and DiT wrappers/modules: modes, buffers, projector caches, fusion/bridge/geometry diagnostics, DiT injection diagnostics, Python/NumPy/torch CPU/CUDA RNG, and parameter-version assertions are restored or fail closed.
+
+TDD evidence for this round:
+
+- New focused tests first produced `6 failed, 11 passed`: unusable-row matching, original-LR dropout isolation, vector-reduced calibration, resume validation, cache/diagnostic isolation, and accumulated-gradient telemetry all failed against `179d148`.
+- After the minimal fixes, `tests/test_stage3_pairing.py` -> `17 passed`.
+- Focused/adjacent Task 4 suite -> `90 passed in 2.99s`.
+- All Stage 3-focused tests plus LR fusion -> `124 passed in 3.17s`.
+- `compileall` and `git diff --check` are rerun before the fix commit.
+
+## Review fix round 2
+
+Addressed the remaining resume-integrity and RNG-order findings on top of `fda8c86`:
+
+- `validate_pairing_resume` now accepts only the corrected immutable preflight schema. It verifies the exact vector-reduction declaration, exactly eight deterministic seed records, complete batch/per-pair records, positive finite reduced and per-batch norms, per-pair coverage and aggregate consistency, unique view indices/pair identities, 64-character lowercase SHA256 values, raw gradient-ratio weight, exact clipping, and equality across artifact, manifest, and checkpoint.
+- Truncated legacy mean-of-norms preflight artifacts are explicitly rejected rather than treated as resumable A5 runs.
+- `_seed_all` now executes only after checkpoint, log, manifest, config, and A5 preflight integrity validation succeeds. A failed resume therefore leaves Python, NumPy, torch CPU, and—by the same control-flow boundary—CUDA RNG untouched.
+
+TDD evidence for this round:
+
+- The new resume-schema and RNG tests first produced `9 failed, 1 passed` against `fda8c86`.
+- Corrected pairing tests -> `26 passed`.
+- Focused/adjacent Task 4 suite -> `99 passed in 2.98s`.
+- All Stage 3-focused tests plus LR fusion -> `133 passed in 3.20s`.
+- `compileall` and `git diff --check` passed before commit.
+
+## Review fix round 3
+
+Addressed the checkpoint-wide resume validation and complete coverage-provenance findings on top of `68e3c8c`:
+
+- Added a mutation-free checkpoint payload validator shared by the normal Stage 3 loader and the resume preflight path. Before runtime construction or seeding, resume now validates serialized config, bridge architecture, the exact adapter set, every adapter key/shape, and all finite values.
+- Added full format-v2 training-state prevalidation for step, optimizer/sigma state containers, Python/NumPy/CPU/CUDA RNG records, dropout RNG, pairing RNG, and the A5 fixed weight. The runtime restore path reuses the same validation helper without requiring an A5 weight for rank-only pairing RNG use.
+- Built the validation-only Stage 3 adapter schema directly on the PyTorch `meta` device. This avoids both real parameter allocation and global CPU RNG consumption while inspecting a failed checkpoint.
+- Extended the immutable calibration artifact with `view_count`, `target_patch_count`, and the complete valid directed target/source identity list for each batch. Each coverage record now carries its patch denominator.
+- Resume validation now requires exact batch index, equality between coverage and `pair_count / target_patch_count`, equality between recorded coverage identities and the complete declared valid-pair set, consistent aggregate pair counts, and exact configured view count. Truncated identity or coverage lists, wrong batch indexes, and mismatched counts fail closed.
+
+TDD evidence for this round:
+
+- The first targeted RED run produced `10 failed, 2 passed`, exposing the missing pairing-state denominators/identities and the old preflight schema.
+- New checkpoint-integrity tests cover missing pairing/dropout/CUDA RNG state, legacy training-state format, checkpoint config mismatch, adapter architecture mismatch, nonfinite adapter values, and verify unchanged Python, NumPy, torch CPU, and mocked CUDA RNG on every rejected resume.
+- `tests/test_stage3_pairing.py` -> `38 passed`.
+- All Stage 3-focused tests plus LR fusion, FullRRE, and UCPE camera contracts -> `174 passed in 3.84s`.
+- `python -m compileall -q src scripts tests` and `git diff --check` -> PASS (only informational LF-to-CRLF warnings).

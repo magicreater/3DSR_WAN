@@ -44,7 +44,10 @@ from rl3dsr.models.wan import (
     sample_conditioned_flow,
     save_stage3_checkpoint,
 )
-from rl3dsr.models.wan.stage3 import load_stage3_initialization_checkpoint
+from rl3dsr.models.wan.stage3 import (
+    load_stage3_initialization_checkpoint,
+    validate_stage3_checkpoint_payload,
+)
 from rl3dsr.models.wan.lr_fusion import pairing_info_nce_loss
 from rl3dsr.models.wan.sampling import SigmaCycle
 from rl3dsr.validation.decoded_space import frame_metrics
@@ -1118,12 +1121,15 @@ def validate_pairing_resume(manifest: dict, checkpoint: dict, config: Stage3Conf
 
     batch_keys = {
         "seed", "scene", "view_indices", "sigma", "target_lr_dropped",
+        "view_count", "target_patch_count", "valid_pair_identities",
         "pair_count", "coverage_min", "coverage", "camera_sha256",
         "wrong_camera_sha256", "batch_sha256", "flow_gradient_norm",
         "pairing_gradient_norm",
     }
+    identity_keys = {"batch_index", "target_view", "source_view"}
     coverage_keys = {
         "batch_index", "target_view", "source_view", "coverage", "pair_count",
+        "target_patch_count",
     }
     for index, batch in enumerate(batches):
         if not isinstance(batch, dict) or set(batch) != batch_keys:
@@ -1150,6 +1156,11 @@ def validate_pairing_resume(manifest: dict, checkpoint: dict, config: Stage3Conf
             raise ValueError("A5 resume pairing preflight sigma is invalid")
         if type(batch["target_lr_dropped"]) is not bool:
             raise ValueError("A5 resume pairing preflight dropout flag is invalid")
+        if type(batch["view_count"]) is not int or batch["view_count"] != config.views:
+            raise ValueError("A5 resume pairing preflight view count is invalid")
+        target_patch_count = batch["target_patch_count"]
+        if type(target_patch_count) is not int or target_patch_count < 1:
+            raise ValueError("A5 resume pairing target patch count is invalid")
         if not finite_positive(batch["flow_gradient_norm"]) or not finite_positive(
             batch["pairing_gradient_norm"]
         ):
@@ -1161,6 +1172,26 @@ def validate_pairing_resume(manifest: dict, checkpoint: dict, config: Stage3Conf
         coverage_rows = batch["coverage"]
         if not isinstance(coverage_rows, list) or not coverage_rows:
             raise ValueError("A5 resume pairing coverage records are missing")
+        identities = batch["valid_pair_identities"]
+        if not isinstance(identities, list) or not identities:
+            raise ValueError("A5 resume pairing valid identities are missing")
+        expected_pairs = set()
+        for identity_row in identities:
+            if not isinstance(identity_row, dict) or set(identity_row) != identity_keys:
+                raise ValueError("A5 resume pairing identity schema mismatch")
+            identity = tuple(identity_row[name] for name in (
+                "batch_index", "target_view", "source_view"
+            ))
+            if (
+                any(type(value) is not int for value in identity)
+                or identity[0] != 0
+                or not 0 <= identity[1] < config.views
+                or not 0 <= identity[2] < config.views
+                or identity[1] == identity[2]
+                or identity in expected_pairs
+            ):
+                raise ValueError("A5 resume pairing valid identity is invalid")
+            expected_pairs.add(identity)
         seen_pairs = set()
         for row in coverage_rows:
             if not isinstance(row, dict) or set(row) != coverage_keys:
@@ -1176,17 +1207,28 @@ def validate_pairing_resume(manifest: dict, checkpoint: dict, config: Stage3Conf
             pair_count = row["pair_count"]
             if type(pair_count) is not int or pair_count < 1:
                 raise ValueError("A5 resume pairing pair count is invalid")
-            identity = (row["batch_index"], row["target_view"], row["source_view"])
             if (
-                any(type(value) is not int for value in identity)
-                or identity[0] < 0
-                or not 0 <= identity[1] < config.views
+                type(row["target_patch_count"]) is not int
+                or row["target_patch_count"] != target_patch_count
+            ):
+                raise ValueError("A5 resume pairing target patch count mismatch")
+            if not math.isclose(coverage, pair_count / target_patch_count):
+                raise ValueError("A5 resume pairing coverage and pair count mismatch")
+            identity = (row["batch_index"], row["target_view"], row["source_view"])
+            if any(type(value) is not int for value in identity):
+                raise ValueError("A5 resume pairing coverage identity is invalid")
+            if identity[0] != 0:
+                raise ValueError("A5 resume pairing coverage batch_index is invalid")
+            if (
+                not 0 <= identity[1] < config.views
                 or not 0 <= identity[2] < config.views
                 or identity[1] == identity[2]
                 or identity in seen_pairs
             ):
                 raise ValueError("A5 resume pairing coverage identity is invalid")
             seen_pairs.add(identity)
+        if seen_pairs != expected_pairs:
+            raise ValueError("A5 resume pairing coverage identities are incomplete")
         coverage_minimum = min(row["coverage"] for row in coverage_rows)
         stored_coverage_minimum = batch["coverage_min"]
         if (
@@ -1324,6 +1366,7 @@ def _calibrate_a5_pairing(runtime: Runtime, args, config: Stage3Config) -> dict:
             "source_view": row["source_view"],
             "coverage": row["coverage"],
             "pair_count": int(row["target_patches"].numel()),
+            "target_patch_count": int(state["target_patch_count"]),
         } for row in state["pairs"]]
         coverage = [row["coverage"] for row in coverage_rows]
         metadata = {
@@ -1332,6 +1375,9 @@ def _calibrate_a5_pairing(runtime: Runtime, args, config: Stage3Config) -> dict:
             "view_indices": indices,
             "sigma": float(sigma),
             "target_lr_dropped": bool(dropped),
+            "view_count": int(state["view_count"]),
+            "target_patch_count": int(state["target_patch_count"]),
+            "valid_pair_identities": state["valid_pair_identities"],
             "pair_count": int(sum(row["target_patches"].numel() for row in state["pairs"])),
             "coverage_min": float(min(coverage)),
             "coverage": coverage_rows,
@@ -1438,25 +1484,154 @@ def _validate_runtime_inputs(args, *, checkpoint: Path | None = None) -> None:
         raise ValueError("Stage 3 checkpoint must be an existing file")
 
 
-def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise_generator,
-                            dropout_generator=None, pairing_generator=None):
+def _checkpoint_validation_module(config: Stage3Config) -> Stage3Conditioning:
+    """Build a zero-storage meta schema matching the fixed Stage 3 runtime adapters."""
+    # Construct directly on ``meta``: creating CPU layers first would consume the
+    # global CPU RNG before a malformed resume checkpoint can be rejected.
+    with torch.device("meta"):
+        conditioner = FrozenLQConditioner(
+            torch.nn.Identity(),
+            bridge_blocks=(0, 1, 2, 3),
+            bridge_time_conditioning=True,
+        )
+        geometry = FullRREConditioner(branch_count=30)
+        fusion = None
+        if config.fusion_mode != "off":
+            fusion_mode = config.fusion_mode
+            if fusion_mode == "epipolar" and config.epipolar_attention == "local_band":
+                fusion_mode = "epipolar_local"
+            fusion = LRViewFusion(
+                hidden_dim=config.fusion_dim,
+                heads=config.fusion_heads,
+                mode=fusion_mode,
+                query_chunk_size=config.query_chunk_size,
+                tau=config.epipolar_tau,
+                epipolar_band=config.epipolar_band,
+                allow_self_view_source=config.allow_self_view_source,
+            )
+    return Stage3Conditioning(conditioner, geometry, fusion)
+
+
+def _validate_training_state_payload(
+    state,
+    *,
+    expected_step: int,
+    require_dropout: bool,
+    require_pairing: bool,
+    require_cuda: bool,
+    require_pairing_weight: bool = False,
+    require_version_two: bool = False,
+) -> None:
+    """Validate exact-resume fields without mutating optimizer or any RNG."""
+    if not isinstance(state, dict):
+        raise ValueError("resume checkpoint has no matching training state")
     version = state.get("format_version", 1)
     if type(version) is not int or version not in {1, 2}:
         raise ValueError("unsupported training state format")
+    if require_version_two and version != 2:
+        raise ValueError("resume checkpoint requires training state format v2")
     required = {
         "step", "optimizer", "sigma_cycle", "view_generator_state",
         "noise_generator_state", "python_rng_state", "numpy_rng_state",
         "torch_rng_state",
     }
-    if pairing_generator is not None:
+    if require_pairing:
         required.add("pairing_generator_state")
-    if version >= 2 and dropout_generator is not None:
+    if require_pairing_weight:
+        required.add("pairing_weight")
+    if version >= 2 and require_dropout:
         required.add("dropout_generator_state")
-    if version >= 2 and torch.cuda.is_available():
+    if version >= 2 and require_cuda:
         required.add("cuda_rng_state_all")
     missing = sorted(required - set(state))
     if missing:
         raise ValueError(f"resume checkpoint is missing required RNG/training state: {missing}")
+    if type(state.get("step")) is not int or state["step"] < 0 or state["step"] != expected_step:
+        raise ValueError("resume checkpoint has no matching training state")
+    tensor_fields = ["view_generator_state", "noise_generator_state", "torch_rng_state"]
+    if require_pairing:
+        tensor_fields.append("pairing_generator_state")
+    if version >= 2 and require_dropout:
+        tensor_fields.append("dropout_generator_state")
+    if any(
+        not isinstance(state[name], torch.Tensor)
+        or state[name].dtype != torch.uint8
+        or state[name].ndim != 1
+        or state[name].numel() == 0
+        for name in tensor_fields
+    ):
+        raise ValueError("resume checkpoint contains malformed RNG state")
+    if not isinstance(state["optimizer"], dict) or not isinstance(state["sigma_cycle"], dict):
+        raise ValueError("resume checkpoint contains malformed optimizer or sigma state")
+    numpy_state = state["numpy_rng_state"]
+    if (
+        not isinstance(numpy_state, dict)
+        or set(numpy_state) != {
+            "bit_generator", "state", "position", "has_gauss", "cached_gaussian"
+        }
+        or not isinstance(numpy_state["bit_generator"], str)
+        or not isinstance(numpy_state["state"], list)
+        or not numpy_state["state"]
+        or any(type(value) is not int for value in numpy_state["state"])
+        or type(numpy_state["position"]) is not int
+        or type(numpy_state["has_gauss"]) is not int
+        or isinstance(numpy_state["cached_gaussian"], bool)
+        or not isinstance(numpy_state["cached_gaussian"], (int, float))
+        or not math.isfinite(numpy_state["cached_gaussian"])
+    ):
+        raise ValueError("resume checkpoint contains malformed NumPy RNG state")
+    try:
+        probe = random.Random()
+        probe.setstate(state["python_rng_state"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("resume checkpoint contains malformed Python RNG state") from exc
+    if require_pairing_weight and (
+        isinstance(state["pairing_weight"], bool)
+        or not isinstance(state["pairing_weight"], (int, float))
+        or not math.isfinite(state["pairing_weight"])
+    ):
+        raise ValueError("resume checkpoint contains malformed pairing weight")
+    if require_cuda and version >= 2 and (
+        not isinstance(state["cuda_rng_state_all"], list)
+        or not state["cuda_rng_state_all"]
+        or any(
+            not isinstance(value, torch.Tensor)
+            or value.dtype != torch.uint8
+            or value.ndim != 1
+            or value.numel() == 0
+            for value in state["cuda_rng_state_all"]
+        )
+    ):
+        raise ValueError("resume checkpoint contains malformed CUDA RNG state")
+
+
+def _prevalidate_resume_payload(payload: dict, config: Stage3Config, expected_step: int) -> None:
+    """Reject config/adapter/training-state defects before runtime load or seeding."""
+    module = _checkpoint_validation_module(config)
+    validate_stage3_checkpoint_payload(
+        payload, module, expected_config=config.to_dict()
+    )
+    _validate_training_state_payload(
+        payload.get("training_state"),
+        expected_step=expected_step,
+        require_dropout=True,
+        require_pairing=config.camera_rank_weight > 0 or config.pairing_supervision,
+        require_pairing_weight=config.pairing_supervision,
+        require_cuda=True,
+        require_version_two=True,
+    )
+
+
+def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise_generator,
+                             dropout_generator=None, pairing_generator=None):
+    _validate_training_state_payload(
+        state,
+        expected_step=state.get("step") if isinstance(state, dict) else -1,
+        require_dropout=dropout_generator is not None,
+        require_pairing=pairing_generator is not None,
+        require_cuda=torch.cuda.is_available(),
+    )
+    version = state.get("format_version", 1)
     optimizer.load_state_dict(state["optimizer"])
     sigma_cycle.load_state_dict(state["sigma_cycle"])
     view_generator.set_state(state["view_generator_state"])
@@ -1547,6 +1722,7 @@ def _train(args, config: Stage3Config) -> None:
         if resume_payload.get("format") != "rl3dsr-stage3":
             raise ValueError("resume checkpoint is not Stage 3")
         resume_step = int(resume_payload.get("step", -1))
+        _prevalidate_resume_payload(resume_payload, config, resume_step)
         rows = resume_rows(output / "train_steps.jsonl", resume_step)
         manifest_path = output / "run_manifest.json"
         if not manifest_path.is_file():

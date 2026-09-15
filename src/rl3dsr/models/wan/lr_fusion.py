@@ -333,12 +333,33 @@ class LRViewFusion(nn.Module):
         pairs = mutual_epipolar_patch_pairs(
             features, allowed, usable, minimum_coverage=minimum_coverage
         )
+        valid_pair_identities = [
+            {
+                'batch_index': batch_index,
+                'target_view': target_view,
+                'source_view': source_view,
+            }
+            for batch_index in range(b)
+            for target_view in range(views)
+            for source_view in range(views)
+            if target_view != source_view
+            and bool(
+                usable[
+                    batch_index,
+                    target_view * patches:(target_view + 1) * patches,
+                    source_view,
+                ].any()
+            )
+        ]
         return {
             'query': q,
             'key': k,
             'wrong_key': wrong_k,
             'wrong_allowed': wrong_allowed,
             'patches': patches,
+            'target_patch_count': patches,
+            'view_count': views,
+            'valid_pair_identities': valid_pair_identities,
             'pairs': pairs,
         }
 

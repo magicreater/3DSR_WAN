@@ -133,12 +133,21 @@ def save_stage3_checkpoint(path, module: Stage3Conditioning, *, config: dict, st
         torch.save(payload, stream)
 
 
-def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config: dict | None = None):
-    payload = torch.load(Path(path), map_location="cpu", weights_only=True)
+def validate_stage3_checkpoint_payload(
+    payload: dict,
+    module: Stage3Conditioning,
+    *,
+    expected_config: dict | None = None,
+) -> dict:
+    """Validate a loaded checkpoint without mutating adapter parameters."""
+    if not isinstance(payload, dict):
+        raise ValueError("unsupported Stage 3 checkpoint; initialize old bridges with load_adapter_checkpoint")
     if payload.get("format") != "rl3dsr-stage3" or payload.get("format_version") != 1:
         raise ValueError("unsupported Stage 3 checkpoint; initialize old bridges with load_adapter_checkpoint")
     if expected_config is not None:
-        saved_config = dict(payload.get("config") or {})
+        if not isinstance(payload.get("config"), dict):
+            raise ValueError("Stage 3 checkpoint config mismatch")
+        saved_config = dict(payload["config"])
         expected = json.loads(json.dumps(expected_config))
         # Stage 3.1 adds default-off knobs; old Stage 3 bundles remain valid.
         saved_config.setdefault("target_lr_dropout", 0.0)
@@ -172,17 +181,30 @@ def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config:
     if payload.get("bridge_architecture") != expected_arch:
         raise ValueError("Stage 3 bridge architecture mismatch")
     # Validate all modules before mutating any parameter.
-    states = payload.get("adapters", {})
+    states = payload.get("adapters")
+    if not isinstance(states, dict) or set(states) != set(_states(module)):
+        raise ValueError("Stage 3 checkpoint adapter set mismatch")
     for name, item in _states(module).items():
         saved = states.get(name)
         if (item is None) != (saved is None):
             raise ValueError(f"Stage 3 {name} presence mismatch")
         if item is not None:
+            if not isinstance(saved, dict) or any(
+                not isinstance(value, Tensor) for value in saved.values()
+            ):
+                raise ValueError(f"Stage 3 {name} architecture mismatch")
             current = item.state_dict()
             if current.keys() != saved.keys() or any(current[k].shape != saved[k].shape for k in current):
                 raise ValueError(f"Stage 3 {name} architecture mismatch")
             if any(not torch.isfinite(v).all() for v in saved.values()):
                 raise ValueError(f"Stage 3 {name} contains nonfinite parameters")
+    return payload
+
+
+def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config: dict | None = None):
+    payload = torch.load(Path(path), map_location="cpu", weights_only=True)
+    validate_stage3_checkpoint_payload(payload, module, expected_config=expected_config)
+    states = payload["adapters"]
     for name, item in _states(module).items():
         if item is not None:
             item.load_state_dict(states[name], strict=True)

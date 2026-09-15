@@ -47,21 +47,30 @@ def a5_config(**changes):
 def valid_preflight_payload(config, *, training_seed=42):
     batches = []
     for index in range(8):
+        valid_pair_identities = [
+            {"batch_index": 0, "target_view": target, "source_view": source}
+            for target in range(config.views)
+            for source in range(config.views)
+            if target != source
+        ]
+        coverage = [{
+            **identity,
+            "coverage": 0.25,
+            "pair_count": 1,
+            "target_patch_count": 4,
+        } for identity in valid_pair_identities]
         batches.append({
             "seed": training_seed + 6000 + index,
             "scene": config.train_scenes[index % len(config.train_scenes)],
             "view_indices": list(range(config.views)),
             "sigma": 0.5,
             "target_lr_dropped": False,
-            "pair_count": 1,
+            "view_count": config.views,
+            "target_patch_count": 4,
+            "valid_pair_identities": valid_pair_identities,
+            "pair_count": len(coverage),
             "coverage_min": 0.25,
-            "coverage": [{
-                "batch_index": 0,
-                "target_view": 0,
-                "source_view": 1,
-                "coverage": 0.25,
-                "pair_count": 1,
-            }],
+            "coverage": coverage,
             "camera_sha256": "a" * 64,
             "wrong_camera_sha256": "b" * 64,
             "batch_sha256": f"{index:064x}",
@@ -80,6 +89,60 @@ def valid_preflight_payload(config, *, training_seed=42):
             "raw_weight": 0.5,
             "weight": 0.5,
         },
+    }
+
+
+def valid_resume_payload(runner, config, *, step=1):
+    class Conditioner(torch.nn.Module):
+        bridge_blocks = (0, 1, 2, 3)
+        bridge_time_conditioning = True
+
+        def __init__(self):
+            super().__init__()
+            self.bridge = torch.nn.Linear(2, 2, bias=False)
+
+    module = Stage3Conditioning(
+        Conditioner(),
+        geometry=torch.nn.Linear(2, 2, bias=False),
+        fusion=torch.nn.Linear(2, 2, bias=False),
+    )
+    numpy_state = runner.np.random.get_state()
+    training_state = {
+        "format_version": 2,
+        "step": step,
+        "optimizer": {},
+        "sigma_cycle": {},
+        "view_generator_state": torch.Generator().get_state(),
+        "noise_generator_state": torch.Generator().get_state(),
+        "dropout_generator_state": torch.Generator().get_state(),
+        "pairing_generator_state": torch.Generator().get_state(),
+        "python_rng_state": runner.random.getstate(),
+        "numpy_rng_state": {
+            "bit_generator": numpy_state[0],
+            "state": numpy_state[1].tolist(),
+            "position": numpy_state[2],
+            "has_gauss": numpy_state[3],
+            "cached_gaussian": numpy_state[4],
+        },
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": [torch.Generator().get_state()],
+        "pairing_weight": 0.5,
+    }
+    return module, {
+        "format": "rl3dsr-stage3",
+        "format_version": 1,
+        "step": step,
+        "config": runner.json.loads(runner.json.dumps(config.to_dict())),
+        "bridge_architecture": {
+            "blocks": [0, 1, 2, 3],
+            "time_conditioning": True,
+        },
+        "adapters": {
+            "bridge": module.conditioner.bridge.state_dict(),
+            "geometry": module.geometry.state_dict(),
+            "fusion": module.fusion.state_dict(),
+        },
+        "training_state": training_state,
     }
 
 
@@ -219,6 +282,8 @@ def test_pairing_state_detaches_lr_features_but_keeps_qk_projection_gradients():
     assert float(model.qkv.weight.grad.abs().sum()) > 0
     assert model.output.weight.grad is None
     assert len(state["pairs"]) == 6
+    assert state["target_patch_count"] == 6
+    assert len(state["valid_pair_identities"]) == 6
 
 
 def test_pairing_state_rejects_distorted_ucm_epipolar_geometry():
@@ -462,6 +527,17 @@ def test_a5_resume_validates_protocol_weight_and_preflight_hash(runner, tmp_path
         (lambda payload: payload["calibration"]["batches"][0]["coverage"][0].update({
             "coverage": 0.01
         }), "coverage"),
+        (lambda payload: payload["calibration"]["batches"][0]["coverage"].pop(),
+         "identities"),
+        (lambda payload: payload["calibration"]["batches"][0][
+            "valid_pair_identities"
+        ].pop(), "identities"),
+        (lambda payload: payload["calibration"]["batches"][0]["coverage"][0].update({
+            "batch_index": 1
+        }), "batch_index"),
+        (lambda payload: payload["calibration"]["batches"][0]["coverage"][0].update({
+            "pair_count": 2
+        }), "coverage"),
         (lambda payload: payload["calibration"]["batches"][0].update({
             "batch_sha256": "not-a-hash"
         }), "hash"),
@@ -522,6 +598,89 @@ def test_a5_resume_rejects_truncated_legacy_mean_of_norms_artifact(runner, tmp_p
         )
 
 
+@pytest.mark.parametrize(
+    "defect,match",
+    [
+        ("missing_pairing_generator_state", "pairing_generator_state"),
+        ("missing_dropout_generator_state", "dropout_generator_state"),
+        ("missing_cuda_rng_state", "cuda_rng_state_all"),
+        ("legacy_training_state", "format v2"),
+        ("config_mismatch", "config mismatch"),
+        ("adapter_architecture", "fusion architecture"),
+        ("nonfinite_adapter", "nonfinite"),
+    ],
+)
+def test_failed_resume_checkpoint_prevalidation_preserves_every_rng(
+    runner, tmp_path, monkeypatch, defect, match
+):
+    config = a5_config(steps=2)
+    module, payload = valid_resume_payload(runner, config)
+    if defect == "missing_pairing_generator_state":
+        payload["training_state"].pop("pairing_generator_state")
+    elif defect == "missing_dropout_generator_state":
+        payload["training_state"].pop("dropout_generator_state")
+    elif defect == "missing_cuda_rng_state":
+        payload["training_state"].pop("cuda_rng_state_all")
+    elif defect == "legacy_training_state":
+        payload["training_state"]["format_version"] = 1
+    elif defect == "config_mismatch":
+        payload["config"]["learning_rate"] *= 2
+    elif defect == "adapter_architecture":
+        payload["adapters"]["fusion"].pop("weight")
+    else:
+        payload["adapters"]["fusion"]["weight"][0, 0] = float("nan")
+
+    checkpoint = tmp_path / f"{defect}.pt"
+    runner.torch.save(payload, checkpoint)
+    monkeypatch.setattr(runner, "_checkpoint_validation_module", lambda _config: module)
+    monkeypatch.setattr(runner, "_validate_runtime_inputs", lambda *_args, **_kwargs: None)
+    cuda_state = [torch.arange(16, dtype=torch.uint8)]
+    monkeypatch.setattr(
+        runner.torch.cuda, "get_rng_state_all", lambda: [value.clone() for value in cuda_state]
+    )
+    args = type("Args", (), {
+        "seed": 42,
+        "resume": checkpoint,
+        "init_checkpoint": None,
+        "init_reset_fusion": False,
+        "output_dir": tmp_path / "run",
+    })()
+    python_before = runner.random.getstate()
+    numpy_before = runner.np.random.get_state()
+    torch_before = runner.torch.get_rng_state()
+    cuda_before = runner.torch.cuda.get_rng_state_all()
+
+    with pytest.raises(ValueError, match=match):
+        runner._train(args, config)
+
+    assert runner.random.getstate() == python_before
+    numpy_after = runner.np.random.get_state()
+    assert numpy_after[0] == numpy_before[0]
+    assert runner.np.array_equal(numpy_after[1], numpy_before[1])
+    assert numpy_after[2:] == numpy_before[2:]
+    assert runner.torch.equal(runner.torch.get_rng_state(), torch_before)
+    assert all(
+        runner.torch.equal(after, before)
+        for after, before in zip(runner.torch.cuda.get_rng_state_all(), cuda_before)
+    )
+
+
+def test_resume_schema_factory_is_meta_only_and_preserves_global_rng(runner):
+    python_before = runner.random.getstate()
+    numpy_before = runner.np.random.get_state()
+    torch_before = runner.torch.get_rng_state()
+
+    module = runner._checkpoint_validation_module(a5_config())
+
+    assert all(parameter.is_meta for parameter in module.parameters())
+    assert runner.random.getstate() == python_before
+    numpy_after = runner.np.random.get_state()
+    assert numpy_after[0] == numpy_before[0]
+    assert runner.np.array_equal(numpy_after[1], numpy_before[1])
+    assert numpy_after[2:] == numpy_before[2:]
+    assert runner.torch.equal(runner.torch.get_rng_state(), torch_before)
+
+
 def test_failed_a5_resume_integrity_does_not_mutate_rng(runner, tmp_path, monkeypatch):
     config = a5_config(steps=2)
     output = tmp_path / "run"
@@ -548,6 +707,7 @@ def test_failed_a5_resume_integrity_does_not_mutate_rng(runner, tmp_path, monkey
         },
     }))
     monkeypatch.setattr(runner, "_validate_runtime_inputs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "_prevalidate_resume_payload", lambda *_args: None)
     args = type("Args", (), {
         "seed": 42,
         "resume": checkpoint,
@@ -632,6 +792,11 @@ def test_a5_preflight_uses_eight_private_seeds_without_mutating_parameters(
                                                   [False, False, True],
                                                   [True, False, False]]]),
                 "patches": 1,
+                "target_patch_count": 1,
+                "view_count": 3,
+                "valid_pair_identities": [{
+                    "batch_index": 0, "target_view": 0, "source_view": 1,
+                }],
                 "pairs": [{
                     "batch_index": 0, "target_view": 0, "source_view": 1,
                     "target_patches": torch.tensor([0]),
@@ -716,6 +881,9 @@ def test_a5_preflight_uses_eight_private_seeds_without_mutating_parameters(
     assert numpy_rng_after[2:] == numpy_rng_before[2:]
     assert torch.equal(torch.get_rng_state(), torch_rng_before)
     assert all(row["coverage_min"] == 1.0 for row in calibration["batches"])
+    assert all(row["view_count"] == 3 for row in calibration["batches"])
+    assert all(row["target_patch_count"] == 1 for row in calibration["batches"])
+    assert all(len(row["valid_pair_identities"]) == 1 for row in calibration["batches"])
     assert all(len(row["batch_sha256"]) == 64 for row in calibration["batches"])
 
 
