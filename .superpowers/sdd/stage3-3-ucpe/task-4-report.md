@@ -87,3 +87,24 @@ TDD evidence for this round:
 - `tests/test_stage3_pairing.py` -> `38 passed`.
 - All Stage 3-focused tests plus LR fusion, FullRRE, and UCPE camera contracts -> `174 passed in 3.84s`.
 - `python -m compileall -q src scripts tests` and `git diff --check` -> PASS (only informational LF-to-CRLF warnings).
+
+## Review fix round 4
+
+Addressed the remaining restore-equivalence and independent pair-oracle blockers on top of `629270f`:
+
+- Resume training-state validation now trial-parses Python state with a private `random.Random`, NumPy state with a private `RandomState`, CPU generator states with private `torch.Generator` instances, and CUDA noise/global states with private CUDA generators when available. These checks do not write any global RNG.
+- CUDA state count and pinned state size are validated before restore. CPU-only test generators remain supported by the shared runtime restore helper through an explicit noise-device contract, while production resume prevalidation requires the CUDA format.
+- Optimizer state is trial-loaded into a safe AdamW over the validation schema parameters. Empty or structurally incompatible states are rejected before model runtime construction.
+- SigmaCycle state is checked for the fixed balanced sampling configuration, exact cycle length, permutation order, position/cycle integrity, and then trial-loaded with the real `SigmaCycle.load_state_dict` method on a scheduler-free private instance. This keeps prevalidation aligned with the actual restore path without importing the diffusion runtime.
+- Preflight validation independently constructs the complete `V*(V-1)` directed non-self pair set for batch zero. It no longer accepts a jointly truncated `valid_pair_identities` plus coverage list as self-consistent evidence.
+- Calibration independently derives and persists that same Cartesian pair oracle and fails closed if actual coverage identities are incomplete; it does not trust pairing-state metadata as the oracle.
+- Coverage equality is now exact (`coverage == pair_count / target_patch_count`), so even a `1e-11` perturbation is rejected.
+
+TDD evidence for this round:
+
+- After correcting a test-only dependency setup, the targeted RED run produced six expected failures: jointly truncated identities/coverage, sub-tolerance coverage perturbation, one-byte torch RNG state, invalid NumPy bit generator, empty optimizer state, and empty SigmaCycle state.
+- A separate CUDA-count RED test failed through the later log check until prevalidation enforced the device-state count.
+- A calibration-oracle RED test proved the old path copied a deliberately truncated state identity list instead of deriving the full Cartesian set.
+- `tests/test_stage3_pairing.py` -> `45 passed`.
+- All Stage 3-focused tests plus LR fusion, FullRRE, and UCPE camera contracts -> `181 passed in 4.04s` before the final verification rerun.
+- A direct meta-schema optimizer/SigmaCycle trial reported `meta True` and unchanged CPU RNG.

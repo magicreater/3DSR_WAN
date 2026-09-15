@@ -1175,7 +1175,7 @@ def validate_pairing_resume(manifest: dict, checkpoint: dict, config: Stage3Conf
         identities = batch["valid_pair_identities"]
         if not isinstance(identities, list) or not identities:
             raise ValueError("A5 resume pairing valid identities are missing")
-        expected_pairs = set()
+        recorded_expected_pairs = set()
         for identity_row in identities:
             if not isinstance(identity_row, dict) or set(identity_row) != identity_keys:
                 raise ValueError("A5 resume pairing identity schema mismatch")
@@ -1188,10 +1188,18 @@ def validate_pairing_resume(manifest: dict, checkpoint: dict, config: Stage3Conf
                 or not 0 <= identity[1] < config.views
                 or not 0 <= identity[2] < config.views
                 or identity[1] == identity[2]
-                or identity in expected_pairs
+                or identity in recorded_expected_pairs
             ):
                 raise ValueError("A5 resume pairing valid identity is invalid")
-            expected_pairs.add(identity)
+            recorded_expected_pairs.add(identity)
+        expected_pairs = {
+            (0, target_view, source_view)
+            for target_view in range(config.views)
+            for source_view in range(config.views)
+            if target_view != source_view
+        }
+        if recorded_expected_pairs != expected_pairs:
+            raise ValueError("A5 resume pairing valid identities are incomplete")
         seen_pairs = set()
         for row in coverage_rows:
             if not isinstance(row, dict) or set(row) != coverage_keys:
@@ -1212,7 +1220,7 @@ def validate_pairing_resume(manifest: dict, checkpoint: dict, config: Stage3Conf
                 or row["target_patch_count"] != target_patch_count
             ):
                 raise ValueError("A5 resume pairing target patch count mismatch")
-            if not math.isclose(coverage, pair_count / target_patch_count):
+            if coverage != pair_count / target_patch_count:
                 raise ValueError("A5 resume pairing coverage and pair count mismatch")
             identity = (row["batch_index"], row["target_view"], row["source_view"])
             if any(type(value) is not int for value in identity):
@@ -1368,6 +1376,23 @@ def _calibrate_a5_pairing(runtime: Runtime, args, config: Stage3Config) -> dict:
             "pair_count": int(row["target_patches"].numel()),
             "target_patch_count": int(state["target_patch_count"]),
         } for row in state["pairs"]]
+        if int(state["view_count"]) != config.views:
+            raise ValueError("A5 pairing state view count mismatch")
+        expected_pair_identities = [
+            {"batch_index": 0, "target_view": target, "source_view": source}
+            for target in range(config.views)
+            for source in range(config.views)
+            if target != source
+        ]
+        coverage_identities = {
+            (row["batch_index"], row["target_view"], row["source_view"])
+            for row in coverage_rows
+        }
+        if coverage_identities != {
+            (row["batch_index"], row["target_view"], row["source_view"])
+            for row in expected_pair_identities
+        }:
+            raise ValueError("A5 pairing coverage identities are incomplete")
         coverage = [row["coverage"] for row in coverage_rows]
         metadata = {
             "seed": seed,
@@ -1377,7 +1402,7 @@ def _calibrate_a5_pairing(runtime: Runtime, args, config: Stage3Config) -> dict:
             "target_lr_dropped": bool(dropped),
             "view_count": int(state["view_count"]),
             "target_patch_count": int(state["target_patch_count"]),
-            "valid_pair_identities": state["valid_pair_identities"],
+            "valid_pair_identities": expected_pair_identities,
             "pair_count": int(sum(row["target_patches"].numel() for row in state["pairs"])),
             "coverage_min": float(min(coverage)),
             "coverage": coverage_rows,
@@ -1512,6 +1537,90 @@ def _checkpoint_validation_module(config: Stage3Config) -> Stage3Conditioning:
     return Stage3Conditioning(conditioner, geometry, fusion)
 
 
+def _trial_generator_state(value: torch.Tensor, *, device: str, label: str) -> None:
+    """Ask a private generator to parse state without touching a global RNG."""
+    try:
+        torch.Generator(device=device).set_state(value)
+    except (RuntimeError, ValueError, TypeError) as exc:
+        raise ValueError(f"resume checkpoint contains malformed {label} RNG state") from exc
+
+
+def _balanced_sigma_cycle_length(config: Stage3Config) -> int:
+    """Return the fixed Wan balanced-cycle length without importing the runtime scheduler."""
+    training_alphas = np.linspace(1.0, 1.0 / 1000, 1000)[::-1].copy()
+    base_sigmas = np.asarray(1.0 - training_alphas, dtype=np.float32)
+    sigmas = np.linspace(
+        float(base_sigmas[0]),
+        float(base_sigmas[-1]),
+        config.sampling_steps + 1,
+    ).copy()[:-1]
+    sigmas = config.sampling_shift * sigmas / (
+        1 + (config.sampling_shift - 1) * sigmas
+    )
+    bucket_sizes = (
+        int((sigmas < 0.25).sum()),
+        int(((sigmas >= 0.25) & (sigmas < 0.5)).sum()),
+        int(((sigmas >= 0.5) & (sigmas < 0.8)).sum()),
+        int((sigmas >= 0.8).sum()),
+    )
+    if any(size == 0 for size in bucket_sizes):
+        raise ValueError("inference schedule must populate all balanced sigma bins")
+    return 1 + 4 * max(bucket_sizes)
+
+
+def _validate_resume_optimizer_sigma(
+    state: dict,
+    module: Stage3Conditioning,
+    config: Stage3Config,
+) -> None:
+    """Trial optimizer metadata and validate the fixed balanced SigmaCycle schema."""
+    optimizer_state = state["optimizer"]
+    if not isinstance(optimizer_state, dict) or not optimizer_state:
+        raise ValueError("resume checkpoint contains malformed optimizer state")
+    try:
+        trial_optimizer = torch.optim.AdamW(
+            tuple(parameter for parameter in module.parameters() if parameter.requires_grad),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        trial_optimizer.load_state_dict(optimizer_state)
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("resume checkpoint contains malformed optimizer state") from exc
+
+    sigma_state = state["sigma_cycle"]
+    sigma_keys = {
+        "steps", "shift", "strategy", "generator_state", "order", "position", "cycle"
+    }
+    if not isinstance(sigma_state, dict) or set(sigma_state) != sigma_keys:
+        raise ValueError("resume checkpoint contains malformed sigma cycle state")
+    expected_length = _balanced_sigma_cycle_length(config)
+    order = sigma_state["order"]
+    if (
+        not isinstance(order, torch.Tensor)
+        or order.dtype != torch.int64
+        or order.shape != (expected_length,)
+        or not torch.equal(torch.sort(order).values, torch.arange(expected_length))
+        or type(sigma_state["cycle"]) is not int
+        or sigma_state["cycle"] < 0
+    ):
+        raise ValueError("resume checkpoint contains malformed sigma cycle state")
+    try:
+        # Reuse the real restore method without constructing its scheduler.
+        trial_cycle = object.__new__(SigmaCycle)
+        trial_cycle.config = FlowSamplingConfig(
+            config.sampling_steps, config.sampling_shift
+        )
+        trial_cycle.strategy = "balanced"
+        trial_cycle.values = torch.empty(expected_length)
+        trial_cycle.generator = torch.Generator()
+        trial_cycle.order = torch.arange(expected_length)
+        trial_cycle.position = 0
+        trial_cycle.cycle = 0
+        trial_cycle.load_state_dict(sigma_state)
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("resume checkpoint contains malformed sigma cycle state") from exc
+
+
 def _validate_training_state_payload(
     state,
     *,
@@ -1519,6 +1628,7 @@ def _validate_training_state_payload(
     require_dropout: bool,
     require_pairing: bool,
     require_cuda: bool,
+    noise_device: str = "cpu",
     require_pairing_weight: bool = False,
     require_version_two: bool = False,
 ) -> None:
@@ -1561,6 +1671,21 @@ def _validate_training_state_payload(
         for name in tensor_fields
     ):
         raise ValueError("resume checkpoint contains malformed RNG state")
+    cpu_generator_fields = ["view_generator_state", "torch_rng_state"]
+    if require_pairing:
+        cpu_generator_fields.append("pairing_generator_state")
+    if version >= 2 and require_dropout:
+        cpu_generator_fields.append("dropout_generator_state")
+    for name in cpu_generator_fields:
+        _trial_generator_state(state[name], device="cpu", label="torch")
+    noise_state = state["noise_generator_state"]
+    if torch.device(noise_device).type == "cuda":
+        if noise_state.numel() != 16:
+            raise ValueError("resume checkpoint contains malformed CUDA noise RNG state")
+        if torch.cuda.is_available():
+            _trial_generator_state(noise_state, device=noise_device, label="CUDA noise")
+    else:
+        _trial_generator_state(noise_state, device="cpu", label="torch noise")
     if not isinstance(state["optimizer"], dict) or not isinstance(state["sigma_cycle"], dict):
         raise ValueError("resume checkpoint contains malformed optimizer or sigma state")
     numpy_state = state["numpy_rng_state"]
@@ -1580,6 +1705,17 @@ def _validate_training_state_payload(
         or not math.isfinite(numpy_state["cached_gaussian"])
     ):
         raise ValueError("resume checkpoint contains malformed NumPy RNG state")
+    numpy_tuple = (
+        numpy_state["bit_generator"],
+        np.asarray(numpy_state["state"], dtype=np.uint32),
+        numpy_state["position"],
+        numpy_state["has_gauss"],
+        numpy_state["cached_gaussian"],
+    )
+    try:
+        np.random.RandomState(0).set_state(numpy_tuple)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("resume checkpoint contains malformed NumPy RNG state") from exc
     try:
         probe = random.Random()
         probe.setstate(state["python_rng_state"])
@@ -1603,6 +1739,14 @@ def _validate_training_state_payload(
         )
     ):
         raise ValueError("resume checkpoint contains malformed CUDA RNG state")
+    if require_cuda and version >= 2:
+        if len(state["cuda_rng_state_all"]) != max(torch.cuda.device_count(), 1):
+            raise ValueError("resume checkpoint contains malformed CUDA RNG state")
+        for value in state["cuda_rng_state_all"]:
+            if value.numel() != 16:
+                raise ValueError("resume checkpoint contains malformed CUDA RNG state")
+            if torch.cuda.is_available():
+                _trial_generator_state(value, device="cuda", label="CUDA")
 
 
 def _prevalidate_resume_payload(payload: dict, config: Stage3Config, expected_step: int) -> None:
@@ -1618,8 +1762,10 @@ def _prevalidate_resume_payload(payload: dict, config: Stage3Config, expected_st
         require_pairing=config.camera_rank_weight > 0 or config.pairing_supervision,
         require_pairing_weight=config.pairing_supervision,
         require_cuda=True,
+        noise_device="cuda",
         require_version_two=True,
     )
+    _validate_resume_optimizer_sigma(payload["training_state"], module, config)
 
 
 def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise_generator,
@@ -1630,6 +1776,7 @@ def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise
         require_dropout=dropout_generator is not None,
         require_pairing=pairing_generator is not None,
         require_cuda=torch.cuda.is_available(),
+        noise_device=str(noise_generator.device),
     )
     version = state.get("format_version", 1)
     optimizer.load_state_dict(state["optimizer"])

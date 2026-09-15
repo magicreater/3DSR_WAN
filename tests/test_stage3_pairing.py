@@ -106,14 +106,30 @@ def valid_resume_payload(runner, config, *, step=1):
         geometry=torch.nn.Linear(2, 2, bias=False),
         fusion=torch.nn.Linear(2, 2, bias=False),
     )
+    optimizer = torch.optim.AdamW(
+        module.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
+    cuda_generator_state = (
+        torch.Generator(device="cuda").get_state()
+        if torch.cuda.is_available()
+        else torch.zeros(16, dtype=torch.uint8)
+    )
     numpy_state = runner.np.random.get_state()
     training_state = {
         "format_version": 2,
         "step": step,
-        "optimizer": {},
-        "sigma_cycle": {},
+        "optimizer": optimizer.state_dict(),
+        "sigma_cycle": {
+            "steps": 50,
+            "shift": 5.0,
+            "strategy": "balanced",
+            "generator_state": torch.Generator().get_state(),
+            "order": torch.arange(113),
+            "position": 0,
+            "cycle": 0,
+        },
         "view_generator_state": torch.Generator().get_state(),
-        "noise_generator_state": torch.Generator().get_state(),
+        "noise_generator_state": cuda_generator_state.clone(),
         "dropout_generator_state": torch.Generator().get_state(),
         "pairing_generator_state": torch.Generator().get_state(),
         "python_rng_state": runner.random.getstate(),
@@ -125,7 +141,10 @@ def valid_resume_payload(runner, config, *, step=1):
             "cached_gaussian": numpy_state[4],
         },
         "torch_rng_state": torch.get_rng_state(),
-        "cuda_rng_state_all": [torch.Generator().get_state()],
+        "cuda_rng_state_all": [
+            cuda_generator_state.clone()
+            for _ in range(max(torch.cuda.device_count(), 1))
+        ],
         "pairing_weight": 0.5,
     }
     return module, {
@@ -144,6 +163,13 @@ def valid_resume_payload(runner, config, *, step=1):
         },
         "training_state": training_state,
     }
+
+
+def truncate_expected_and_coverage(payload):
+    batch = payload["calibration"]["batches"][0]
+    batch["valid_pair_identities"].pop()
+    batch["coverage"].pop()
+    batch["pair_count"] -= 1
 
 
 def test_a5_is_explicit_and_uses_the_fixed_pairing_protocol():
@@ -532,11 +558,15 @@ def test_a5_resume_validates_protocol_weight_and_preflight_hash(runner, tmp_path
         (lambda payload: payload["calibration"]["batches"][0][
             "valid_pair_identities"
         ].pop(), "identities"),
+        (truncate_expected_and_coverage, "identities"),
         (lambda payload: payload["calibration"]["batches"][0]["coverage"][0].update({
             "batch_index": 1
         }), "batch_index"),
         (lambda payload: payload["calibration"]["batches"][0]["coverage"][0].update({
             "pair_count": 2
+        }), "coverage"),
+        (lambda payload: payload["calibration"]["batches"][0]["coverage"][0].update({
+            "coverage": 0.25 + 1e-11
         }), "coverage"),
         (lambda payload: payload["calibration"]["batches"][0].update({
             "batch_sha256": "not-a-hash"
@@ -604,7 +634,12 @@ def test_a5_resume_rejects_truncated_legacy_mean_of_norms_artifact(runner, tmp_p
         ("missing_pairing_generator_state", "pairing_generator_state"),
         ("missing_dropout_generator_state", "dropout_generator_state"),
         ("missing_cuda_rng_state", "cuda_rng_state_all"),
+        ("wrong_cuda_rng_count", "CUDA RNG"),
         ("legacy_training_state", "format v2"),
+        ("short_torch_rng_state", "torch RNG"),
+        ("bad_numpy_bit_generator", "NumPy RNG"),
+        ("empty_optimizer_state", "optimizer"),
+        ("empty_sigma_cycle_state", "sigma cycle"),
         ("config_mismatch", "config mismatch"),
         ("adapter_architecture", "fusion architecture"),
         ("nonfinite_adapter", "nonfinite"),
@@ -621,8 +656,20 @@ def test_failed_resume_checkpoint_prevalidation_preserves_every_rng(
         payload["training_state"].pop("dropout_generator_state")
     elif defect == "missing_cuda_rng_state":
         payload["training_state"].pop("cuda_rng_state_all")
+    elif defect == "wrong_cuda_rng_count":
+        payload["training_state"]["cuda_rng_state_all"].append(
+            payload["training_state"]["cuda_rng_state_all"][0].clone()
+        )
     elif defect == "legacy_training_state":
         payload["training_state"]["format_version"] = 1
+    elif defect == "short_torch_rng_state":
+        payload["training_state"]["torch_rng_state"] = torch.zeros(1, dtype=torch.uint8)
+    elif defect == "bad_numpy_bit_generator":
+        payload["training_state"]["numpy_rng_state"]["bit_generator"] = "NOT_MT19937"
+    elif defect == "empty_optimizer_state":
+        payload["training_state"]["optimizer"] = {}
+    elif defect == "empty_sigma_cycle_state":
+        payload["training_state"]["sigma_cycle"] = {}
     elif defect == "config_mismatch":
         payload["config"]["learning_rate"] *= 2
     elif defect == "adapter_architecture":
@@ -783,7 +830,17 @@ def test_a5_preflight_uses_eight_private_seeds_without_mutating_parameters(
             runner.random.random()
             runner.np.random.rand()
             calls.append(kwargs["pairing_camera"])
-            q = torch.stack((self.fusion.weight, torch.ones_like(self.fusion.weight))).reshape(1, 1, 1, 2)
+            q = torch.stack((self.fusion.weight, torch.ones_like(self.fusion.weight))).reshape(
+                1, 1, 1, 2
+            ).expand(1, 1, 3, 2)
+            identities = [
+                {"batch_index": 0, "target_view": 0, "source_view": 1},
+                {"batch_index": 0, "target_view": 0, "source_view": 2},
+                {"batch_index": 0, "target_view": 1, "source_view": 0},
+                {"batch_index": 0, "target_view": 1, "source_view": 2},
+                {"batch_index": 0, "target_view": 2, "source_view": 0},
+                {"batch_index": 0, "target_view": 2, "source_view": 1},
+            ]
             return torch.zeros(1, 3, 1), {
                 "query": q,
                 "key": torch.tensor([[[[1., 0.], [1., 0.], [1., 0.]]]]),
@@ -794,14 +851,12 @@ def test_a5_preflight_uses_eight_private_seeds_without_mutating_parameters(
                 "patches": 1,
                 "target_patch_count": 1,
                 "view_count": 3,
-                "valid_pair_identities": [{
-                    "batch_index": 0, "target_view": 0, "source_view": 1,
-                }],
-                "pairs": [{
-                    "batch_index": 0, "target_view": 0, "source_view": 1,
+                # Deliberately truncated: calibration must derive its oracle.
+                "valid_pair_identities": identities[:-1],
+                "pairs": [{**identity,
                     "target_patches": torch.tensor([0]),
                     "source_patches": torch.tensor([0]), "coverage": 1.0,
-                }],
+                } for identity in identities],
             }
 
         def predict(self, _dit, noisy, *_args, **_kwargs):
@@ -883,7 +938,7 @@ def test_a5_preflight_uses_eight_private_seeds_without_mutating_parameters(
     assert all(row["coverage_min"] == 1.0 for row in calibration["batches"])
     assert all(row["view_count"] == 3 for row in calibration["batches"])
     assert all(row["target_patch_count"] == 1 for row in calibration["batches"])
-    assert all(len(row["valid_pair_identities"]) == 1 for row in calibration["batches"])
+    assert all(len(row["valid_pair_identities"]) == 6 for row in calibration["batches"])
     assert all(len(row["batch_sha256"]) == 64 for row in calibration["batches"])
 
 
