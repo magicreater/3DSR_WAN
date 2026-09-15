@@ -25,6 +25,7 @@ ARM_MODES = {
     "A2": "visual",
     "A3": "epipolar",
     "A4": "rre_epipolar",
+    "A5": "rre_epipolar",
 }
 
 
@@ -61,10 +62,16 @@ class Stage3Config:
     allow_self_view_source: bool = True
     camera_rank_weight: float = 0.0
     camera_rank_margin_ratio: float = 0.05
+    pairing_temperature: float = 0.07
+    pairing_minimum_coverage: float = 0.05
+    pairing_calibration_batches: int = 8
+    pairing_target_gradient_ratio: float = 0.25
+    pairing_weight_min: float = 0.01
+    pairing_weight_max: float = 10.0
 
     def __post_init__(self):
         if self.arm not in ARM_MODES:
-            raise ValueError("arm must be A0, A1, A2, A3 or A4")
+            raise ValueError("arm must be A0, A1, A2, A3, A4 or A5")
         groups = (self.train_scenes, self.validation_scenes, self.test_scenes)
         for group in groups:
             if not isinstance(group, tuple) or not group or any(not isinstance(s, str) or not s for s in group):
@@ -75,7 +82,8 @@ class Stage3Config:
             raise ValueError("train, validation and test scenes must be disjoint")
         for name in ("image_size", "scale", "views", "steps", "gradient_accumulation", "checkpoint_every",
                      "sampling_steps", "validation_groups_per_scene", "final_groups_per_scene",
-                     "nearest_views", "fusion_dim", "fusion_heads", "query_chunk_size"):
+                     "nearest_views", "fusion_dim", "fusion_heads", "query_chunk_size",
+                     "pairing_calibration_batches"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -109,15 +117,26 @@ class Stage3Config:
             raise ValueError("image_size must align with Wan VAE/patch grid and SR scale")
         if self.fusion_dim % self.fusion_heads:
             raise ValueError("fusion_dim must be divisible by fusion_heads")
-        if self.arm == "A4":
+        if self.arm in {"A4", "A5"}:
             if self.fusion_dim != 192:
-                raise ValueError("A4 requires fusion_dim=192")
+                raise ValueError(f"{self.arm} requires fusion_dim=192")
             if self.fusion_heads != 1:
-                raise ValueError("A4 requires fusion_heads=1")
+                raise ValueError(f"{self.arm} requires fusion_heads=1")
             if self.epipolar_attention != "local_band":
-                raise ValueError("A4 requires epipolar_attention=local_band")
+                raise ValueError(f"{self.arm} requires epipolar_attention=local_band")
             if self.allow_self_view_source:
-                raise ValueError("A4 requires allow_self_view_source=false")
+                raise ValueError(f"{self.arm} requires allow_self_view_source=false")
+        if self.arm == "A5":
+            if self.pairing_temperature != 0.07:
+                raise ValueError("A5 requires pairing_temperature=0.07")
+            if self.pairing_minimum_coverage != 0.05:
+                raise ValueError("A5 requires pairing_minimum_coverage=0.05")
+            if self.pairing_calibration_batches != 8:
+                raise ValueError("A5 requires pairing_calibration_batches=8")
+            if self.pairing_target_gradient_ratio != 0.25:
+                raise ValueError("A5 requires pairing_target_gradient_ratio=0.25")
+            if (self.pairing_weight_min, self.pairing_weight_max) != (0.01, 10.0):
+                raise ValueError("A5 requires pairing weight clip [0.01,10]")
         if self.nearest_views < self.views - 1:
             raise ValueError("nearest_views must cover all auxiliary views")
 
@@ -128,6 +147,20 @@ class Stage3Config:
     @property
     def validation_scene_names(self) -> tuple[str, ...]:
         return self.train_scenes + self.validation_scenes
+
+    @property
+    def pairing_supervision(self) -> bool:
+        return self.arm == "A5"
+
+    @property
+    def pairing_protocol(self) -> dict:
+        return {
+            "temperature": self.pairing_temperature,
+            "minimum_coverage": self.pairing_minimum_coverage,
+            "calibration_batches": self.pairing_calibration_batches,
+            "target_gradient_ratio": self.pairing_target_gradient_ratio,
+            "weight_clip": [self.pairing_weight_min, self.pairing_weight_max],
+        }
 
     def to_dict(self) -> dict:
         return asdict(self)

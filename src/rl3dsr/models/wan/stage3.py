@@ -25,11 +25,14 @@ class Stage3Conditioning(nn.Module):
     def prepare_multiview(self, lr: Tensor, camera: CameraBatch,
                           latent_shape: tuple[int, int, int],
                           conditioning_size: tuple[int, int], *, source_mask=None,
-                          allow_self_view_source=None) -> Tensor:
+                          allow_self_view_source=None, pairing_camera=None,
+                          pairing_minimum_coverage=0.05) -> Tensor | tuple[Tensor, dict]:
         """Encode independent LR views and fuse once, returning [B,V*P,D].
 
         Retain this tensor for the full inference trajectory. During training
         prepare again after each parameter update; never cache a learned graph.
+        Supplying ``pairing_camera`` opts into a differentiable A5 Q/K state
+        and returns ``(features, pairing_state)``.
         """
         if camera.sequence_kind != "multiview":
             raise ValueError("Stage 3 preparation requires multiview; use video_features for temporal input")
@@ -39,6 +42,8 @@ class Stage3Conditioning(nn.Module):
         features = self.conditioner.multiview_features(
             lr, conditioning_size=conditioning_size, latent_shape=latent_shape)
         if self.fusion is None:
+            if pairing_camera is not None:
+                raise ValueError("pairing supervision requires LR fusion")
             return features
         views, height, width = latent_shape
         shaped = features.reshape(features.shape[0], views, -1, features.shape[-1])
@@ -49,7 +54,17 @@ class Stage3Conditioning(nn.Module):
             source_mask=source_mask,
             allow_self_view_source=allow_self_view_source,
         )
-        return fused.reshape_as(features)
+        prepared = fused.reshape_as(features)
+        if pairing_camera is None:
+            return prepared
+        pairing = self.fusion.build_pairing_state(
+            shaped,
+            camera,
+            pairing_camera,
+            (height // 2, width // 2),
+            minimum_coverage=pairing_minimum_coverage,
+        )
+        return prepared, pairing
 
     def predict(
         self,
@@ -117,12 +132,24 @@ def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config:
         saved_config.setdefault("allow_self_view_source", True)
         saved_config.setdefault("camera_rank_weight", 0.0)
         saved_config.setdefault("camera_rank_margin_ratio", 0.05)
+        saved_config.setdefault("pairing_temperature", 0.07)
+        saved_config.setdefault("pairing_minimum_coverage", 0.05)
+        saved_config.setdefault("pairing_calibration_batches", 8)
+        saved_config.setdefault("pairing_target_gradient_ratio", 0.25)
+        saved_config.setdefault("pairing_weight_min", 0.01)
+        saved_config.setdefault("pairing_weight_max", 10.0)
         expected.setdefault("target_lr_dropout", 0.0)
         expected.setdefault("epipolar_attention", "global_bias")
         expected.setdefault("epipolar_band", 1.5)
         expected.setdefault("allow_self_view_source", True)
         expected.setdefault("camera_rank_weight", 0.0)
         expected.setdefault("camera_rank_margin_ratio", 0.05)
+        expected.setdefault("pairing_temperature", 0.07)
+        expected.setdefault("pairing_minimum_coverage", 0.05)
+        expected.setdefault("pairing_calibration_batches", 8)
+        expected.setdefault("pairing_target_gradient_ratio", 0.25)
+        expected.setdefault("pairing_weight_min", 0.01)
+        expected.setdefault("pairing_weight_max", 10.0)
         if saved_config != expected:
             raise ValueError("Stage 3 checkpoint config mismatch")
     expected_arch = {"blocks": list(module.conditioner.bridge_blocks),

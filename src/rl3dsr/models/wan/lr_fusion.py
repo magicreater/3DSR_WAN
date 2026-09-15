@@ -122,6 +122,105 @@ def epipolar_local_key_mask(
     return allowed.reshape(camera.K.shape[0], tokens, tokens), usable
 
 
+def mutual_epipolar_patch_pairs(
+    features: Tensor,
+    allowed: Tensor,
+    usable: Tensor,
+    *,
+    minimum_coverage: float = 0.05,
+) -> list[dict]:
+    """Select detached cosine mutual-nearest matches for every valid view pair."""
+    if features.ndim != 4 or not features.is_floating_point():
+        raise ValueError('features must be floating point [B,V,P,D]')
+    b, views, patches, _ = features.shape
+    tokens = views * patches
+    if allowed.shape != (b, tokens, tokens) or allowed.dtype != torch.bool:
+        raise ValueError('allowed must be bool [B,V*P,V*P]')
+    if usable.shape != (b, tokens, views) or usable.dtype != torch.bool:
+        raise ValueError('usable must be bool [B,V*P,V]')
+    if (
+        isinstance(minimum_coverage, bool)
+        or not isinstance(minimum_coverage, (int, float))
+        or not math.isfinite(minimum_coverage)
+        or not 0 <= minimum_coverage <= 1
+    ):
+        raise ValueError('minimum_coverage must be finite and in [0,1]')
+    discovery = torch.nn.functional.normalize(features.detach().float(), dim=-1)
+    result = []
+    for batch in range(b):
+        for target in range(views):
+            target_slice = slice(target * patches, (target + 1) * patches)
+            for source in range(views):
+                if source == target or not bool(usable[batch, target_slice, source].any()):
+                    continue
+                source_slice = slice(source * patches, (source + 1) * patches)
+                candidate_mask = allowed[batch, target_slice, source_slice]
+                similarity = discovery[batch, target] @ discovery[batch, source].transpose(0, 1)
+                masked = similarity.masked_fill(~candidate_mask, -torch.inf)
+                target_has_candidate = candidate_mask.any(dim=1)
+                source_has_candidate = candidate_mask.any(dim=0)
+                target_best = masked.argmax(dim=1)
+                source_best = masked.argmax(dim=0)
+                target_indices = torch.arange(patches, device=features.device)
+                mutual = (
+                    target_has_candidate
+                    & source_has_candidate[target_best]
+                    & (source_best[target_best] == target_indices)
+                )
+                target_patches = target_indices[mutual]
+                source_patches = target_best[mutual]
+                coverage = float(target_patches.numel() / patches)
+                if coverage < float(minimum_coverage):
+                    raise ValueError(
+                        f'pairing coverage failed for batch {batch} target {target} '
+                        f'source {source}: {coverage:.3f} < {float(minimum_coverage):.3f}'
+                    )
+                result.append({
+                    'batch_index': batch,
+                    'target_view': target,
+                    'source_view': source,
+                    'target_patches': target_patches.detach(),
+                    'source_patches': source_patches.detach(),
+                    'coverage': coverage,
+                })
+    if not result:
+        raise ValueError('no valid camera view pairs are available for pairing')
+    return result
+
+
+def pairing_info_nce_loss(state: dict, *, temperature: float = 0.07) -> Tensor:
+    """Contrast correct transformed Q/K pairs against wrong-camera hard negatives."""
+    if temperature != 0.07:
+        raise ValueError('pairing temperature must be exactly 0.07')
+    q, k, wrong_k = state['query'], state['key'], state['wrong_key']
+    wrong_allowed = state['wrong_allowed']
+    patches = state['patches']
+    losses = []
+    for pair in state['pairs']:
+        batch = pair['batch_index']
+        target = pair['target_view']
+        source = pair['source_view']
+        query_indices = target * patches + pair['target_patches']
+        positive_indices = source * patches + pair['source_patches']
+        queries = torch.nn.functional.normalize(q[batch, 0, query_indices], dim=-1)
+        positives = torch.nn.functional.normalize(k[batch, 0, positive_indices], dim=-1)
+        source_slice = slice(source * patches, (source + 1) * patches)
+        candidate_mask = wrong_allowed[batch, query_indices, source_slice]
+        hard_keys = torch.nn.functional.normalize(wrong_k[batch, 0, source_slice], dim=-1)
+        paired_wrong = torch.nn.functional.normalize(
+            wrong_k[batch, 0, positive_indices], dim=-1
+        )
+        positive_logits = (queries * positives).sum(-1, keepdim=True)
+        paired_wrong_logits = (queries * paired_wrong).sum(-1, keepdim=True)
+        hard_logits = queries @ hard_keys.transpose(0, 1)
+        hard_logits = hard_logits.masked_fill(~candidate_mask, -torch.inf)
+        logits = torch.cat((positive_logits, paired_wrong_logits, hard_logits), dim=1) / temperature
+        losses.append(-torch.log_softmax(logits, dim=1)[:, 0])
+    if not losses:
+        raise ValueError('pairing state contains no matches')
+    return torch.cat(losses).mean()
+
+
 class LRViewFusion(nn.Module):
     """One zero-initialized LR attention residual; never encodes views as time.
 
@@ -176,6 +275,68 @@ class LRViewFusion(nn.Module):
         self.qkv = nn.Linear(feature_dim, hidden_dim * 3, bias=False)
         self.output = nn.Linear(hidden_dim, feature_dim, bias=False)
         nn.init.zeros_(self.output.weight)
+
+    def build_pairing_state(
+        self,
+        features: Tensor,
+        camera: CameraBatch,
+        wrong_camera: CameraBatch,
+        patch_grid: tuple[int, int],
+        *,
+        minimum_coverage: float = 0.05,
+    ) -> dict:
+        """Build opt-in differentiable Q/K state without retaining LR feature gradients."""
+        if self.mode != 'rre_epipolar' or self.heads != 1:
+            raise ValueError('direct pairing requires rre_epipolar with one head')
+        b, views, patches, _ = features.shape
+        camera.validate(batch=b)
+        wrong_camera.validate(batch=b)
+        if camera.K.shape[1] != views or wrong_camera.K.shape[1] != views:
+            raise ValueError('camera views must match LR views')
+        if any(
+            value.camera_model == 'ucm' and bool((value.xi != 0).any())
+            for value in (camera, wrong_camera)
+        ):
+            raise ValueError(
+                'direct pairing does not support nonzero UCM distortion in its pinhole epipolar band'
+            )
+        if patches != patch_grid[0] * patch_grid[1]:
+            raise ValueError('patch_grid must match LR features')
+        detached = features.detach().to(self.qkv.weight.dtype)
+        qkv = self.qkv(detached).reshape(b, views * patches, 3, 1, self.hidden_dim)
+        q, k = qkv.permute(2, 0, 3, 1, 4)[:2]
+        q, k = q.float(), k.float()
+        coeff_x, coeff_y = patch_prope_coefficients(
+            patch_grid, views, self.hidden_dim // 4,
+            device=features.device, dtype=q.dtype,
+        )
+        correct_world_to_ray = build_world_to_ray(camera, patch_grid).world_to_ray.to(q)
+        wrong_world_to_ray = build_world_to_ray(wrong_camera, patch_grid).world_to_ray.to(q)
+        q = apply_prope(q, correct_world_to_ray.transpose(-1, -2), coeff_x, coeff_y)
+        k = apply_prope(k, invert_se3(correct_world_to_ray), coeff_x, coeff_y)
+        wrong_k = apply_prope(
+            qkv.permute(2, 0, 3, 1, 4)[1].float(),
+            invert_se3(wrong_world_to_ray),
+            coeff_x,
+            coeff_y,
+        )
+        allowed, usable = epipolar_local_key_mask(
+            camera, patch_grid, band=self.epipolar_band
+        )
+        wrong_allowed, _ = epipolar_local_key_mask(
+            wrong_camera, patch_grid, band=self.epipolar_band
+        )
+        pairs = mutual_epipolar_patch_pairs(
+            features, allowed, usable, minimum_coverage=minimum_coverage
+        )
+        return {
+            'query': q,
+            'key': k,
+            'wrong_key': wrong_k,
+            'wrong_allowed': wrong_allowed,
+            'patches': patches,
+            'pairs': pairs,
+        }
 
     def forward(
         self,
