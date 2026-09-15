@@ -44,6 +44,45 @@ def a5_config(**changes):
     return config
 
 
+def valid_preflight_payload(config, *, training_seed=42):
+    batches = []
+    for index in range(8):
+        batches.append({
+            "seed": training_seed + 6000 + index,
+            "scene": config.train_scenes[index % len(config.train_scenes)],
+            "view_indices": list(range(config.views)),
+            "sigma": 0.5,
+            "target_lr_dropped": False,
+            "pair_count": 1,
+            "coverage_min": 0.25,
+            "coverage": [{
+                "batch_index": 0,
+                "target_view": 0,
+                "source_view": 1,
+                "coverage": 0.25,
+                "pair_count": 1,
+            }],
+            "camera_sha256": "a" * 64,
+            "wrong_camera_sha256": "b" * 64,
+            "batch_sha256": f"{index:064x}",
+            "flow_gradient_norm": 2.0,
+            "pairing_gradient_norm": 1.0,
+        })
+    return {
+        "protocol": config.pairing_protocol,
+        "calibration": {
+            "batches": batches,
+            "gradient_reduction": "mean_gradient_over_8_batches_then_global_l2",
+            "flow_gradient_norm": 2.0,
+            "pairing_gradient_norm": 1.0,
+            "flow_batch_gradient_norm_mean": 2.0,
+            "pairing_batch_gradient_norm_mean": 1.0,
+            "raw_weight": 0.5,
+            "weight": 0.5,
+        },
+    }
+
+
 def test_a5_is_explicit_and_uses_the_fixed_pairing_protocol():
     config = a5_config()
     assert config.fusion_mode == "rre_epipolar"
@@ -378,19 +417,16 @@ def test_resume_preserves_pairing_weight_and_rng_while_init_recalibrates(runner)
 def test_a5_resume_validates_protocol_weight_and_preflight_hash(runner, tmp_path):
     config = a5_config()
     artifact = tmp_path / "pairing_preflight.json"
-    artifact.write_text(runner.json.dumps({
-        "protocol": config.pairing_protocol,
-        "calibration": {"weight": 0.4},
-    }))
+    artifact.write_text(runner.json.dumps(valid_preflight_payload(config)))
     manifest = {"pairing": {
         "enabled": True,
-        "weight": 0.4,
+        "weight": 0.5,
         "protocol": config.pairing_protocol,
         "preflight": str(artifact),
         "preflight_sha256": runner._sha256(artifact),
-    }}
-    checkpoint = {"training_state": {"pairing_weight": 0.4}}
-    assert runner.validate_pairing_resume(manifest, checkpoint, config) == 0.4
+    }, "provenance": {"training_seed": 42}}
+    checkpoint = {"training_state": {"pairing_weight": 0.5}}
+    assert runner.validate_pairing_resume(manifest, checkpoint, config) == 0.5
 
     artifact.write_text("{}")
     with pytest.raises(ValueError, match="hash"):
@@ -399,10 +435,7 @@ def test_a5_resume_validates_protocol_weight_and_preflight_hash(runner, tmp_path
     with pytest.raises(ValueError, match="missing"):
         runner.validate_pairing_resume(manifest, checkpoint, config)
 
-    artifact.write_text(runner.json.dumps({
-        "protocol": config.pairing_protocol,
-        "calibration": {"weight": 0.4},
-    }))
+    artifact.write_text(runner.json.dumps(valid_preflight_payload(config)))
     manifest["pairing"]["preflight_sha256"] = runner._sha256(artifact)
     manifest["pairing"]["protocol"] = {**config.pairing_protocol, "temperature": 0.08}
     with pytest.raises(ValueError, match="protocol"):
@@ -411,6 +444,130 @@ def test_a5_resume_validates_protocol_weight_and_preflight_hash(runner, tmp_path
     manifest["pairing"]["weight"] = 11.0
     with pytest.raises(ValueError, match="weight"):
         runner.validate_pairing_resume(manifest, checkpoint, config)
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda payload: payload["calibration"].update({
+            "gradient_reduction": "mean_of_batch_gradient_norms"
+        }), "reduction"),
+        (lambda payload: payload["calibration"]["batches"].pop(), "8 batch"),
+        (lambda payload: payload["calibration"].update({
+            "pairing_gradient_norm": float("nan")
+        }), "gradient norm"),
+        (lambda payload: payload["calibration"]["batches"][0].update({
+            "seed": 999
+        }), "seed"),
+        (lambda payload: payload["calibration"]["batches"][0]["coverage"][0].update({
+            "coverage": 0.01
+        }), "coverage"),
+        (lambda payload: payload["calibration"]["batches"][0].update({
+            "batch_sha256": "not-a-hash"
+        }), "hash"),
+        (lambda payload: payload["calibration"].update({
+            "weight": 0.6
+        }), "clipped weight"),
+    ],
+)
+def test_a5_resume_rejects_invalid_corrected_preflight_schema(
+    runner, tmp_path, mutation, match
+):
+    config = a5_config()
+    payload = valid_preflight_payload(config)
+    mutation(payload)
+    artifact = tmp_path / "pairing_preflight.json"
+    artifact.write_text(runner.json.dumps(payload))
+    manifest = {
+        "provenance": {"training_seed": 42},
+        "pairing": {
+            "enabled": True,
+            "weight": 0.5,
+            "protocol": config.pairing_protocol,
+            "preflight": str(artifact),
+            "preflight_sha256": runner._sha256(artifact),
+        },
+    }
+    checkpoint = {"training_state": {"pairing_weight": 0.5}}
+    with pytest.raises(ValueError, match=match):
+        runner.validate_pairing_resume(manifest, checkpoint, config)
+
+
+def test_a5_resume_rejects_truncated_legacy_mean_of_norms_artifact(runner, tmp_path):
+    config = a5_config()
+    artifact = tmp_path / "pairing_preflight.json"
+    artifact.write_text(runner.json.dumps({
+        "protocol": config.pairing_protocol,
+        "calibration": {
+            "batches": [],
+            "flow_gradient_norm_mean": 2.0,
+            "pairing_gradient_norm_mean": 1.0,
+            "raw_weight": 0.5,
+            "weight": 0.5,
+        },
+    }))
+    manifest = {
+        "provenance": {"training_seed": 42},
+        "pairing": {
+            "enabled": True,
+            "weight": 0.5,
+            "protocol": config.pairing_protocol,
+            "preflight": str(artifact),
+            "preflight_sha256": runner._sha256(artifact),
+        },
+    }
+    with pytest.raises(ValueError, match="schema"):
+        runner.validate_pairing_resume(
+            manifest, {"training_state": {"pairing_weight": 0.5}}, config
+        )
+
+
+def test_failed_a5_resume_integrity_does_not_mutate_rng(runner, tmp_path, monkeypatch):
+    config = a5_config(steps=2)
+    output = tmp_path / "run"
+    output.mkdir()
+    checkpoint = tmp_path / "resume.pt"
+    runner.torch.save({
+        "format": "rl3dsr-stage3",
+        "format_version": 1,
+        "step": 1,
+        "training_state": {"pairing_weight": 0.5},
+    }, checkpoint)
+    (output / "train_steps.jsonl").write_text('{"step": 1}\n')
+    artifact = output / "pairing_preflight.json"
+    artifact.write_text("{}")
+    (output / "run_manifest.json").write_text(runner.json.dumps({
+        "config": config.to_dict(),
+        "provenance": {"training_seed": 42},
+        "pairing": {
+            "enabled": True,
+            "weight": 0.5,
+            "protocol": config.pairing_protocol,
+            "preflight": str(artifact),
+            "preflight_sha256": runner._sha256(artifact),
+        },
+    }))
+    monkeypatch.setattr(runner, "_validate_runtime_inputs", lambda *_args, **_kwargs: None)
+    args = type("Args", (), {
+        "seed": 42,
+        "resume": checkpoint,
+        "init_checkpoint": None,
+        "init_reset_fusion": False,
+        "output_dir": output,
+    })()
+    python_before = runner.random.getstate()
+    numpy_before = runner.np.random.get_state()
+    torch_before = runner.torch.get_rng_state()
+
+    with pytest.raises(ValueError, match="schema"):
+        runner._train(args, config)
+
+    assert runner.random.getstate() == python_before
+    numpy_after = runner.np.random.get_state()
+    assert numpy_after[0] == numpy_before[0]
+    assert runner.np.array_equal(numpy_after[1], numpy_before[1])
+    assert numpy_after[2:] == numpy_before[2:]
+    assert runner.torch.equal(runner.torch.get_rng_state(), torch_before)
 
 
 def test_pairing_preflight_is_immutable_and_manifest_binds_its_hash(runner, tmp_path):

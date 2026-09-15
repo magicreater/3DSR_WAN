@@ -1079,10 +1079,172 @@ def validate_pairing_resume(manifest: dict, checkpoint: dict, config: Stage3Conf
         raise ValueError("A5 resume pairing preflight artifact is invalid") from exc
     if not isinstance(payload, dict):
         raise ValueError("A5 resume pairing preflight artifact is invalid")
+    if set(payload) != {"protocol", "calibration"}:
+        raise ValueError("A5 resume pairing preflight schema mismatch")
     if payload.get("protocol") != config.pairing_protocol:
         raise ValueError("A5 resume preflight protocol mismatch")
     calibration = payload.get("calibration")
-    if not isinstance(calibration, dict) or calibration.get("weight") != weight:
+    calibration_keys = {
+        "batches", "gradient_reduction", "flow_gradient_norm",
+        "pairing_gradient_norm", "flow_batch_gradient_norm_mean",
+        "pairing_batch_gradient_norm_mean", "raw_weight", "weight",
+    }
+    if not isinstance(calibration, dict) or set(calibration) != calibration_keys:
+        raise ValueError("A5 resume pairing preflight calibration schema mismatch")
+    reduction = "mean_gradient_over_8_batches_then_global_l2"
+    if calibration["gradient_reduction"] != reduction:
+        raise ValueError("A5 resume pairing gradient reduction mismatch")
+    batches = calibration["batches"]
+    if not isinstance(batches, list) or len(batches) != config.pairing_calibration_batches:
+        raise ValueError("A5 resume pairing preflight requires exactly 8 batch records")
+    training_seed = (manifest.get("provenance") or {}).get("training_seed")
+    if type(training_seed) is not int or training_seed < 0:
+        raise ValueError("A5 resume pairing training seed is invalid")
+
+    def finite_positive(value) -> bool:
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+            and value > 0
+        )
+
+    def sha256_string(value) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    batch_keys = {
+        "seed", "scene", "view_indices", "sigma", "target_lr_dropped",
+        "pair_count", "coverage_min", "coverage", "camera_sha256",
+        "wrong_camera_sha256", "batch_sha256", "flow_gradient_norm",
+        "pairing_gradient_norm",
+    }
+    coverage_keys = {
+        "batch_index", "target_view", "source_view", "coverage", "pair_count",
+    }
+    for index, batch in enumerate(batches):
+        if not isinstance(batch, dict) or set(batch) != batch_keys:
+            raise ValueError("A5 resume pairing preflight batch schema mismatch")
+        if batch["seed"] != training_seed + 6000 + index:
+            raise ValueError("A5 resume pairing preflight seed mismatch")
+        if batch["scene"] not in config.train_scenes:
+            raise ValueError("A5 resume pairing preflight scene mismatch")
+        view_indices = batch["view_indices"]
+        if (
+            not isinstance(view_indices, list)
+            or len(view_indices) != config.views
+            or any(type(value) is not int or value < 0 for value in view_indices)
+            or len(set(view_indices)) != len(view_indices)
+        ):
+            raise ValueError("A5 resume pairing preflight view indices are invalid")
+        sigma = batch["sigma"]
+        if (
+            isinstance(sigma, bool)
+            or not isinstance(sigma, (int, float))
+            or not math.isfinite(sigma)
+            or not 0 <= sigma <= 1
+        ):
+            raise ValueError("A5 resume pairing preflight sigma is invalid")
+        if type(batch["target_lr_dropped"]) is not bool:
+            raise ValueError("A5 resume pairing preflight dropout flag is invalid")
+        if not finite_positive(batch["flow_gradient_norm"]) or not finite_positive(
+            batch["pairing_gradient_norm"]
+        ):
+            raise ValueError("A5 resume pairing per-batch gradient norm is invalid")
+        if not all(sha256_string(batch[name]) for name in (
+            "camera_sha256", "wrong_camera_sha256", "batch_sha256"
+        )):
+            raise ValueError("A5 resume pairing preflight hash is invalid")
+        coverage_rows = batch["coverage"]
+        if not isinstance(coverage_rows, list) or not coverage_rows:
+            raise ValueError("A5 resume pairing coverage records are missing")
+        seen_pairs = set()
+        for row in coverage_rows:
+            if not isinstance(row, dict) or set(row) != coverage_keys:
+                raise ValueError("A5 resume pairing coverage schema mismatch")
+            coverage = row["coverage"]
+            if (
+                isinstance(coverage, bool)
+                or not isinstance(coverage, (int, float))
+                or not math.isfinite(coverage)
+                or not config.pairing_minimum_coverage <= coverage <= 1
+            ):
+                raise ValueError("A5 resume pairing per-pair coverage is invalid")
+            pair_count = row["pair_count"]
+            if type(pair_count) is not int or pair_count < 1:
+                raise ValueError("A5 resume pairing pair count is invalid")
+            identity = (row["batch_index"], row["target_view"], row["source_view"])
+            if (
+                any(type(value) is not int for value in identity)
+                or identity[0] < 0
+                or not 0 <= identity[1] < config.views
+                or not 0 <= identity[2] < config.views
+                or identity[1] == identity[2]
+                or identity in seen_pairs
+            ):
+                raise ValueError("A5 resume pairing coverage identity is invalid")
+            seen_pairs.add(identity)
+        coverage_minimum = min(row["coverage"] for row in coverage_rows)
+        stored_coverage_minimum = batch["coverage_min"]
+        if (
+            isinstance(stored_coverage_minimum, bool)
+            or not isinstance(stored_coverage_minimum, (int, float))
+            or not math.isfinite(stored_coverage_minimum)
+            or stored_coverage_minimum < config.pairing_minimum_coverage
+            or stored_coverage_minimum != coverage_minimum
+        ):
+            raise ValueError("A5 resume pairing coverage minimum mismatch")
+        pair_count = batch["pair_count"]
+        if type(pair_count) is not int or pair_count != sum(
+            row["pair_count"] for row in coverage_rows
+        ):
+            raise ValueError("A5 resume pairing total pair count mismatch")
+
+    norm_names = (
+        "flow_gradient_norm", "pairing_gradient_norm",
+        "flow_batch_gradient_norm_mean", "pairing_batch_gradient_norm_mean",
+    )
+    if any(not finite_positive(calibration[name]) for name in norm_names):
+        raise ValueError("A5 resume pairing reduced or per-batch gradient norm is invalid")
+    expected_flow_mean = float(np.mean([
+        batch["flow_gradient_norm"] for batch in batches
+    ]))
+    expected_pairing_mean = float(np.mean([
+        batch["pairing_gradient_norm"] for batch in batches
+    ]))
+    if not math.isclose(calibration["flow_batch_gradient_norm_mean"], expected_flow_mean):
+        raise ValueError("A5 resume flow per-batch gradient norm mean mismatch")
+    if not math.isclose(
+        calibration["pairing_batch_gradient_norm_mean"], expected_pairing_mean
+    ):
+        raise ValueError("A5 resume pairing per-batch gradient norm mean mismatch")
+    raw_weight = calibration["raw_weight"]
+    calibrated_weight = calibration["weight"]
+    if (
+        isinstance(raw_weight, bool)
+        or not isinstance(raw_weight, (int, float))
+        or not math.isfinite(raw_weight)
+        or isinstance(calibrated_weight, bool)
+        or not isinstance(calibrated_weight, (int, float))
+        or not math.isfinite(calibrated_weight)
+    ):
+        raise ValueError("A5 resume raw or clipped weight is invalid")
+    expected_raw = (
+        config.pairing_target_gradient_ratio
+        * calibration["flow_gradient_norm"]
+        / calibration["pairing_gradient_norm"]
+    )
+    if not math.isclose(raw_weight, expected_raw):
+        raise ValueError("A5 resume raw pairing weight mismatch")
+    expected_clipped = float(np.clip(
+        raw_weight, config.pairing_weight_min, config.pairing_weight_max
+    ))
+    if calibrated_weight != expected_clipped:
+        raise ValueError("A5 resume clipped weight mismatch")
+    if calibrated_weight != weight:
         raise ValueError("A5 resume preflight weight mismatch")
     state_weight = ((checkpoint.get("training_state") or {}).get("pairing_weight"))
     if state_weight != weight:
@@ -1374,7 +1536,6 @@ def _train(args, config: Stage3Config) -> None:
         resume_checkpoint, init_checkpoint, init_reset_fusion
     )
     _validate_runtime_inputs(args, checkpoint=parent_checkpoint)
-    _seed_all(args.seed)
     output = Path(args.output_dir).resolve()
     start_step, rows = 1, []
     resume_payload = None
@@ -1410,6 +1571,7 @@ def _train(args, config: Stage3Config) -> None:
         start_step = resume_step + 1
         if start_step > config.steps:
             raise ValueError("resume checkpoint already reached configured steps")
+    _seed_all(args.seed)
     runtime = load_runtime(
         config,
         model_dir=args.model_dir,
