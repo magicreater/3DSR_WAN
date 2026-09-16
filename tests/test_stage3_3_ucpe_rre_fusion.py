@@ -191,6 +191,7 @@ def test_run_stops_after_failed_a5_pilot_without_replication(driver, tmp_path, m
     monkeypatch.setattr(driver, "prepare", lambda _args: calls.append("prepare"))
     monkeypatch.setattr(driver, "cpu_tests", lambda _args: calls.append("cpu"))
     monkeypatch.setattr(driver, "smoke", lambda _args: calls.append("smoke"))
+    monkeypatch.setattr(driver, "a5_probe_coverage", lambda _args: calls.append("a5_preflight"))
     monkeypatch.setattr(
         driver, "analyze_cell",
         lambda _args, cell: calls.append(cell.name) or {"pass": False},
@@ -202,7 +203,7 @@ def test_run_stops_after_failed_a5_pilot_without_replication(driver, tmp_path, m
 
     result = driver.run(args)
 
-    assert calls == ["prepare", "cpu", "smoke", "h0", "a4_pilot", "a5_pilot"]
+    assert calls == ["prepare", "cpu", "smoke", "h0", "a4_pilot", "a5_preflight", "a5_pilot"]
     assert result["verdict"] == "HOLD"
     assert result["STAGE4_READY"] is False
 
@@ -222,3 +223,27 @@ def test_run_requires_fresh_a3_1000_after_h0_screen(driver, tmp_path, monkeypatc
     result = driver.run(args)
     assert calls == ["h0", "a3_pilot"]
     assert result["verdict"] == "HOLD"
+
+
+def test_a5_probe_coverage_failure_stops_before_training(driver, tmp_path, monkeypatch):
+    args = SimpleNamespace(campaign_root=tmp_path)
+    calls = []
+    monkeypatch.setattr(driver, "prepare", lambda _args: None)
+    monkeypatch.setattr(driver, "cpu_tests", lambda _args: None)
+    monkeypatch.setattr(driver, "smoke", lambda _args: None)
+
+    def analyze(_args, cell):
+        calls.append(cell.name)
+        return {"pass": False}
+
+    monkeypatch.setattr(driver, "analyze_cell", analyze)
+    monkeypatch.setattr(
+        driver, "a5_probe_coverage",
+        lambda _args: (_ for _ in ()).throw(
+            ValueError("A5 four-probe coverage preflight failed: chair:033")
+        ),
+    )
+    result = driver.run(args)
+    assert calls == ["h0", "a4_pilot"]
+    assert result["verdict"] == "HOLD"
+    assert driver.read_json(tmp_path / "analysis" / "a5_preflight_hold.json")["verdict"] == "HOLD"

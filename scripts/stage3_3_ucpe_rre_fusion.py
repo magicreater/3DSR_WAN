@@ -263,6 +263,11 @@ def prepare(args) -> dict:
             "repository": "https://github.com/chengzhag/UCPE",
             "source_commit": UCPE_SOURCE_COMMIT,
             "paper": "https://arxiv.org/abs/2512.07237",
+            "weight_source": (
+                "https://monashuni-my.sharepoint.com/:f:/g/personal/"
+                "cheng_zhang_monash_edu/IgCoTNrYOJRJRKtk5A6I1yiCAR9c64-BOrsId5GYsUxE9y4"
+                "?e=hD26qU"
+            ),
             "converter_version": 1,
             "official_weight": official_weight,
             "experiment_scope": "pinhole project-specific A4/A5; no pretrained UCPE injection",
@@ -453,10 +458,19 @@ def _runtime_args(args) -> list[str]:
     return values
 
 
-def _run_logged(command: list[str], *, args, name: str, append: bool = False) -> None:
+def _run_logged(command: list[str], *, args, name: str) -> None:
     gpu = _gpu_record(args.gpu)
+    control = args.campaign_root / "control"
+    if (control / f"{name}.json").exists():
+        previous = read_json(control / f"{name}.json")
+        if previous.get("exit_code") == 0:
+            raise RuntimeError(f"completed command record already exists: {name}")
+        attempt = 2
+        while (control / f"{name}_attempt{attempt}.json").exists():
+            attempt += 1
+        name = f"{name}_attempt{attempt}"
     log = args.campaign_root / "logs" / f"{name}.log"
-    record = args.campaign_root / "control" / f"{name}.json"
+    record = control / f"{name}.json"
     log.parent.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     environment.update({
@@ -464,7 +478,7 @@ def _run_logged(command: list[str], *, args, name: str, append: bool = False) ->
         "PYTHONPATH": str(args.repo_root / "src"),
         "PYTHONUNBUFFERED": "1",
     })
-    with log.open("a" if append else "w", encoding="utf-8") as stream:
+    with log.open("x", encoding="utf-8") as stream:
         stream.write(shlex.join(command) + "\n")
         stream.flush()
         completed = subprocess.run(
@@ -474,15 +488,7 @@ def _run_logged(command: list[str], *, args, name: str, append: bool = False) ->
     payload = {"command": command, "gpu": gpu, "exit_code": completed.returncode}
     payload["log"] = str(log.resolve())
     payload["log_sha256"] = sha256_file(log)
-    if record.exists() and append:
-        # The resumed checkpoint is fixed by this command name, so a second
-        # attempt may replace only an unsuccessful command record.
-        previous = read_json(record)
-        if previous.get("exit_code") == 0:
-            raise RuntimeError(f"already completed command record: {record}")
-        record.write_text(_json_text(payload), encoding="utf-8")
-    else:
-        write_frozen_json(record, payload)
+    write_frozen_json(record, payload)
     if completed.returncode:
         raise subprocess.CalledProcessError(completed.returncode, command)
 
@@ -544,7 +550,6 @@ def train_cell(args, cell: Cell) -> Path:
     _run_logged(
         command, args=args,
         name=f"{cell.name}_train_{resume_label}",
-        append=resume is not None,
     )
     if not _complete_training(output, config.steps):
         raise RuntimeError(f"training cell did not complete exactly {config.steps} steps")
@@ -669,9 +674,16 @@ def _integrity(args, cell: Cell) -> dict:
             ),
             "seen_manifest_hash": summary.get("seen_manifest_sha256") == sha256_file(seen_manifest),
             "command_records": bool(control_records) and all(
-                record.get("exit_code") == 0
-                and Path(record.get("log", "")).is_file()
+                Path(record.get("log", "")).is_file()
                 and record.get("log_sha256") == sha256_file(Path(record["log"]))
+                for record in control_records
+            ) and any(
+                record.get("exit_code") == 0
+                and "seen-eval" in record.get("command", [])
+                for record in control_records
+            ) and any(
+                record.get("exit_code") == 0
+                and "train" in record.get("command", [])
                 for record in control_records
             ),
         })
@@ -939,6 +951,98 @@ def smoke(args) -> dict:
     return payload
 
 
+def a5_probe_coverage(args) -> dict:
+    """Fail closed on every directed pair of each frozen probe before A5 trains."""
+    target = args.campaign_root / "preflight" / "a5_four_probe_coverage.json"
+    if target.is_file():
+        payload = read_json(target)
+        if not payload.get("pass"):
+            raise ValueError("A5 four-probe coverage preflight failed")
+        return payload
+    prepare(args)
+    _gpu_record(args.gpu)
+    import stage3_experiment as stage3
+
+    config = load_stage3_config(_config_path(args, FIXED_CELLS["a5_pilot"]))
+    runtime = stage3.load_runtime(
+        config,
+        model_dir=args.model_dir,
+        lq_source=args.lq_source,
+        lq_checkpoint=args.lq_checkpoint,
+        bridge_checkpoint=args.bridge_checkpoint,
+        stage3_checkpoint=args.phase_c_checkpoint,
+        model_only_initialization=True,
+        reset_initialization_fusion=True,
+        device="cuda",
+    )
+    runtime.module.eval()
+    groups = {group["id"]: group for group in read_json(args.seen_manifest)["groups"]}
+    results = []
+    try:
+        with torch.no_grad():
+            for group_id in PROBE_IDS:
+                group = groups[group_id]
+                _, hr, lr, camera = stage3._load_indices(
+                    args.dataset_root, group["scene"], "train", group["indices"],
+                    config, runtime.device,
+                )
+                clean = runtime.vae.encode_multiview(hr)
+                wrong = stage3.derange_auxiliary_fusion_camera(
+                    camera, torch.Generator().manual_seed(330300 + group["anchor"])
+                )
+                try:
+                    _, pairing = runtime.module.prepare_multiview(
+                        lr, camera, tuple(clean.shape[2:]),
+                        (config.image_size, config.image_size),
+                        pairing_camera=wrong,
+                        pairing_minimum_coverage=config.pairing_minimum_coverage,
+                    )
+                except ValueError as exc:
+                    if "pairing coverage failed" not in str(exc):
+                        raise
+                    raise ValueError(
+                        f"A5 four-probe coverage preflight failed: {group_id}: {exc}"
+                    ) from exc
+                rows = [
+                    {
+                        "target_view": int(row["target_view"]),
+                        "source_view": int(row["source_view"]),
+                        "coverage": float(row["coverage"]),
+                        "pair_count": int(row["target_patches"].numel()),
+                    }
+                    for row in pairing["pairs"]
+                ]
+                expected = {
+                    (target_view, source_view)
+                    for target_view in range(config.views)
+                    for source_view in range(config.views)
+                    if target_view != source_view
+                }
+                identities = [(row["target_view"], row["source_view"]) for row in rows]
+                if (
+                    len(rows) != config.views * (config.views - 1)
+                    or len(set(identities)) != len(rows)
+                    or set(identities) != expected
+                    or any(row["coverage"] < config.pairing_minimum_coverage for row in rows)
+                ):
+                    raise ValueError(f"A5 four-probe coverage preflight failed: {group_id}")
+                results.append({"group_id": group_id, "pairs": rows})
+                del hr, lr, camera, clean, pairing
+    finally:
+        del runtime
+        gc.collect()
+        torch.cuda.empty_cache()
+    payload = {
+        "pass": len(results) == len(PROBE_IDS),
+        "probe_ids": list(PROBE_IDS),
+        "parent_checkpoint_sha256": PHASE_C_CHECKPOINT_SHA256,
+        "minimum_coverage": config.pairing_minimum_coverage,
+        "results": results,
+    }
+    write_frozen_json(target, payload)
+    return payload
+
+
 def cpu_tests(args) -> dict:
     target = args.campaign_root / "preflight" / "cpu_tests.json"
     if target.is_file():
@@ -1031,7 +1135,16 @@ def run(args) -> dict:
         if not pilot["pass"]:
             winner = FIXED_CELLS["a5_pilot"]
             try:
+                a5_probe_coverage(args)
                 pilot = analyze_cell(args, winner)
+            except ValueError as exc:
+                if "A5 four-probe coverage preflight failed" not in str(exc):
+                    raise
+                write_frozen_json(
+                    args.campaign_root / "analysis" / "a5_preflight_hold.json",
+                    {"verdict": "HOLD", "reason": str(exc)},
+                )
+                return _write_machine_verdict(args, status="HOLD", completed=completed)
             except subprocess.CalledProcessError as exc:
                 log = args.campaign_root / "logs" / "a5_pilot_train_initial.log"
                 text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
@@ -1099,7 +1212,7 @@ def build_parser() -> argparse.ArgumentParser:
     phase_c = original / "artifacts" / "stage3_2_camera_causality_20260913" / "phase_c"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=(
-        "prepare", "cpu-tests", "smoke", "train", "evaluate", "analyze", "run", "status",
+        "prepare", "cpu-tests", "smoke", "a5-preflight", "train", "evaluate", "analyze", "run", "status",
     ))
     parser.add_argument("--cell", choices=tuple(FIXED_CELLS))
     parser.add_argument("--repo-root", type=Path, default=root)
@@ -1138,6 +1251,8 @@ def main(argv: list[str] | None = None) -> None:
         result = cpu_tests(args)
     elif args.command == "smoke":
         result = smoke(args)
+    elif args.command == "a5-preflight":
+        result = a5_probe_coverage(args)
     elif args.command in {"train", "evaluate", "analyze"}:
         if args.cell is None:
             raise ValueError(f"{args.command} requires --cell")
