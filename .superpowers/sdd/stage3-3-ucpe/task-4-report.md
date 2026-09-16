@@ -108,3 +108,43 @@ TDD evidence for this round:
 - `tests/test_stage3_pairing.py` -> `45 passed`.
 - All Stage 3-focused tests plus LR fusion, FullRRE, and UCPE camera contracts -> `181 passed in 4.04s` before the final verification rerun.
 - A direct meta-schema optimizer/SigmaCycle trial reported `meta True` and unchanged CPU RNG.
+
+## Review fix round 5 (final)
+
+Preserved the uncommitted round-4 work and completed the final schema-hardening
+findings on top of `1ac65a1`:
+
+- AdamW format-v2 resume prevalidation now requires exactly one canonical
+  parameter group, the exact ordered parameter-id list and state-id set, exact
+  group keys, exact hyperparameter types/values (including finite floats), and
+  equality to the optimizer built from the declared Stage 3 configuration.
+- Every AdamW parameter state now has the exact non-AMSGrad key set, a plain
+  CPU `float32` scalar step equal to the checkpoint step, and plain finite CPU
+  moment tensors with the exact parameter shape and dtype. String/mismatched
+  learning rates, incomplete state, unexpected AMSGrad state, tensor
+  subclasses, integer/wrong steps, nonfinite values, and wrong shapes fail
+  before runtime construction or RNG restoration.
+- SigmaCycle prevalidation now enforces exact scalar and tensor types, positive
+  finite configuration values equal to the declared sampling config, the fixed
+  balanced strategy, plain CPU generator/order tensors, an exact permutation,
+  and strict position/cycle ranges. Bool, float, integer-type, or tensor-subclass
+  masquerades are rejected before restore.
+- Calibration coverage is independently validated both while constructing each
+  preflight batch and immediately before opening the immutable artifact. Every
+  batch must contain exactly `V*(V-1)` unique directed non-self rows, exactly the
+  Cartesian identity set, exact `coverage == pair_count / target_patch_count`,
+  the configured minimum coverage, and exact aggregate count/minimum fields.
+  Invalid calibration leaves no artifact behind.
+
+Final-round TDD evidence:
+
+- The inherited focused file first passed (`55 passed`), establishing the
+  starting state without discarding the partial changes.
+- New exact-schema and pre-write coverage tests then produced the expected
+  `12 failed, 55 deselected`; a second edge-case RED run produced `2 failed,
+  67 deselected` for optimizer-step equality and malformed identity handling.
+- After the minimal fixes, the pairing tests passed (`69 passed` as part of the
+  final focused run), and the complete requested Stage 3/fusion/FullRRE/UCPE
+  focused set passed: `211 passed in 4.51s`.
+- `python -m compileall -q src scripts tests` and `git diff --check` passed;
+  Git emitted only informational LF-to-CRLF warnings.

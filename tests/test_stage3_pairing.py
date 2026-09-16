@@ -109,6 +109,10 @@ def valid_resume_payload(runner, config, *, step=1):
     optimizer = torch.optim.AdamW(
         module.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
+    for parameter in module.parameters():
+        parameter.grad = torch.zeros_like(parameter)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
     cuda_generator_state = (
         torch.Generator(device="cuda").get_state()
         if torch.cuda.is_available()
@@ -170,6 +174,22 @@ def truncate_expected_and_coverage(payload):
     batch["valid_pair_identities"].pop()
     batch["coverage"].pop()
     batch["pair_count"] -= 1
+
+
+def calibration_coverage_rows():
+    return [
+        {
+            "batch_index": 0,
+            "target_view": target,
+            "source_view": source,
+            "coverage": 0.25,
+            "pair_count": 1,
+            "target_patch_count": 4,
+        }
+        for target in range(3)
+        for source in range(3)
+        if target != source
+    ]
 
 
 def test_a5_is_explicit_and_uses_the_fixed_pairing_protocol():
@@ -640,6 +660,12 @@ def test_a5_resume_rejects_truncated_legacy_mean_of_norms_artifact(runner, tmp_p
         ("bad_numpy_bit_generator", "NumPy RNG"),
         ("empty_optimizer_state", "optimizer"),
         ("empty_sigma_cycle_state", "sigma cycle"),
+        ("optimizer_string_lr", "optimizer"),
+        ("optimizer_mismatched_lr", "optimizer"),
+        ("optimizer_wrong_moment_shape", "optimizer"),
+        ("optimizer_nonfinite_moment", "optimizer"),
+        ("sigma_float_steps", "sigma cycle"),
+        ("sigma_bool_position", "sigma cycle"),
         ("config_mismatch", "config mismatch"),
         ("adapter_architecture", "fusion architecture"),
         ("nonfinite_adapter", "nonfinite"),
@@ -670,6 +696,20 @@ def test_failed_resume_checkpoint_prevalidation_preserves_every_rng(
         payload["training_state"]["optimizer"] = {}
     elif defect == "empty_sigma_cycle_state":
         payload["training_state"]["sigma_cycle"] = {}
+    elif defect == "optimizer_string_lr":
+        payload["training_state"]["optimizer"]["param_groups"][0]["lr"] = "oops"
+    elif defect == "optimizer_mismatched_lr":
+        payload["training_state"]["optimizer"]["param_groups"][0]["lr"] *= 2
+    elif defect == "optimizer_wrong_moment_shape":
+        first = next(iter(payload["training_state"]["optimizer"]["state"].values()))
+        first["exp_avg"] = torch.zeros(1)
+    elif defect == "optimizer_nonfinite_moment":
+        first = next(iter(payload["training_state"]["optimizer"]["state"].values()))
+        first["exp_avg"].flatten()[0] = float("nan")
+    elif defect == "sigma_float_steps":
+        payload["training_state"]["sigma_cycle"]["steps"] = 50.0
+    elif defect == "sigma_bool_position":
+        payload["training_state"]["sigma_cycle"]["position"] = True
     elif defect == "config_mismatch":
         payload["config"]["learning_rate"] *= 2
     elif defect == "adapter_architecture":
@@ -710,6 +750,70 @@ def test_failed_resume_checkpoint_prevalidation_preserves_every_rng(
         runner.torch.equal(after, before)
         for after, before in zip(runner.torch.cuda.get_rng_state_all(), cuda_before)
     )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "integer_lr_equal_to_float_config",
+        "missing_parameter_state",
+        "unexpected_amsgrad_moment",
+        "parameter_step_tensor",
+        "integer_step_tensor",
+        "wrong_finite_step",
+        "parameter_moment_tensor",
+    ],
+)
+def test_adamw_v2_resume_schema_requires_exact_runtime_types_and_state(
+    runner, defect
+):
+    config = a5_config(learning_rate=1.0, weight_decay=1.0)
+    module, payload = valid_resume_payload(runner, config)
+    optimizer = payload["training_state"]["optimizer"]
+    first_id = next(iter(optimizer["state"]))
+    first_state = optimizer["state"][first_id]
+    if defect == "integer_lr_equal_to_float_config":
+        optimizer["param_groups"][0]["lr"] = 1
+    elif defect == "missing_parameter_state":
+        optimizer["state"].pop(first_id)
+    elif defect == "unexpected_amsgrad_moment":
+        first_state["max_exp_avg_sq"] = first_state["exp_avg_sq"].clone()
+    elif defect == "parameter_step_tensor":
+        first_state["step"] = torch.nn.Parameter(first_state["step"].clone())
+    elif defect == "integer_step_tensor":
+        first_state["step"] = first_state["step"].to(torch.int64)
+    elif defect == "wrong_finite_step":
+        first_state["step"] = first_state["step"] + 1
+    else:
+        first_state["exp_avg"] = torch.nn.Parameter(first_state["exp_avg"].clone())
+
+    with pytest.raises(ValueError, match="optimizer"):
+        runner._validate_resume_optimizer_sigma(
+            payload["training_state"], module, config
+        )
+
+
+@pytest.mark.parametrize(
+    "defect", ["integer_shift_equal_to_float_config", "tensor_subclass_order"]
+)
+def test_sigma_cycle_v2_resume_schema_requires_exact_scalar_and_tensor_types(
+    runner, defect
+):
+    config = a5_config(sampling_shift=5.0)
+    module, payload = valid_resume_payload(runner, config)
+    sigma = payload["training_state"]["sigma_cycle"]
+    if defect == "integer_shift_equal_to_float_config":
+        sigma["shift"] = 5
+    else:
+        class TensorSubclass(torch.Tensor):
+            pass
+
+        sigma["order"] = sigma["order"].as_subclass(TensorSubclass)
+
+    with pytest.raises(ValueError, match="sigma cycle"):
+        runner._validate_resume_optimizer_sigma(
+            payload["training_state"], module, config
+        )
 
 
 def test_resume_schema_factory_is_meta_only_and_preserves_global_rng(runner):
@@ -778,14 +882,8 @@ def test_failed_a5_resume_integrity_does_not_mutate_rng(runner, tmp_path, monkey
 
 
 def test_pairing_preflight_is_immutable_and_manifest_binds_its_hash(runner, tmp_path):
-    calibration = {
-        "batches": [{"seed": 6000, "coverage_min": 0.2}],
-        "flow_gradient_norm_mean": 2.0,
-        "pairing_gradient_norm_mean": 1.0,
-        "raw_weight": 0.5,
-        "weight": 0.5,
-    }
     config = a5_config()
+    calibration = valid_preflight_payload(config)["calibration"]
     section = runner.persist_pairing_preflight(tmp_path, config, calibration)
     artifact = tmp_path / "pairing_preflight.json"
     payload = runner.json.loads(artifact.read_text())
@@ -800,6 +898,63 @@ def test_pairing_preflight_is_immutable_and_manifest_binds_its_hash(runner, tmp_
     }
     with pytest.raises(FileExistsError):
         runner.persist_pairing_preflight(tmp_path, config, calibration)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "duplicate", "missing", "wrong_identity", "unhashable_identity",
+        "perturbed_coverage",
+    ],
+)
+def test_pairing_preflight_rejects_bad_cartesian_coverage_before_writing(
+    runner, tmp_path, defect
+):
+    config = a5_config()
+    calibration = valid_preflight_payload(config)["calibration"]
+    rows = calibration["batches"][0]["coverage"]
+    if defect == "duplicate":
+        rows[-1] = dict(rows[0])
+    elif defect == "missing":
+        rows.pop()
+    elif defect == "wrong_identity":
+        rows[-1]["target_view"] = rows[-1]["source_view"]
+    elif defect == "unhashable_identity":
+        calibration["batches"][0]["valid_pair_identities"][0]["target_view"] = [0]
+    else:
+        rows[0]["coverage"] += 1e-11
+
+    with pytest.raises(ValueError, match="calibration coverage"):
+        runner.persist_pairing_preflight(tmp_path, config, calibration)
+    assert not (tmp_path / "pairing_preflight.json").exists()
+
+
+def test_calibration_coverage_requires_the_complete_directed_cartesian_set(runner):
+    assert runner._validate_calibration_coverage(
+        calibration_coverage_rows(), view_count=3, target_patch_count=4
+    ) == [
+        {"batch_index": 0, "target_view": 0, "source_view": 1},
+        {"batch_index": 0, "target_view": 0, "source_view": 2},
+        {"batch_index": 0, "target_view": 1, "source_view": 0},
+        {"batch_index": 0, "target_view": 1, "source_view": 2},
+        {"batch_index": 0, "target_view": 2, "source_view": 0},
+        {"batch_index": 0, "target_view": 2, "source_view": 1},
+    ]
+
+
+@pytest.mark.parametrize("defect", ["duplicate", "missing", "perturbed_coverage"])
+def test_calibration_coverage_rejects_incomplete_or_inexact_rows(runner, defect):
+    rows = calibration_coverage_rows()
+    if defect == "duplicate":
+        rows.append(dict(rows[0]))
+    elif defect == "missing":
+        rows.pop()
+    else:
+        rows[0]["coverage"] += 1e-11
+    with pytest.raises(ValueError, match="calibration coverage"):
+        runner._validate_calibration_coverage(
+            rows, view_count=3, target_patch_count=4
+        )
 
 
 def test_a5_preflight_uses_eight_private_seeds_without_mutating_parameters(

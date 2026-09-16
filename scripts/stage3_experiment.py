@@ -1304,6 +1304,72 @@ def validate_pairing_resume(manifest: dict, checkpoint: dict, config: Stage3Conf
 
 def persist_pairing_preflight(output: Path, config: Stage3Config, calibration: dict) -> dict:
     """Persist one immutable A5 calibration artifact and return its manifest section."""
+    batches = calibration.get("batches") if isinstance(calibration, dict) else None
+    if (
+        not isinstance(batches, list)
+        or len(batches) != config.pairing_calibration_batches
+    ):
+        raise ValueError("A5 calibration coverage requires exactly 8 batches")
+    expected_identity_keys = {"batch_index", "target_view", "source_view"}
+    for batch in batches:
+        if not isinstance(batch, dict):
+            raise ValueError("A5 calibration coverage batch is malformed")
+        view_count = batch.get("view_count")
+        target_patch_count = batch.get("target_patch_count")
+        if view_count != config.views:
+            raise ValueError("A5 calibration coverage has an invalid view count")
+        expected_identities = _validate_calibration_coverage(
+            batch.get("coverage"),
+            view_count=view_count,
+            target_patch_count=target_patch_count,
+        )
+        identities = batch.get("valid_pair_identities")
+        if (
+            not isinstance(identities, list)
+            or len(identities) != len(expected_identities)
+            or any(
+                not isinstance(row, dict) or set(row) != expected_identity_keys
+                for row in identities
+            )
+        ):
+            raise ValueError("A5 calibration coverage identities are malformed")
+        if any(
+            any(type(row[name]) is not int for name in expected_identity_keys)
+            or row["batch_index"] != 0
+            or not 0 <= row["target_view"] < view_count
+            or not 0 <= row["source_view"] < view_count
+            or row["target_view"] == row["source_view"]
+            for row in identities
+        ):
+            raise ValueError("A5 calibration coverage identities are malformed")
+        identity_tuples = [
+            (row["batch_index"], row["target_view"], row["source_view"])
+            for row in identities
+        ]
+        expected_tuples = {
+            (row["batch_index"], row["target_view"], row["source_view"])
+            for row in expected_identities
+        }
+        if (
+            len(set(identity_tuples)) != len(identity_tuples)
+            or set(identity_tuples) != expected_tuples
+        ):
+            raise ValueError("A5 calibration coverage identities are incomplete")
+        coverage_rows = batch["coverage"]
+        if any(
+            row["coverage"] < config.pairing_minimum_coverage
+            for row in coverage_rows
+        ):
+            raise ValueError("A5 calibration coverage is below the required minimum")
+        if (
+            type(batch.get("pair_count")) is not int
+            or batch["pair_count"] != sum(row["pair_count"] for row in coverage_rows)
+            or isinstance(batch.get("coverage_min"), bool)
+            or not isinstance(batch.get("coverage_min"), (int, float))
+            or not math.isfinite(batch["coverage_min"])
+            or batch["coverage_min"] != min(row["coverage"] for row in coverage_rows)
+        ):
+            raise ValueError("A5 calibration coverage aggregate is malformed")
     path = Path(output).resolve() / "pairing_preflight.json"
     payload = {"protocol": config.pairing_protocol, "calibration": calibration}
     with path.open("x", encoding="utf-8") as stream:
@@ -1316,6 +1382,68 @@ def persist_pairing_preflight(output: Path, config: Stage3Config, calibration: d
         "preflight": str(path),
         "preflight_sha256": _sha256(path),
     }
+
+
+def _validate_calibration_coverage(
+    coverage_rows: list[dict], *, view_count: int, target_patch_count: int
+) -> list[dict]:
+    """Validate one pinhole batch's complete directed non-self pair coverage."""
+    if type(view_count) is not int or view_count < 2:
+        raise ValueError("A5 calibration coverage has an invalid view count")
+    if type(target_patch_count) is not int or target_patch_count <= 0:
+        raise ValueError("A5 calibration coverage has an invalid target patch count")
+    expected = [
+        {"batch_index": 0, "target_view": target, "source_view": source}
+        for target in range(view_count)
+        for source in range(view_count)
+        if target != source
+    ]
+    if not isinstance(coverage_rows, list) or len(coverage_rows) != len(expected):
+        raise ValueError("A5 calibration coverage is not the complete directed pair set")
+    identities = []
+    for row in coverage_rows:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {
+                "batch_index", "target_view", "source_view", "coverage",
+                "pair_count", "target_patch_count",
+            }
+        ):
+            raise ValueError("A5 calibration coverage row is malformed")
+        identity = (
+            row.get("batch_index"), row.get("target_view"), row.get("source_view")
+        )
+        if (
+            any(type(value) is not int for value in identity)
+            or identity[0] != 0
+            or not 0 <= identity[1] < view_count
+            or not 0 <= identity[2] < view_count
+            or identity[1] == identity[2]
+        ):
+            raise ValueError("A5 calibration coverage identity is malformed")
+        pair_count = row.get("pair_count")
+        row_patch_count = row.get("target_patch_count")
+        coverage = row.get("coverage")
+        if (
+            type(pair_count) is not int
+            or pair_count <= 0
+            or pair_count > target_patch_count
+            or type(row_patch_count) is not int
+            or row_patch_count != target_patch_count
+            or isinstance(coverage, bool)
+            or not isinstance(coverage, (int, float))
+            or not math.isfinite(coverage)
+            or coverage != pair_count / target_patch_count
+        ):
+            raise ValueError("A5 calibration coverage value is malformed")
+        identities.append(identity)
+    expected_set = {
+        (row["batch_index"], row["target_view"], row["source_view"])
+        for row in expected
+    }
+    if len(set(identities)) != len(identities) or set(identities) != expected_set:
+        raise ValueError("A5 calibration coverage is not the complete directed pair set")
+    return expected
 
 
 def _calibrate_a5_pairing(runtime: Runtime, args, config: Stage3Config) -> dict:
@@ -1378,21 +1506,11 @@ def _calibrate_a5_pairing(runtime: Runtime, args, config: Stage3Config) -> dict:
         } for row in state["pairs"]]
         if int(state["view_count"]) != config.views:
             raise ValueError("A5 pairing state view count mismatch")
-        expected_pair_identities = [
-            {"batch_index": 0, "target_view": target, "source_view": source}
-            for target in range(config.views)
-            for source in range(config.views)
-            if target != source
-        ]
-        coverage_identities = {
-            (row["batch_index"], row["target_view"], row["source_view"])
-            for row in coverage_rows
-        }
-        if coverage_identities != {
-            (row["batch_index"], row["target_view"], row["source_view"])
-            for row in expected_pair_identities
-        }:
-            raise ValueError("A5 pairing coverage identities are incomplete")
+        expected_pair_identities = _validate_calibration_coverage(
+            coverage_rows,
+            view_count=config.views,
+            target_patch_count=int(state["target_patch_count"]),
+        )
         coverage = [row["coverage"] for row in coverage_rows]
         metadata = {
             "seed": seed,
@@ -1575,14 +1693,103 @@ def _validate_resume_optimizer_sigma(
 ) -> None:
     """Trial optimizer metadata and validate the fixed balanced SigmaCycle schema."""
     optimizer_state = state["optimizer"]
-    if not isinstance(optimizer_state, dict) or not optimizer_state:
+    if (
+        not isinstance(optimizer_state, dict)
+        or set(optimizer_state) != {"state", "param_groups"}
+        or not isinstance(optimizer_state["state"], dict)
+        or not optimizer_state["state"]
+        or not isinstance(optimizer_state["param_groups"], list)
+        or len(optimizer_state["param_groups"]) != 1
+    ):
         raise ValueError("resume checkpoint contains malformed optimizer state")
+    parameters = tuple(
+        parameter for parameter in module.parameters() if parameter.requires_grad
+    )
     try:
         trial_optimizer = torch.optim.AdamW(
-            tuple(parameter for parameter in module.parameters() if parameter.requires_grad),
+            parameters,
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("resume checkpoint contains malformed optimizer state") from exc
+    expected_group = trial_optimizer.state_dict()["param_groups"][0]
+    group = optimizer_state["param_groups"][0]
+    if not isinstance(group, dict) or set(group) != set(expected_group):
+        raise ValueError("resume checkpoint contains malformed optimizer state")
+    expected_ids = list(range(len(parameters)))
+    if (
+        group["params"] != expected_ids
+        or any(type(value) is not int for value in group["params"])
+    ):
+        raise ValueError("resume checkpoint contains malformed optimizer state")
+
+    def valid_hyperparameter(actual, expected) -> bool:
+        if type(actual) is not type(expected):
+            return False
+        if isinstance(expected, tuple):
+            return (
+                len(actual) == len(expected)
+                and all(
+                    valid_hyperparameter(actual_value, expected_value)
+                    for actual_value, expected_value in zip(actual, expected)
+                )
+            )
+        if type(expected) is float:
+            return math.isfinite(actual) and actual == expected
+        return actual == expected
+
+    if any(
+        not valid_hyperparameter(group[key], expected_group[key])
+        for key in expected_group
+        if key != "params"
+    ):
+        raise ValueError("resume checkpoint contains malformed optimizer state")
+    valid_ids = set(expected_ids)
+    if (
+        any(type(parameter_id) is not int for parameter_id in optimizer_state["state"])
+        or set(optimizer_state["state"]) != valid_ids
+    ):
+        raise ValueError("resume checkpoint contains malformed optimizer state")
+    allowed_state_keys = {"step", "exp_avg", "exp_avg_sq"}
+    if group["amsgrad"]:
+        allowed_state_keys.add("max_exp_avg_sq")
+    expected_optimizer_step = state.get("step")
+    if type(expected_optimizer_step) is not int or expected_optimizer_step < 0:
+        raise ValueError("resume checkpoint contains malformed optimizer state")
+    for parameter_id, parameter_state in optimizer_state["state"].items():
+        if (
+            not isinstance(parameter_state, dict)
+            or set(parameter_state) != allowed_state_keys
+        ):
+            raise ValueError("resume checkpoint contains malformed optimizer state")
+        step = parameter_state["step"]
+        if (
+            type(step) is not torch.Tensor
+            or step.ndim != 0
+            or step.device.type != "cpu"
+            or step.dtype != torch.float32
+            or step.requires_grad
+            or not torch.isfinite(step)
+            or float(step) < 0
+            or float(step) != int(float(step))
+            or float(step) != expected_optimizer_step
+        ):
+            raise ValueError("resume checkpoint contains malformed optimizer state")
+        parameter = parameters[parameter_id]
+        for key in set(parameter_state) - {"step"}:
+            moment = parameter_state[key]
+            if (
+                type(moment) is not torch.Tensor
+                or moment.shape != parameter.shape
+                or moment.device.type != "cpu"
+                or moment.dtype != parameter.dtype
+                or not moment.dtype.is_floating_point
+                or moment.requires_grad
+                or not torch.isfinite(moment).all()
+            ):
+                raise ValueError("resume checkpoint contains malformed optimizer state")
+    try:
         trial_optimizer.load_state_dict(optimizer_state)
     except (KeyError, RuntimeError, TypeError, ValueError) as exc:
         raise ValueError("resume checkpoint contains malformed optimizer state") from exc
@@ -1596,10 +1803,30 @@ def _validate_resume_optimizer_sigma(
     expected_length = _balanced_sigma_cycle_length(config)
     order = sigma_state["order"]
     if (
-        not isinstance(order, torch.Tensor)
+        type(sigma_state["steps"]) is not int
+        or sigma_state["steps"] <= 0
+        or sigma_state["steps"] != config.sampling_steps
+        or type(sigma_state["shift"]) is not type(config.sampling_shift)
+        or type(sigma_state["shift"]) not in {int, float}
+        or not math.isfinite(sigma_state["shift"])
+        or sigma_state["shift"] <= 0
+        or sigma_state["shift"] != config.sampling_shift
+        or type(sigma_state["strategy"]) is not str
+        or sigma_state["strategy"] != "balanced"
+        or type(sigma_state["generator_state"]) is not torch.Tensor
+        or sigma_state["generator_state"].dtype != torch.uint8
+        or sigma_state["generator_state"].ndim != 1
+        or sigma_state["generator_state"].numel() == 0
+        or sigma_state["generator_state"].device.type != "cpu"
+        or sigma_state["generator_state"].requires_grad
+        or type(order) is not torch.Tensor
         or order.dtype != torch.int64
+        or order.device.type != "cpu"
+        or order.requires_grad
         or order.shape != (expected_length,)
         or not torch.equal(torch.sort(order).values, torch.arange(expected_length))
+        or type(sigma_state["position"]) is not int
+        or not 0 <= sigma_state["position"] <= expected_length
         or type(sigma_state["cycle"]) is not int
         or sigma_state["cycle"] < 0
     ):
