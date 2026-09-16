@@ -129,8 +129,14 @@ def valid_resume_payload(runner, config, *, step=1):
             "strategy": "balanced",
             "generator_state": torch.Generator().get_state(),
             "order": torch.arange(113),
-            "position": 0,
-            "cycle": 0,
+            "position": (
+                0 if step == 0 else
+                ((step * config.gradient_accumulation - 1) % 113) + 1
+            ),
+            "cycle": (
+                0 if step == 0 else
+                (step * config.gradient_accumulation - 1) // 113
+            ),
         },
         "view_generator_state": torch.Generator().get_state(),
         "noise_generator_state": cuda_generator_state.clone(),
@@ -814,6 +820,40 @@ def test_sigma_cycle_v2_resume_schema_requires_exact_scalar_and_tensor_types(
         runner._validate_resume_optimizer_sigma(
             payload["training_state"], module, config
         )
+
+
+def test_sigma_cycle_resume_state_must_match_consumed_microbatches(runner):
+    config = a5_config(gradient_accumulation=2)
+    module, payload = valid_resume_payload(runner, config, step=1)
+    sigma = payload["training_state"]["sigma_cycle"]
+    sigma["cycle"] = 99
+    sigma["position"] = 0
+
+    with pytest.raises(ValueError, match="sigma cycle"):
+        runner._validate_resume_optimizer_sigma(
+            payload["training_state"], module, config
+        )
+
+
+def test_prevalidate_accepts_legacy_a4_training_state(runner, monkeypatch):
+    config = Stage3Config(
+        arm="A4",
+        fusion_dim=192,
+        fusion_heads=1,
+        epipolar_attention="local_band",
+        allow_self_view_source=False,
+        steps=2,
+    )
+    module, payload = valid_resume_payload(runner, config, step=1)
+    state = payload["training_state"]
+    state["format_version"] = 1
+    state.pop("dropout_generator_state")
+    state.pop("cuda_rng_state_all")
+    state.pop("pairing_generator_state")
+    state.pop("pairing_weight")
+    monkeypatch.setattr(runner, "_checkpoint_validation_module", lambda _config: module)
+
+    runner._prevalidate_resume_payload(payload, config, expected_step=1)
 
 
 def test_resume_schema_factory_is_meta_only_and_preserves_global_rng(runner):

@@ -1831,6 +1831,14 @@ def _validate_resume_optimizer_sigma(
         or sigma_state["cycle"] < 0
     ):
         raise ValueError("resume checkpoint contains malformed sigma cycle state")
+    consumed = state["step"] * config.gradient_accumulation
+    expected_cycle = 0 if consumed == 0 else (consumed - 1) // expected_length
+    expected_position = 0 if consumed == 0 else (consumed - 1) % expected_length + 1
+    if (
+        sigma_state["cycle"] != expected_cycle
+        or sigma_state["position"] != expected_position
+    ):
+        raise ValueError("resume checkpoint contains inconsistent sigma cycle state")
     try:
         # Reuse the real restore method without constructing its scheduler.
         trial_cycle = object.__new__(SigmaCycle)
@@ -1990,7 +1998,7 @@ def _prevalidate_resume_payload(payload: dict, config: Stage3Config, expected_st
         require_pairing_weight=config.pairing_supervision,
         require_cuda=True,
         noise_device="cuda",
-        require_version_two=True,
+        require_version_two=config.pairing_supervision,
     )
     _validate_resume_optimizer_sigma(payload["training_state"], module, config)
 

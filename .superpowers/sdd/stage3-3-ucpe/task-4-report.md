@@ -148,3 +148,18 @@ Final-round TDD evidence:
   focused set passed: `211 passed in 4.51s`.
 - `python -m compileall -q src scripts tests` and `git diff --check` passed;
   Git emitted only informational LF-to-CRLF warnings.
+
+## Controller closeout
+
+The final independent review identified two narrow restore defects after round 5:
+
+- format-v2 training state is now mandatory only for A5 pairing supervision;
+  legacy A0-A4 format-v1 checkpoints retain the documented optional dropout and
+  CUDA RNG behavior;
+- SigmaCycle `cycle` and `position` must exactly match
+  `checkpoint_step * gradient_accumulation`, preventing a well-typed but
+  trajectory-changing scheduler state from resuming.
+
+Regression tests cover a real legacy A4 prevalidation path and an inconsistent
+SigmaCycle state. Server verification passed `105` pairing/runner tests before
+the final focused and repository-wide reruns.
