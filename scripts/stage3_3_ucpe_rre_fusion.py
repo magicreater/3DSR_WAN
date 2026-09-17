@@ -411,7 +411,6 @@ def candidate_gate(
         "target_drop_direction": directional(deltas["target_drop"]["psnr"]),
     }
     for condition in ("shuffle_fusion", "target_drop_shuffle_fusion"):
-        normalized_config = json.loads(json.dumps(config.to_dict()))
         checks.update({
             f"{condition}_psnr": mean(deltas[condition]["psnr"]) >= 0.05,
             f"{condition}_ssim": mean(deltas[condition]["ssim"]) >= 0.0005,
@@ -701,6 +700,7 @@ def _integrity(args, cell: Cell) -> dict:
         control_records = [
             read_json(path) for path in (args.campaign_root / "control").glob(f"{cell.name}_*.json")
         ]
+        normalized_config = json.loads(json.dumps(config.to_dict()))
         checks.update({
             "training_complete": len(rows) == config.steps and [r.get("step") for r in rows] == list(range(1, config.steps + 1)),
             "evaluation_keys": set(evaluation_index(eval_rows)) == {(g, m) for g in PROBE_IDS for m in MODES},
