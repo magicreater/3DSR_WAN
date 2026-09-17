@@ -26,7 +26,7 @@ def passing_rows(driver):
         "remove": (28.5, 0.94),
         "target_drop": (26.0, 0.90),
         "shuffle_fusion": (29.9, 0.949),
-        "target_drop_shuffle_fusion": (29.8, 0.948),
+        "target_drop_shuffle_fusion": (25.9, 0.899),
         "mispaired_lr": (29.7, 0.947),
         "mispaired_camera": (29.7, 0.947),
         "joint_permute": (30.0, 0.95),
@@ -76,6 +76,19 @@ def test_candidate_gate_does_not_substitute_geometry_for_fusion(driver):
     assert result["pass"] is False
     assert result["checks"]["shuffle_fusion_psnr"] is False
     assert result["deltas"]["shuffle_geometry"]["psnr"]["mean"] > 0
+
+
+def test_target_drop_shuffle_compares_against_target_drop(driver):
+    rows = passing_rows(driver)
+    for row in rows:
+        if row["condition"] == "target_drop_shuffle_fusion":
+            row["psnr"] = 26.0
+            row["ssim"] = 0.90
+    result = driver.candidate_gate(rows, passing_train_rows(), expected_steps=200)
+    assert result["delta_references"]["target_drop_shuffle_fusion"] == "target_drop"
+    assert result["deltas"]["target_drop_shuffle_fusion"]["psnr"]["mean"] == 0
+    assert result["checks"]["target_drop_shuffle_fusion_psnr"] is False
+    assert result["checks"]["target_drop_shuffle_fusion_ssim"] is False
 
 
 def test_candidate_gate_rejects_nonseparating_last_100_steps(driver):

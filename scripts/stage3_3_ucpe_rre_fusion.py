@@ -353,9 +353,11 @@ def evaluation_index(rows: list[dict]) -> dict[tuple[str, str], dict]:
     return index
 
 
-def _degradations(index: dict, condition: str, metric: str) -> list[float]:
+def _degradations(
+    index: dict, condition: str, metric: str, *, baseline: str = "correct"
+) -> list[float]:
     return [
-        float(index[(group, "correct")][metric])
+        float(index[(group, baseline)][metric])
         - float(index[(group, condition)][metric])
         for group in PROBE_IDS
     ]
@@ -386,9 +388,15 @@ def candidate_gate(
     ):
         raise ValueError("last-100 training telemetry is incomplete or nonfinite")
 
+    delta_references = {
+        condition: "target_drop" if condition == "target_drop_shuffle_fusion" else "correct"
+        for condition in MODES if condition != "correct"
+    }
     deltas = {
         condition: {
-            metric: _degradations(index, condition, metric) for metric in METRICS
+            metric: _degradations(
+                index, condition, metric, baseline=delta_references[condition]
+            ) for metric in METRICS
         }
         for condition in MODES if condition != "correct"
     }
@@ -439,6 +447,7 @@ def candidate_gate(
         "pass": all(checks.values()),
         "checks": checks,
         "correct": correct,
+        "delta_references": delta_references,
         "deltas": {
             condition: {
                 metric: {"mean": mean(values), "values": values}
