@@ -714,7 +714,7 @@ def _integrity(args, cell: Cell) -> dict:
             "checkpoint": checkpoint.is_file(),
             "checkpoint_payload": (
                 checkpoint_payload.get("step") == config.steps
-                and checkpoint_payload.get("config") == config.to_dict()
+                and checkpoint_payload.get("config") == normalized_config
             ),
             "paired_protocol": summary.get("inference_seeds") == [INFERENCE_SEED] and summary.get("conditions") == list(MODES),
             "evaluation_checkpoint": summary.get("checkpoint") == str(checkpoint.resolve()),
