@@ -135,8 +135,8 @@ class Stage3Config:
                 raise ValueError("A5 requires pairing_calibration_batches=8")
             if self.pairing_target_gradient_ratio != 0.25:
                 raise ValueError("A5 requires pairing_target_gradient_ratio=0.25")
-            if (self.pairing_weight_min, self.pairing_weight_max) != (0.01, 10.0):
-                raise ValueError("A5 requires pairing weight clip [0.01,10]")
+            if self.pairing_weight_min not in (0.01, 1e-5) or self.pairing_weight_max != 10.0:
+                raise ValueError("A5 requires pairing weight clip [0.01,10] or [1e-5,10]")
         if self.nearest_views < self.views - 1:
             raise ValueError("nearest_views must cover all auxiliary views")
 

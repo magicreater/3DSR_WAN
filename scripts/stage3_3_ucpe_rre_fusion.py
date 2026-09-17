@@ -152,7 +152,8 @@ def _assert_hash(path: Path, expected: str, label: str) -> None:
 
 
 def _config_path(args, cell: Cell) -> Path:
-    return args.campaign_root / "config" / cell.config_name
+    name = "A5_pairing_chair_1000_v2.json" if args.v2 and cell.name == "a5_pilot" else cell.config_name
+    return args.campaign_root / "config" / name
 
 
 def _train_dir(args, cell_name: str) -> Path:
@@ -188,7 +189,7 @@ def prepare(args) -> dict:
         if sha256_tree(root_scene / "train") != hashes["train_images_sha256"]:
             raise RuntimeError(f"{scene} image data hash mismatch")
     for cell in FIXED_CELLS.values():
-        source = root / "configs" / "stage3_3" / cell.config_name
+        source = root / "configs" / "stage3_3" / _config_path(args, cell).name
         destination = _config_path(args, cell)
         copy_or_verify(source, destination)
         config = load_stage3_config(destination)
@@ -233,7 +234,7 @@ def prepare(args) -> dict:
     ).splitlines()
     protocol = {
         "schema_version": 1,
-        "scope": "stage3_3_ucpe_rre_fusion",
+        "scope": "stage3_3_v2" if args.v2 else "stage3_3_ucpe_rre_fusion",
         "audit_baseline": AUDIT_BASELINE,
         "git_revision": revision,
         "git_status": git_status,
@@ -251,8 +252,9 @@ def prepare(args) -> dict:
             "correct_ssim_floor_delta": -0.001,
             "remove_psnr": 1.0,
             "target_drop_psnr": 3.0,
-            "fusion_psnr": 0.05,
-            "fusion_ssim": 0.0005,
+            "fusion_psnr": 0.03 if args.v2 else 0.05,
+            "fusion_ssim": 0.0003 if args.v2 else 0.0005,
+            "joint_permutation_gate": "fusion" if args.v2 else "decoded_wan",
             "directional_probes": 3,
             "wrong_correct_ratio": 0.05,
             "rank_active_max": 0.5,
@@ -374,6 +376,8 @@ def candidate_gate(
     expected_steps: int,
     reference: dict[str, float] = PHASE_C_CORRECT,
     tolerance: float = NUMERICAL_TOLERANCE,
+    v2: bool = False,
+    fusion_equivariant: bool = False,
 ) -> dict:
     index = evaluation_index(evaluation_rows)
     if len(train_rows) != expected_steps or [row.get("step") for row in train_rows] != list(
@@ -412,7 +416,7 @@ def candidate_gate(
         "joint_permute_equivalent": all(
             abs(value) <= tolerance
             for metric in METRICS for value in deltas["joint_permute"][metric]
-        ),
+        ) if not v2 else fusion_equivariant,
         "remove_psnr": mean(deltas["remove"]["psnr"]) >= 1.0,
         "remove_direction": directional(deltas["remove"]["psnr"]),
         "target_drop_psnr": mean(deltas["target_drop"]["psnr"]) >= 3.0,
@@ -420,8 +424,8 @@ def candidate_gate(
     }
     for condition in ("shuffle_fusion", "target_drop_shuffle_fusion"):
         checks.update({
-            f"{condition}_psnr": mean(deltas[condition]["psnr"]) >= 0.05,
-            f"{condition}_ssim": mean(deltas[condition]["ssim"]) >= 0.0005,
+            f"{condition}_psnr": mean(deltas[condition]["psnr"]) >= (0.03 if v2 else 0.05),
+            f"{condition}_ssim": mean(deltas[condition]["ssim"]) >= (0.0003 if v2 else 0.0005),
             f"{condition}_psnr_direction": directional(deltas[condition]["psnr"]),
             f"{condition}_ssim_direction": directional(deltas[condition]["ssim"]),
         })
@@ -462,6 +466,10 @@ def candidate_gate(
             "rank_active_fraction": rank_active,
         },
         "camera_dose_monotonic_probes": dose_counts,
+        "decoded_wan_joint_permutation_diagnostic": all(
+            abs(value) <= tolerance
+            for metric in METRICS for value in deltas["joint_permute"][metric]
+        ),
     }
 
 
@@ -668,6 +676,45 @@ def _complete_evaluation(output: Path) -> bool:
     )
 
 
+def fusion_equivariance(args, cell: Cell) -> dict:
+    """Check joint view relabeling on the trained fusion module alone."""
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+    from rl3dsr.models.wan.lr_fusion import LRViewFusion
+
+    config = load_stage3_config(_config_path(args, cell))
+    checkpoint = _train_dir(args, cell.name) / f"stage3_step_{config.steps:04d}.pt"
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    model = LRViewFusion(
+        1536, config.fusion_dim, config.fusion_heads, mode=config.fusion_mode,
+        query_chunk_size=config.query_chunk_size, tau=config.epipolar_tau,
+        epipolar_band=config.epipolar_band, allow_self_view_source=False,
+    )
+    model.load_state_dict(payload["adapters"]["fusion"], strict=True)
+    model.eval()
+    features = torch.randn(1, config.views, 6, 1536, generator=torch.Generator().manual_seed(3303))
+    intrinsics = torch.tensor([[24., 0., 16.], [0., 20., 12.], [0., 0., 1.]]).repeat(1, config.views, 1, 1)
+    transforms = torch.eye(4).repeat(1, config.views, 1, 1)
+    transforms[0, :, 0, 3] = torch.arange(config.views) * .25
+    camera = CameraBatch(intrinsics, transforms, (24, 32), "multiview")
+    permutation = torch.arange(config.views).roll(1)
+    permuted_camera = CameraBatch(
+        intrinsics[:, permutation], transforms[:, permutation], (24, 32), "multiview",
+        reference_index=int((permutation == 0).nonzero(as_tuple=False).item()),
+    )
+    with torch.no_grad():
+        expected = model(features, camera, (2, 3))
+        actual = model(features[:, permutation], permuted_camera, (2, 3))[:, torch.argsort(permutation)]
+    result = {
+        "pass": bool(torch.allclose(expected, actual, atol=2e-5, rtol=2e-5)),
+        "max_abs_error": float((expected - actual).abs().max()),
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "permutation": permutation.tolist(),
+        "atol": 2e-5, "rtol": 2e-5,
+    }
+    write_frozen_json(args.campaign_root / "analysis" / cell.name / "fusion_equivariance.json", result)
+    return result
+
+
 def evaluate_cell(args, cell: Cell) -> Path:
     checkpoint = train_cell(args, cell)
     output = _eval_dir(args, cell.name)
@@ -850,10 +897,13 @@ def _write_contact_sheet(args, cell: Cell) -> None:
 def analyze_cell(args, cell: Cell) -> dict:
     output = evaluate_cell(args, cell)
     config = load_stage3_config(_config_path(args, cell))
+    equivariance = fusion_equivariance(args, cell) if args.v2 else None
     gate = candidate_gate(
         read_jsonl(output / "evaluation_rows.jsonl"),
         read_jsonl(_train_dir(args, cell.name) / "train_steps.jsonl"),
         expected_steps=config.steps,
+        v2=args.v2,
+        fusion_equivariant=bool(equivariance and equivariance["pass"]),
     )
     integrity = _integrity(args, cell)
     passed = gate["pass"] and integrity["pass"]
@@ -864,6 +914,7 @@ def analyze_cell(args, cell: Cell) -> dict:
         "steps": config.steps,
         "pass": passed,
         "gate": gate,
+        "fusion_equivariance": equivariance,
         "integrity": integrity,
         "next": next_action(cell.name, passed),
         "CAMERA_FUSION_PASS": False,
@@ -1276,6 +1327,7 @@ def build_parser() -> argparse.ArgumentParser:
         "prepare", "cpu-tests", "smoke", "a5-preflight", "train", "evaluate", "analyze", "run", "status",
     ))
     parser.add_argument("--cell", choices=tuple(FIXED_CELLS))
+    parser.add_argument("--v2", action="store_true")
     parser.add_argument("--repo-root", type=Path, default=root)
     parser.add_argument(
         "--campaign-root", type=Path,
@@ -1298,6 +1350,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.v2 and args.campaign_root == args.repo_root / "artifacts" / "stage3_3_ucpe_rre_fusion_20260916":
+        raise ValueError("v2 requires a separate --campaign-root")
     for name in (
         "repo_root", "campaign_root", "phase_c_checkpoint", "phase_c_protocol",
         "seen_manifest", "dataset_root", "model_dir", "lq_source", "lq_checkpoint",

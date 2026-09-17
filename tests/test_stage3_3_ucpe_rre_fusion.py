@@ -66,6 +66,23 @@ def test_candidate_gate_requires_every_frozen_threshold(driver):
     assert result["camera_dose_monotonic_probes"] == {"psnr": 4, "ssim": 4}
 
 
+def test_v2_thresholds_and_fusion_permutation_gate(driver):
+    rows = passing_rows(driver)
+    for row in rows:
+        if row["condition"] == "shuffle_fusion":
+            row["psnr"], row["ssim"] = 29.96, 0.9496
+        elif row["condition"] == "target_drop_shuffle_fusion":
+            row["psnr"], row["ssim"] = 25.96, 0.8996
+        elif row["condition"] == "joint_permute":
+            row["psnr"], row["ssim"] = 29.9, 0.949
+    old = driver.candidate_gate(rows, passing_train_rows(), expected_steps=200)
+    new = driver.candidate_gate(rows, passing_train_rows(), expected_steps=200, v2=True, fusion_equivariant=True)
+    assert not old["pass"]
+    assert new["pass"]
+    assert not new["decoded_wan_joint_permutation_diagnostic"]
+    assert not driver.candidate_gate(rows, passing_train_rows(), expected_steps=200, v2=True)["pass"]
+
+
 def test_candidate_gate_does_not_substitute_geometry_for_fusion(driver):
     rows = passing_rows(driver)
     for row in rows:

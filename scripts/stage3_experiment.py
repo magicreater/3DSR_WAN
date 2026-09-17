@@ -2183,6 +2183,9 @@ def _train(args, config: Stage3Config) -> None:
     pairing_calibration = None
     if config.pairing_supervision and initialization_mode != "resume":
         pairing_calibration = _calibrate_a5_pairing(runtime, args, config)
+        if not math.isclose(pairing_calibration["raw_weight"], pairing_calibration["weight"], rel_tol=1e-9):
+            persist_pairing_preflight(output, config, pairing_calibration)
+            raise ValueError("A5 calibration weight clipped; stopping before training")
     pairing_weight = resolve_pairing_weight(
         config.pairing_supervision,
         initialization_mode,
