@@ -274,7 +274,56 @@ def prepare(args) -> dict:
         },
         "forbidden": ["10000-step training", "Stage 4", "4DSR"],
     }
-    write_frozen_json(args.campaign_root / "protocol.json", protocol)
+    protocol_path = args.campaign_root / "protocol.json"
+    if protocol_path.is_file():
+        original = read_json(protocol_path)
+        if original == protocol:
+            return original
+        previous_source = dict(original.get("source_sha256") or {})
+        current_source = dict(protocol["source_sha256"])
+        driver_key = "scripts/stage3_3_ucpe_rre_fusion.py"
+        previous_driver = previous_source.pop(driver_key, None)
+        current_driver = current_source.pop(driver_key, None)
+        previous_revision = original.get("git_revision")
+        changed = set(subprocess.check_output(
+            ["git", "diff", "--name-only", f"{previous_revision}..{revision}"],
+            cwd=root, text=True,
+        ).splitlines()) if previous_revision and _is_ancestor(root, previous_revision, revision) else set()
+        if (
+            previous_source != current_source
+            or previous_driver is None
+            or current_driver is None
+            or not changed
+            or not changed <= {
+                driver_key, "tests/test_stage3_3_ucpe_rre_fusion.py"
+            }
+            or {
+                key: value for key, value in original.items()
+                if key not in {"git_revision", "git_status", "source_sha256"}
+            } != {
+                key: value for key, value in protocol.items()
+                if key not in {"git_revision", "git_status", "source_sha256"}
+            }
+        ):
+            raise RuntimeError("immutable Stage 3.3 protocol or model-source drift")
+        amendment = {
+            "schema_version": 1,
+            "scope": "analysis_driver_revision",
+            "original_protocol_sha256": sha256_file(protocol_path),
+            "training_revision": previous_revision,
+            "analysis_revision": revision,
+            "changed_paths": sorted(changed),
+            "driver_sha256_before": previous_driver,
+            "driver_sha256_after": current_driver,
+            "model_source_sha256": current_source,
+            "frozen_gates": original["gates"],
+        }
+        write_frozen_json(
+            args.campaign_root / "analysis" / "driver_revision_amendment.json",
+            amendment,
+        )
+        return original
+    write_frozen_json(protocol_path, protocol)
     return protocol
 
 
@@ -494,7 +543,7 @@ def _run_logged(command: list[str], *, args, name: str) -> None:
 
 
 def _complete_training(output: Path, steps: int) -> bool:
-    final = output / f"stage3_step_{steps}.pt"
+    final = output / f"stage3_step_{steps:04d}.pt"
     rows = output / "train_steps.jsonl"
     if not final.is_file() or not rows.is_file():
         return False
@@ -507,7 +556,7 @@ def train_cell(args, cell: Cell) -> Path:
     config_path = _config_path(args, cell)
     config = load_stage3_config(config_path)
     output = _train_dir(args, cell.name)
-    final = output / f"stage3_step_{config.steps}.pt"
+    final = output / f"stage3_step_{config.steps:04d}.pt"
     if _complete_training(output, config.steps):
         return final
     resume = None
@@ -643,7 +692,7 @@ def _integrity(args, cell: Cell) -> dict:
         eval_rows = read_jsonl(eval_dir / "evaluation_rows.jsonl")
         summary = read_json(eval_dir / "evaluation_summary.json")
         manifest = read_json(train_dir / "run_manifest.json")
-        checkpoint = train_dir / f"stage3_step_{config.steps}.pt"
+        checkpoint = train_dir / f"stage3_step_{config.steps:04d}.pt"
         checkpoint_payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
         seen_manifest = seen_manifest_for_cell(args, cell)
         control_records = [

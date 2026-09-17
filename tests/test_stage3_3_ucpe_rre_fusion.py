@@ -144,6 +144,16 @@ def test_all_fixed_templates_are_valid_and_bounded(driver):
         assert config.allow_self_view_source is False
 
 
+def test_complete_training_uses_the_runner_four_digit_checkpoint_name(driver, tmp_path):
+    output = tmp_path / "train"
+    output.mkdir()
+    (output / "stage3_step_0200.pt").write_bytes(b"checkpoint")
+    (output / "train_steps.jsonl").write_text(
+        "".join(driver._json_text({"step": step}).replace("\n", "") + "\n" for step in range(1, 201))
+    )
+    assert driver._complete_training(output, 200)
+
+
 def test_cli_has_no_stage4_or_4dsr_execution_command(driver):
     parser = driver.build_parser()
     command = next(action for action in parser._actions if action.dest == "command")
