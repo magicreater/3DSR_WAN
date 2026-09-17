@@ -318,10 +318,12 @@ def prepare(args) -> dict:
             "model_source_sha256": current_source,
             "frozen_gates": original["gates"],
         }
-        write_frozen_json(
-            args.campaign_root / "analysis" / "driver_revision_amendment.json",
-            amendment,
-        )
+        amendment_path = args.campaign_root / "analysis" / "driver_revision_amendment.json"
+        if amendment_path.is_file() and read_json(amendment_path) != amendment:
+            amendment_path = amendment_path.with_name(
+                f"driver_revision_amendment_{revision[:12]}.json"
+            )
+        write_frozen_json(amendment_path, amendment)
         return original
     write_frozen_json(protocol_path, protocol)
     return protocol
@@ -409,6 +411,7 @@ def candidate_gate(
         "target_drop_direction": directional(deltas["target_drop"]["psnr"]),
     }
     for condition in ("shuffle_fusion", "target_drop_shuffle_fusion"):
+        normalized_config = json.loads(json.dumps(config.to_dict()))
         checks.update({
             f"{condition}_psnr": mean(deltas[condition]["psnr"]) >= 0.05,
             f"{condition}_ssim": mean(deltas[condition]["ssim"]) >= 0.0005,
@@ -705,13 +708,13 @@ def _integrity(args, cell: Cell) -> dict:
             "baseline_rows": len(read_jsonl(eval_dir / "baseline_rows.jsonl")) == 8,
             "diagnostic_rows": len(read_jsonl(eval_dir / "diagnostics.jsonl")) == len(PROBE_IDS) * (len(MODES) - 1),
             "images": len(list((eval_dir / "images").rglob("*.png"))) == 64,
-            "manifest_config": manifest.get("config") == read_json(_config_path(args, cell)),
+            "manifest_config": manifest.get("config") == normalized_config,
             "manifest_seed": manifest.get("provenance", {}).get("training_seed") == cell.seed,
             "manifest_parent": manifest.get("provenance", {}).get("parent_checkpoint_sha256") == PHASE_C_CHECKPOINT_SHA256,
             "checkpoint": checkpoint.is_file(),
             "checkpoint_payload": (
                 checkpoint_payload.get("step") == config.steps
-                and checkpoint_payload.get("config") == read_json(_config_path(args, cell))
+                and checkpoint_payload.get("config") == config.to_dict()
             ),
             "paired_protocol": summary.get("inference_seeds") == [INFERENCE_SEED] and summary.get("conditions") == list(MODES),
             "evaluation_checkpoint": summary.get("checkpoint") == str(checkpoint.resolve()),
