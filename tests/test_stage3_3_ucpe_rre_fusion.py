@@ -46,6 +46,17 @@ def passing_rows(driver):
     return rows
 
 
+def test_dataset_control_uses_explicit_probe_ids(driver):
+    probes = ("counter:000", "counter:069", "counter:139", "counter:209")
+    rows = [{**row, "group_id": probes[driver.PROBE_IDS.index(row["group_id"])]}
+            for row in passing_rows(driver)]
+    result = driver.candidate_gate(
+        rows, passing_train_rows(1000), expected_steps=1000,
+        reference=None, v2=True, fusion_equivariant=True, probe_ids=probes,
+    )
+    assert result["pass"]
+
+
 def passing_train_rows(steps=200):
     return [
         {

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import csv
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -23,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from rl3dsr.data import NeRFSyntheticAdapter, Split
+from rl3dsr.data import MipNeRF360Adapter, NeRFSyntheticAdapter, Split
 from rl3dsr.data.tensor_prep import rgb_images_to_video
 from rl3dsr.models.wan import (
     CameraBatch,
@@ -190,12 +191,28 @@ def _module_grad_norm(module) -> float | None:
 
 
 def _sampling_signature(config: Stage3Config) -> dict:
-    return {
+    signature = {
         "train_scenes": list(config.train_scenes),
         "image_size": config.image_size,
         "scale": config.scale,
         "views": config.views,
     }
+    if config.dataset_kind == "mipnerf360":
+        signature.update(dataset_kind=config.dataset_kind, image_factor=config.image_factor)
+    return signature
+
+
+@lru_cache(maxsize=8)
+def _mip_scene_data(root: Path, factor: int, split: Split):
+    adapter = MipNeRF360Adapter(root, image_factor=factor)
+    return adapter, adapter.index(split)
+
+
+def _scene_data(root: Path, config: Stage3Config, split: Split):
+    if config.dataset_kind == "mipnerf360":
+        return _mip_scene_data(root, config.image_factor, split)
+    adapter = NeRFSyntheticAdapter(root)
+    return adapter, adapter.index(split)
 
 
 def _git_revision() -> str | None:
@@ -444,8 +461,9 @@ def _load_group(
     generator: torch.Generator,
     device: torch.device,
 ):
-    adapter = NeRFSyntheticAdapter(dataset_root / scene)
-    sequence = adapter.index(Split.TRAIN if route == "train" else Split.TEST)
+    adapter, sequence = _scene_data(
+        dataset_root / scene, config, Split.TRAIN if route == "train" else Split.TEST
+    )
     all_camera = _camera(sequence.observations, config.image_size, torch.device("cpu"))
     anchor = int(torch.randint(len(sequence.observations), (), generator=generator))
     indices = sample_view_indices(
@@ -468,8 +486,9 @@ def _load_indices(
 ):
     if len(indices) != config.views or len(set(indices)) != config.views:
         raise ValueError("view indices must contain exactly the configured unique views")
-    adapter = NeRFSyntheticAdapter(dataset_root / scene)
-    sequence = adapter.index(Split.TRAIN if route == "train" else Split.TEST)
+    adapter, sequence = _scene_data(
+        dataset_root / scene, config, Split.TRAIN if route == "train" else Split.TEST
+    )
     if min(indices) < 0 or max(indices) >= len(sequence.observations):
         raise ValueError("view index is outside the selected split")
     observations = tuple(sequence.observations[index] for index in indices)
@@ -489,8 +508,7 @@ def _prepare_seen_manifest(args, config: Stage3Config) -> None:
     datasets = {}
     for scene in config.train_scenes:
         scene_root = args.dataset_root / scene
-        adapter = NeRFSyntheticAdapter(scene_root)
-        sequence = adapter.index(Split.TRAIN)
+        adapter, sequence = _scene_data(scene_root, config, Split.TRAIN)
         camera = _camera(sequence.observations, config.image_size, torch.device("cpu"))
         count = len(sequence.observations)
         probe = set(evenly_spaced_indices(count, 4))
@@ -508,18 +526,27 @@ def _prepare_seen_manifest(args, config: Stage3Config) -> None:
                 subsets["probe"].append(group_id)
             if anchor in intervention:
                 subsets["intervention"].append(group_id)
-        transforms = scene_root / "transforms_train.json"
-        image_root = scene_root / "train"
-        datasets[scene] = {
-            "views": count,
-            "transforms_train_sha256": _sha256(transforms),
-            "train_images_sha256": _sha256_tree(image_root),
-        }
+        if config.dataset_kind == "mipnerf360":
+            image_root = scene_root / ("images" if config.image_factor == 1 else f"images_{config.image_factor}")
+            datasets[scene] = {
+                "views": count,
+                "cameras_bin_sha256": _sha256(scene_root / "sparse/0/cameras.bin"),
+                "images_bin_sha256": _sha256(scene_root / "sparse/0/images.bin"),
+                "train_images_sha256": _sha256_tree(image_root),
+            }
+        else:
+            datasets[scene] = {
+                "views": count,
+                "transforms_train_sha256": _sha256(scene_root / "transforms_train.json"),
+                "train_images_sha256": _sha256_tree(scene_root / "train"),
+            }
     payload = {
         "version": 1,
         "scope": "seen_train_sr",
         "sampling_signature": _sampling_signature(config),
         "dataset_root": str(args.dataset_root.resolve()),
+        "dataset_kind": config.dataset_kind,
+        "image_factor": config.image_factor,
         "datasets": datasets,
         "groups": groups,
         "subsets": subsets,
@@ -606,7 +633,7 @@ def _camera_for_indices(
     config: Stage3Config,
     device: torch.device,
 ) -> CameraBatch:
-    sequence = NeRFSyntheticAdapter(dataset_root / scene).index(Split.TRAIN)
+    _, sequence = _scene_data(dataset_root / scene, config, Split.TRAIN)
     if any(type(index) is not int or not 0 <= index < len(sequence.observations) for index in indices):
         raise ValueError("camera donor index is out of range")
     observations = [sequence.observations[index] for index in indices]

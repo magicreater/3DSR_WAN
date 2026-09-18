@@ -338,8 +338,8 @@ def _finite_metric_rows(rows: list[dict]) -> bool:
     )
 
 
-def evaluation_index(rows: list[dict]) -> dict[tuple[str, str], dict]:
-    expected = {(group, mode) for group in PROBE_IDS for mode in MODES}
+def evaluation_index(rows: list[dict], probe_ids: tuple[str, ...] = PROBE_IDS) -> dict[tuple[str, str], dict]:
+    expected = {(group, mode) for group in probe_ids for mode in MODES}
     index: dict[tuple[str, str], dict] = {}
     for row in rows:
         key = (row.get("group_id"), row.get("condition"))
@@ -356,17 +356,19 @@ def evaluation_index(rows: list[dict]) -> dict[tuple[str, str], dict]:
 
 
 def _degradations(
-    index: dict, condition: str, metric: str, *, baseline: str = "correct"
+    index: dict, condition: str, metric: str, *, baseline: str = "correct",
+    probe_ids: tuple[str, ...] = PROBE_IDS,
 ) -> list[float]:
     return [
         float(index[(group, baseline)][metric])
         - float(index[(group, condition)][metric])
-        for group in PROBE_IDS
+        for group in probe_ids
     ]
 
 
-def _mean_condition(index: dict, condition: str, metric: str) -> float:
-    return mean(float(index[(group, condition)][metric]) for group in PROBE_IDS)
+def _mean_condition(index: dict, condition: str, metric: str,
+                    probe_ids: tuple[str, ...] = PROBE_IDS) -> float:
+    return mean(float(index[(group, condition)][metric]) for group in probe_ids)
 
 
 def candidate_gate(
@@ -374,12 +376,13 @@ def candidate_gate(
     train_rows: list[dict],
     *,
     expected_steps: int,
-    reference: dict[str, float] = PHASE_C_CORRECT,
+    reference: dict[str, float] | None = PHASE_C_CORRECT,
     tolerance: float = NUMERICAL_TOLERANCE,
     v2: bool = False,
     fusion_equivariant: bool = False,
+    probe_ids: tuple[str, ...] = PROBE_IDS,
 ) -> dict:
-    index = evaluation_index(evaluation_rows)
+    index = evaluation_index(evaluation_rows, probe_ids)
     if len(train_rows) != expected_steps or [row.get("step") for row in train_rows] != list(
         range(1, expected_steps + 1)
     ):
@@ -399,16 +402,15 @@ def candidate_gate(
     deltas = {
         condition: {
             metric: _degradations(
-                index, condition, metric, baseline=delta_references[condition]
+                index, condition, metric, baseline=delta_references[condition],
+                probe_ids=probe_ids,
             ) for metric in METRICS
         }
         for condition in MODES if condition != "correct"
     }
-    correct = {metric: _mean_condition(index, "correct", metric) for metric in METRICS}
+    correct = {metric: _mean_condition(index, "correct", metric, probe_ids) for metric in METRICS}
     directional = lambda values: sum(value > 0 for value in values) >= 3
     checks = {
-        "correct_psnr_nonregression": correct["psnr"] - reference["psnr"] >= -0.10,
-        "correct_ssim_nonregression": correct["ssim"] - reference["ssim"] >= -0.001,
         "correct_repeat_equivalent": all(
             abs(value) <= tolerance
             for metric in METRICS for value in deltas["correct_repeat"][metric]
@@ -422,6 +424,9 @@ def candidate_gate(
         "target_drop_psnr": mean(deltas["target_drop"]["psnr"]) >= 3.0,
         "target_drop_direction": directional(deltas["target_drop"]["psnr"]),
     }
+    if reference is not None:
+        checks["correct_psnr_nonregression"] = correct["psnr"] - reference["psnr"] >= -0.10
+        checks["correct_ssim_nonregression"] = correct["ssim"] - reference["ssim"] >= -0.001
     for condition in ("shuffle_fusion", "target_drop_shuffle_fusion"):
         checks.update({
             f"{condition}_psnr": mean(deltas[condition]["psnr"]) >= (0.03 if v2 else 0.05),
@@ -432,7 +437,7 @@ def candidate_gate(
     dose_counts = {}
     for metric in METRICS:
         monotonic = 0
-        for group in PROBE_IDS:
+        for group in probe_ids:
             correct_value = float(index[(group, "correct")][metric])
             half = float(index[(group, "fusion_camera_dose_half")][metric])
             full = float(index[(group, "fusion_camera_dose_full")][metric])

@@ -68,10 +68,18 @@ class Stage3Config:
     pairing_target_gradient_ratio: float = 0.25
     pairing_weight_min: float = 0.01
     pairing_weight_max: float = 10.0
+    dataset_kind: str = "nerf_synthetic"
+    image_factor: int = 1
 
     def __post_init__(self):
         if self.arm not in ARM_MODES:
             raise ValueError("arm must be A0, A1, A2, A3, A4 or A5")
+        if self.dataset_kind not in {"nerf_synthetic", "mipnerf360"}:
+            raise ValueError("dataset_kind must be nerf_synthetic or mipnerf360")
+        if type(self.image_factor) is not int or self.image_factor not in (1, 2, 4, 8):
+            raise ValueError("image_factor must be 1, 2, 4 or 8")
+        if self.dataset_kind == "nerf_synthetic" and self.image_factor != 1:
+            raise ValueError("nerf_synthetic requires image_factor=1")
         groups = (self.train_scenes, self.validation_scenes, self.test_scenes)
         for group in groups:
             if not isinstance(group, tuple) or not group or any(not isinstance(s, str) or not s for s in group):

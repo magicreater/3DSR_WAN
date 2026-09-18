@@ -149,6 +149,10 @@ def validate_stage3_checkpoint_payload(
             raise ValueError("Stage 3 checkpoint config mismatch")
         saved_config = dict(payload["config"])
         expected = json.loads(json.dumps(expected_config))
+        saved_config.setdefault("dataset_kind", "nerf_synthetic")
+        saved_config.setdefault("image_factor", 1)
+        expected.setdefault("dataset_kind", "nerf_synthetic")
+        expected.setdefault("image_factor", 1)
         # Stage 3.1 adds default-off knobs; old Stage 3 bundles remain valid.
         saved_config.setdefault("target_lr_dropout", 0.0)
         saved_config.setdefault("epipolar_attention", "global_bias")

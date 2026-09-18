@@ -37,6 +37,10 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
     assert Stage3Config(allow_self_view_source=False).allow_self_view_source is False
     assert Stage3Config().camera_rank_weight == 0.0
     assert Stage3Config().camera_rank_margin_ratio == 0.05
+    assert Stage3Config().dataset_kind == "nerf_synthetic"
+    assert replace(Stage3Config(), dataset_kind="mipnerf360", image_factor=4).image_factor == 4
+    with pytest.raises(ValueError, match="image_factor"):
+        replace(Stage3Config(), image_factor=4)
     with pytest.raises(ValueError, match="epipolar_attention"):
         replace(Stage3Config(), epipolar_attention="invalid")
     with pytest.raises(ValueError, match="target_lr_dropout"):
