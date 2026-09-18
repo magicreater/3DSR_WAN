@@ -17,7 +17,7 @@ import torch
 import stage3_experiment as stage3
 import stage3_3_ucpe_rre_fusion as prior
 from rl3dsr.models.wan.lr_fusion import pairing_info_nce_loss
-from rl3dsr.validation.stage3_protocol import Split, evenly_spaced_indices, load_stage3_config
+from rl3dsr.validation.stage3_protocol import evenly_spaced_indices, load_stage3_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
