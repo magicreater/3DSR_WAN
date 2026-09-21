@@ -74,6 +74,19 @@ def test_a4_maps_to_rre_epipolar_and_enforces_production_contract():
         replace(config, allow_self_view_source=True)
 
 
+def test_a6_keeps_rre_fusion_without_a5_pairing_supervision():
+    config = Stage3Config(
+        arm="A6",
+        fusion_dim=192,
+        fusion_heads=1,
+        epipolar_attention="local_band",
+        allow_self_view_source=False,
+        camera_rank_weight=1.0,
+    )
+    assert config.fusion_mode == "rre_epipolar"
+    assert config.pairing_supervision is False
+
+
 def test_legacy_arm_mapping_and_serialized_config_are_unchanged(tmp_path):
     expected = {
         "A0": "off",

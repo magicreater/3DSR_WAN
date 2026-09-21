@@ -380,6 +380,55 @@ def test_camera_rank_hinge_is_inactive_when_wrong_is_worse(runner):
     assert rank.item() == 0
 
 
+def test_a6_ranking_uses_only_target_view_but_flow_uses_all_views(runner):
+    target = torch.zeros(1, 1, 3, 1, 1)
+    correct = torch.tensor([1.0, 2.0, 3.0]).reshape_as(target)
+    wrong = torch.tensor([0.5, 20.0, 30.0]).reshape_as(target)
+    flow, e_correct, e_wrong, rank = runner._camera_pair_training_losses(
+        correct,
+        wrong,
+        target,
+        margin_ratio=0.05,
+        target_view_only=True,
+    )
+    changed = wrong.clone()
+    changed[:, :, 1:] = -100
+    changed_flow, changed_correct, changed_wrong, changed_rank = runner._camera_pair_training_losses(
+        correct,
+        changed,
+        target,
+        margin_ratio=0.05,
+        target_view_only=True,
+    )
+    assert flow == changed_flow
+    assert torch.equal(e_correct, changed_correct)
+    assert torch.equal(e_wrong, changed_wrong)
+    assert torch.equal(rank, changed_rank)
+    assert torch.equal(runner.per_view_flow_losses(correct, target), torch.tensor([[1.0, 4.0, 9.0]]))
+
+
+def test_camera_rank_gradient_groups_split_existing_modules(runner):
+    from types import SimpleNamespace
+
+    fusion = SimpleNamespace(
+        hidden_dim=2,
+        qkv=torch.nn.Linear(2, 6, bias=False),
+        output=torch.nn.Linear(2, 2, bias=False),
+    )
+    bridge = torch.nn.Linear(2, 2)
+    module = SimpleNamespace(
+        fusion=fusion,
+        conditioner=SimpleNamespace(bridge=bridge),
+    )
+    parameters = [*fusion.qkv.parameters(), *fusion.output.parameters(), *bridge.parameters()]
+    gradients = [torch.ones_like(parameter) for parameter in parameters]
+    groups = runner._camera_rank_gradient_groups(module, parameters, gradients)
+    assert groups["camera_rank_qk_gradient_norm"] > 0
+    assert groups["camera_rank_value_gradient_norm"] > 0
+    assert groups["camera_rank_output_gradient_norm"] > 0
+    assert groups["camera_rank_bridge_gradient_norm"] > 0
+
+
 def test_pairing_derangement_preserves_target_and_changes_every_auxiliary(runner):
     from rl3dsr.models.wan.geometry_conditioning import CameraBatch
     k = torch.eye(3).repeat(1, 4, 1, 1)

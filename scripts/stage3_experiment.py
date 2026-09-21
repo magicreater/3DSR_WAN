@@ -654,6 +654,64 @@ def camera_pair_ranking_loss(prediction_correct, prediction_wrong, target, *, ma
     return e_correct, e_wrong, rank
 
 
+def per_view_flow_losses(prediction, target):
+    """Return MSE for each [batch, view] without mixing target and auxiliaries."""
+    if prediction.shape != target.shape or prediction.ndim < 3:
+        raise ValueError("prediction and target must have matching [B,C,V,...] shapes")
+    dimensions = tuple(index for index in range(1, target.ndim) if index != 2)
+    return (prediction - target).square().mean(dim=dimensions)
+
+
+def _camera_pair_training_losses(
+    prediction_correct,
+    prediction_wrong,
+    target,
+    *,
+    margin_ratio: float,
+    target_view_only: bool,
+):
+    """Keep the SR flow loss global while optionally ranking only view zero."""
+    flow = flow_matching_loss(prediction_correct, target)
+    if target_view_only:
+        prediction_correct = prediction_correct[:, :, 0:1]
+        prediction_wrong = prediction_wrong[:, :, 0:1]
+        target = target[:, :, 0:1]
+    e_correct, e_wrong, rank = camera_pair_ranking_loss(
+        prediction_correct,
+        prediction_wrong,
+        target,
+        margin_ratio=margin_ratio,
+    )
+    return flow, e_correct, e_wrong, rank
+
+
+def _camera_rank_gradient_groups(module, parameters, gradients):
+    """Split A6 ranking gradients across the existing fusion/bridge path."""
+    if len(parameters) != len(gradients):
+        raise ValueError("parameters and gradients must have equal lengths")
+    if module.fusion is None:
+        raise ValueError("camera ranking gradient telemetry requires LR fusion")
+    by_parameter = {id(parameter): gradient for parameter, gradient in zip(parameters, gradients)}
+    qkv = by_parameter.get(id(module.fusion.qkv.weight))
+    hidden = module.fusion.hidden_dim
+    qk = None if qkv is None else qkv[: 2 * hidden]
+    value = None if qkv is None else qkv[2 * hidden :]
+
+    def gradients_for(values):
+        return tuple(by_parameter.get(id(parameter)) for parameter in values)
+
+    return {
+        "camera_rank_qk_gradient_norm": _tensor_gradient_norm((qk,)),
+        "camera_rank_value_gradient_norm": _tensor_gradient_norm((value,)),
+        "camera_rank_output_gradient_norm": _tensor_gradient_norm(
+            gradients_for(module.fusion.output.parameters())
+        ),
+        "camera_rank_bridge_gradient_norm": _tensor_gradient_norm(
+            gradients_for(module.conditioner.bridge.parameters())
+        ),
+    }
+
+
 def _deranged_auxiliary_indices(views: int, generator: torch.Generator) -> torch.Tensor:
     if views < 3:
         raise ValueError("camera pairing requires at least two auxiliary views")
@@ -2262,6 +2320,8 @@ def _train(args, config: Stage3Config) -> None:
         losses, scenes, view_groups, sigmas, target_lr_dropped = [], [], [], [], []
         main_flow_losses, correct_flow_losses, wrong_flow_losses = [], [], []
         rank_losses, rank_active_fractions, rank_gradient_norms = [], [], []
+        per_view_correct_losses, per_view_wrong_losses = [], []
+        rank_gradient_groups: dict[str, list[float]] = {}
         pairing_losses, pair_counts, pairing_coverage_minima = [], [], []
         flow_fusion_gradients = rank_fusion_gradients = pairing_fusion_gradients = None
         for micro in range(config.gradient_accumulation):
@@ -2331,11 +2391,12 @@ def _train(args, config: Stage3Config) -> None:
                     camera,
                     tuple(clean.shape[2:]),
                 )
-                e_correct, e_wrong, rank = camera_pair_ranking_loss(
+                flow_term, e_correct, e_wrong, rank = _camera_pair_training_losses(
                     prediction,
                     prediction_wrong,
                     target,
                     margin_ratio=config.camera_rank_margin_ratio,
+                    target_view_only=config.arm == "A6",
                 )
                 rank_term = config.camera_rank_weight * rank.mean()
                 rank_gradients = torch.autograd.grad(
@@ -2344,16 +2405,26 @@ def _train(args, config: Stage3Config) -> None:
                     retain_graph=True,
                     allow_unused=True,
                 )
-                loss = e_correct.mean() + rank_term
+                loss = flow_term + rank_term
                 correct_flow_losses.append(float(e_correct.mean().detach()))
                 wrong_flow_losses.append(float(e_wrong.mean().detach()))
                 rank_losses.append(float(rank.mean().detach()))
                 rank_active_fractions.append(float((rank.detach() > 0).float().mean()))
                 rank_gradient_norms.append(_tensor_gradient_norm(rank_gradients))
+                if config.arm == "A6":
+                    per_view_correct_losses.append(
+                        per_view_flow_losses(prediction, target).detach().mean(dim=0).float().cpu().tolist()
+                    )
+                    per_view_wrong_losses.append(
+                        per_view_flow_losses(prediction_wrong, target).detach().mean(dim=0).float().cpu().tolist()
+                    )
+                    for name, value in _camera_rank_gradient_groups(
+                        runtime.module, trainable, rank_gradients
+                    ).items():
+                        rank_gradient_groups.setdefault(name, []).append(value)
                 micro_rank_fusion_gradients = tuple(
                     rank_gradients[index] for index in fusion_trainable_indices
                 )
-                flow_term = e_correct.mean()
             else:
                 flow_term = flow_matching_loss(prediction, target)
                 rank_term = prediction.new_zeros(())
@@ -2435,6 +2506,16 @@ def _train(args, config: Stage3Config) -> None:
                 "camera_rank_active_fraction": float(np.mean(rank_active_fractions)),
                 "camera_rank_gradient_norm": float(np.mean(rank_gradient_norms)),
             })
+            if config.arm == "A6":
+                row.update({
+                    "camera_rank_scope": "target_view_0",
+                    "per_view_correct_flow_loss": np.mean(per_view_correct_losses, axis=0).tolist(),
+                    "per_view_wrong_flow_loss": np.mean(per_view_wrong_losses, axis=0).tolist(),
+                    **{
+                        name: float(np.mean(values))
+                        for name, values in rank_gradient_groups.items()
+                    },
+                })
         if config.pairing_supervision:
             row.update(a5_step_telemetry(
                 flow_losses=main_flow_losses,

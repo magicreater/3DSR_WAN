@@ -26,6 +26,7 @@ ARM_MODES = {
     "A3": "epipolar",
     "A4": "rre_epipolar",
     "A5": "rre_epipolar",
+    "A6": "rre_epipolar",
 }
 
 
@@ -73,7 +74,7 @@ class Stage3Config:
 
     def __post_init__(self):
         if self.arm not in ARM_MODES:
-            raise ValueError("arm must be A0, A1, A2, A3, A4 or A5")
+            raise ValueError("arm must be A0, A1, A2, A3, A4, A5 or A6")
         if self.dataset_kind not in {"nerf_synthetic", "mipnerf360"}:
             raise ValueError("dataset_kind must be nerf_synthetic or mipnerf360")
         if type(self.image_factor) is not int or self.image_factor not in (1, 2, 4, 8):
@@ -125,7 +126,7 @@ class Stage3Config:
             raise ValueError("image_size must align with Wan VAE/patch grid and SR scale")
         if self.fusion_dim % self.fusion_heads:
             raise ValueError("fusion_dim must be divisible by fusion_heads")
-        if self.arm in {"A4", "A5"}:
+        if self.arm in {"A4", "A5", "A6"}:
             if self.fusion_dim != 192:
                 raise ValueError(f"{self.arm} requires fusion_dim=192")
             if self.fusion_heads != 1:
