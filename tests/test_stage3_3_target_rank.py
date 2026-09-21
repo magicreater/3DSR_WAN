@@ -11,6 +11,7 @@ from rl3dsr.validation.stage3_protocol import load_stage3_config
 @pytest.fixture
 def driver():
     path = Path(__file__).resolve().parents[1] / "scripts/stage3_3_target_rank.py"
+    sys.path.insert(0, str(path.parent))
     spec = importlib.util.spec_from_file_location("stage3_3_target_rank", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
