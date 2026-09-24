@@ -274,14 +274,21 @@ Initially verify structure using forward passes, shapes, parameter counts, and c
 
 ### Stage 3 — Pose-aware cross-view LR fusion
 
-Implement a static-3D-only LR evidence router between the frozen LR encoder
-and the existing bridge. Compare matched A0-A3 arms: no fusion, same-view
-attention, visual cross-view attention, and epipolar-biased cross-view
-attention. Preserve the full RRE camera path and bypass fusion for temporal
-4DSR inputs.
+Keep the static LR evidence router as the default for existing configurations
+and checkpoints. The final Stage 3 candidate caches frozen per-view LR
+features, then at each 3DSR denoising step queries epipolar-local auxiliary
+patches using the current pooled target latent, target LR feature and noise
+timestep. Attention normalizes within each source view, then across source
+views and a null candidate. The trainable residual starts at zero. This
+candidate also shares the Wan temporal RoPE phase across 3DSR views while
+retaining spatial RoPE and the full RRE camera path. Temporal 4DSR inputs
+retain the original Wan phase and do not use cross-view fusion.
 
-Validate structure, controlled auxiliary-view interventions, and small shared
-multi-scene training before claiming a cross-view or geometry contribution.
+Compare matched 4/8-view A5 controls and the combined candidate at fixed
+4000-step endpoints. Require correct-output quality, LR/camera correspondence,
+full-model auxiliary permutation, and independent replication before Stage 4
+readiness. A passing combined candidate does not attribute an effect to either
+change alone.
 
 ### Stage 4 — First large-scale supervised 3DSR training
 

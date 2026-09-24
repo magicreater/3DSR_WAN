@@ -61,6 +61,8 @@ class Stage3Config:
     epipolar_band: float = 1.5
     target_lr_dropout: float = 0.0
     allow_self_view_source: bool = True
+    dynamic_fusion: bool = False
+    shared_multiview_rope: bool = False
     camera_rank_weight: float = 0.0
     camera_rank_margin_ratio: float = 0.05
     symmetric_correspondence_rank: bool = False
@@ -112,6 +114,10 @@ class Stage3Config:
             raise ValueError("target_lr_dropout must be finite and in [0, 1)")
         if type(self.allow_self_view_source) is not bool:
             raise ValueError("allow_self_view_source must be boolean")
+        if type(self.dynamic_fusion) is not bool or type(self.shared_multiview_rope) is not bool:
+            raise ValueError("dynamic_fusion and shared_multiview_rope must be boolean")
+        if (self.dynamic_fusion or self.shared_multiview_rope) and self.arm != "A6":
+            raise ValueError("dynamic fusion and shared multiview RoPE require A6")
         value = self.camera_rank_weight
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError("camera_rank_weight must be finite and nonnegative")

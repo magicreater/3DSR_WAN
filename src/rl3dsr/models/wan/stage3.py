@@ -1,4 +1,4 @@
-"""Static-3D LR fusion preparation and small adapter-only checkpoints.
+"""Stage 3 LR fusion preparation and small adapter-only checkpoints.
 
 Preparation occurs outside the diffusion loop. The original temporal/video
 entry points and Stage 1/2 checkpoint formats are deliberately unchanged.
@@ -6,21 +6,39 @@ entry points and Stage 1/2 checkpoint formats are deliberately unchanged.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch import nn, Tensor
 
 from .geometry_conditioning import CameraBatch
 from .lq_conditioning import FrozenLQConditioner, conditioned_prediction
 
 
+@dataclass(frozen=True)
+class DynamicPrepared:
+    features: Tensor  # [B,V,P,D], frozen LR evidence before fusion
+    camera: CameraBatch
+    patch_grid: tuple[int, int]
+    source_mask: Tensor | None
+    allow_self_view_source: bool | None
+
+    @property
+    def shape(self):
+        batch, views, patches, dim = self.features.shape
+        return (batch, views * patches, dim)
+
+
 class Stage3Conditioning(nn.Module):
-    def __init__(self, conditioner: FrozenLQConditioner, geometry=None, fusion=None):
+    def __init__(self, conditioner: FrozenLQConditioner, geometry=None, fusion=None,
+                 *, shared_multiview_rope: bool = False):
         super().__init__()
         self.conditioner = conditioner
         self.geometry = geometry
         self.fusion = fusion
+        self.shared_multiview_rope = shared_multiview_rope
 
     def prepare_multiview(self, lr: Tensor, camera: CameraBatch,
                           latent_shape: tuple[int, int, int],
@@ -50,6 +68,11 @@ class Stage3Conditioning(nn.Module):
             return features
         views, height, width = latent_shape
         shaped = features.reshape(features.shape[0], views, -1, features.shape[-1])
+        if getattr(self.fusion, "dynamic", False):
+            if pairing_camera is not None or pairing_lr is not None:
+                raise ValueError("dynamic fusion does not use A5 pairing supervision")
+            return DynamicPrepared(shaped, camera, (height // 2, width // 2),
+                                   source_mask, allow_self_view_source)
         fused = self.fusion(
             shaped,
             camera,
@@ -101,9 +124,27 @@ class Stage3Conditioning(nn.Module):
         adapter. When omitted, both paths intentionally use ``camera``.
         """
         geometry_camera = camera if geometry_camera is None else geometry_camera
+        if isinstance(prepared_features, DynamicPrepared):
+            state = prepared_features
+            if tuple(sample.shape[2:]) != tuple(latent_shape) or sample.shape[2] != state.features.shape[1]:
+                raise ValueError("dynamic fusion latent views do not match prepared LR views")
+            batch, channels, views, height, width = sample.shape
+            if channels != 16 or (height // 2, width // 2) != state.patch_grid:
+                raise ValueError("dynamic fusion requires Wan latent channels and patch grid")
+            pooled = F.avg_pool2d(
+                sample.permute(0, 2, 1, 3, 4).reshape(batch * views, 16, height, width).float(),
+                kernel_size=2,
+            ).permute(0, 2, 3, 1).reshape(batch, views, -1, 16)
+            prepared_features = self.fusion(
+                state.features, state.camera, state.patch_grid,
+                source_mask=state.source_mask,
+                allow_self_view_source=state.allow_self_view_source,
+                latent_query=pooled, timestep=timestep,
+            ).reshape(batch, -1, state.features.shape[-1])
         return conditioned_prediction(
             dit, self.conditioner, sample, timestep, context, prepared_features,
-            geometry_adapter=self.geometry, camera=geometry_camera, latent_shape=latent_shape)
+            geometry_adapter=self.geometry, camera=geometry_camera, latent_shape=latent_shape,
+            shared_view_rope=self.shared_multiview_rope and camera.sequence_kind == "multiview")
 
 
 def _states(module: Stage3Conditioning):
@@ -168,6 +209,8 @@ def validate_stage3_checkpoint_payload(
         saved_config.setdefault("pairing_target_gradient_ratio", 0.25)
         saved_config.setdefault("pairing_weight_min", 0.01)
         saved_config.setdefault("pairing_weight_max", 10.0)
+        saved_config.setdefault("dynamic_fusion", False)
+        saved_config.setdefault("shared_multiview_rope", False)
         expected.setdefault("target_lr_dropout", 0.0)
         expected.setdefault("epipolar_attention", "global_bias")
         expected.setdefault("epipolar_band", 1.5)
@@ -182,6 +225,8 @@ def validate_stage3_checkpoint_payload(
         expected.setdefault("pairing_target_gradient_ratio", 0.25)
         expected.setdefault("pairing_weight_min", 0.01)
         expected.setdefault("pairing_weight_max", 10.0)
+        expected.setdefault("dynamic_fusion", False)
+        expected.setdefault("shared_multiview_rope", False)
         if saved_config != expected:
             raise ValueError("Stage 3 checkpoint config mismatch")
     expected_arch = {"blocks": list(module.conditioner.bridge_blocks),

@@ -60,6 +60,7 @@ class WanDiT:
         token_residual: Tensor | None = None,
         block_token_residuals: Mapping[int, Tensor] | None = None,
         camera_attention: tuple[object, object] | None = None,
+        shared_view_rope: bool = False,
     ) -> Tensor:
         if not isinstance(latents, Tensor) or latents.ndim != 5 or latents.shape[1] != 16:
             raise ValueError("latents must have shape [B,16,F,h,w]")
@@ -109,8 +110,18 @@ class WanDiT:
         )
         with self._injection_lock:
             handles = []
+            original_freqs = None
             self.last_injection_stats = {}
             try:
+                if shared_view_rope:
+                    original_freqs = self.model.freqs
+                    head_dim = self.model.dim // self.model.num_heads
+                    temporal_columns = (head_dim - 4 * (head_dim // 6)) // 2
+                    if original_freqs.ndim != 2 or not 0 < temporal_columns < original_freqs.shape[1]:
+                        raise RuntimeError("unexpected Wan temporal RoPE layout")
+                    shared_freqs = original_freqs.clone()
+                    shared_freqs[:, :temporal_columns] = shared_freqs[:1, :temporal_columns]
+                    self.model.freqs = shared_freqs
                 for block_index, residual in residuals.items():
                     def inject_tokens(_module, args, residual=residual, block_index=block_index):
                         embedded = args[0]
@@ -158,6 +169,8 @@ class WanDiT:
                 with autocast:
                     outputs = self.model(samples, timesteps.to(self.device), contexts, seq_len)
             finally:
+                if original_freqs is not None:
+                    self.model.freqs = original_freqs
                 for handle in handles:
                     handle.remove()
         output = torch.stack(outputs, dim=0)

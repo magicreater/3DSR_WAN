@@ -287,8 +287,11 @@ def load_runtime(
             tau=config.epipolar_tau,
             epipolar_band=config.epipolar_band,
             allow_self_view_source=config.allow_self_view_source,
+            dynamic=config.dynamic_fusion,
         ).to(device)
-    module = Stage3Conditioning(conditioner, geometry, fusion).to(device)
+    module = Stage3Conditioning(
+        conditioner, geometry, fusion, shared_multiview_rope=config.shared_multiview_rope
+    ).to(device)
     payload = None
     if stage3_checkpoint is not None:
         if model_only_initialization:
@@ -396,8 +399,9 @@ def sample_latents(
             timestep,
             text_context,
             features,
-            geometry_camera,
+            fusion_camera,
             latent_shape,
+            geometry_camera=geometry_camera,
         )
         if return_diagnostics:
             traced = velocity if inverse_permutation is None else permute_view_tensor(
@@ -421,7 +425,9 @@ def sample_latents(
     if not return_diagnostics:
         return sampled
     return sampled, {
-        "prepared_features": prepared.detach().float().cpu(),
+        "prepared_features": (
+            prepared.features if hasattr(prepared, "features") else prepared
+        ).detach().float().cpu(),
         "fusion_diagnostics": _scalar_diagnostics(
             getattr(fusion_module, "last_diagnostics", {})
         ),
@@ -1765,8 +1771,11 @@ def _checkpoint_validation_module(config: Stage3Config) -> Stage3Conditioning:
                 tau=config.epipolar_tau,
                 epipolar_band=config.epipolar_band,
                 allow_self_view_source=config.allow_self_view_source,
+                dynamic=config.dynamic_fusion,
             )
-    return Stage3Conditioning(conditioner, geometry, fusion)
+    return Stage3Conditioning(
+        conditioner, geometry, fusion, shared_multiview_rope=config.shared_multiview_rope
+    )
 
 
 def _trial_generator_state(value: torch.Tensor, *, device: str, label: str) -> None:
@@ -2948,6 +2957,9 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
     correct_fusion = _scalar_diagnostics(
         getattr(fusion_module, "last_diagnostics", {})
     )
+    dynamic_scope = hasattr(correct, "features")
+    if dynamic_scope:
+        correct = correct.features.reshape(correct.features.shape[0], -1, correct.features.shape[-1])
     changed = runtime.module.prepare_multiview(
         changed_lr,
         fusion_camera,
@@ -2956,6 +2968,8 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
         source_mask=source_mask,
         allow_self_view_source=allow_self_view_source,
     )
+    if dynamic_scope:
+        changed = changed.features.reshape(changed.features.shape[0], -1, changed.features.shape[-1])
     changed = _canonicalize_prepared_views(
         changed, view_permutation, tuple(clean_shape[2:])[0]
     )
@@ -2982,6 +2996,7 @@ def _feature_diagnostics(runtime: Runtime, lr: torch.Tensor, camera: CameraBatch
             ),
         }
     return {
+        "feature_scope": "cached_lr_only" if dynamic_scope else "static_fused",
         "group_id": group["id"],
         "scene": group["scene"],
         "view_index": group["anchor"],

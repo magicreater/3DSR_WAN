@@ -244,6 +244,7 @@ class LRViewFusion(nn.Module):
         tau: float = 1.0,
         epipolar_band: float = 1.5,
         allow_self_view_source: bool = True,
+        dynamic: bool = False,
     ) -> None:
         super().__init__()
         if mode not in {'off', 'same_view', 'visual', 'epipolar', 'epipolar_local', 'rre_epipolar'}:
@@ -259,6 +260,8 @@ class LRViewFusion(nn.Module):
             raise ValueError('epipolar_band must be finite and positive')
         if type(allow_self_view_source) is not bool:
             raise ValueError('allow_self_view_source must be boolean')
+        if type(dynamic) is not bool or (dynamic and mode != 'rre_epipolar'):
+            raise ValueError('dynamic fusion requires rre_epipolar mode')
         if mode == 'rre_epipolar':
             if heads != 1:
                 raise ValueError('rre_epipolar requires one attention head')
@@ -274,11 +277,15 @@ class LRViewFusion(nn.Module):
         self.tau = float(tau)
         self.epipolar_band = float(epipolar_band)
         self.allow_self_view_source = allow_self_view_source
+        self.dynamic = dynamic
         self.record_diagnostics = False
         self.last_diagnostics: dict[str, dict[str, Tensor]] = {}
         self.qkv = nn.Linear(feature_dim, hidden_dim * 3, bias=False)
         self.output = nn.Linear(hidden_dim, feature_dim, bias=False)
         nn.init.zeros_(self.output.weight)
+        if dynamic:
+            self.latent_query = nn.Linear(16, hidden_dim, bias=False)
+            self.time_query = nn.Linear(1, hidden_dim, bias=False)
 
     def build_pairing_state(
         self,
@@ -371,11 +378,21 @@ class LRViewFusion(nn.Module):
         *,
         source_mask: Tensor | None = None,
         allow_self_view_source: bool | None = None,
+        latent_query: Tensor | None = None,
+        timestep: Tensor | None = None,
     ) -> Tensor:
         self.last_diagnostics = {}
         if features.ndim != 4 or features.shape[-1] != self.feature_dim:
             raise ValueError('features must have shape [B,V,P,feature_dim]')
         b, views, patches, _ = features.shape
+        if self.dynamic:
+            if (latent_query is None or latent_query.shape != (b, views, patches, 16)
+                    or timestep is None or timestep.shape != (b,)):
+                raise ValueError('dynamic fusion requires latent_query [B,V,P,16] and timestep [B]')
+            if not torch.isfinite(latent_query).all() or not torch.isfinite(timestep).all():
+                raise ValueError('dynamic fusion query and timestep must be finite')
+        elif latent_query is not None or timestep is not None:
+            raise ValueError('static fusion does not accept a latent query')
         if len(patch_grid) != 2 or any(type(value) is not int or value < 1 for value in patch_grid):
             raise ValueError('patch_grid must contain two positive integers')
         gh, gw = patch_grid
@@ -426,6 +443,10 @@ class LRViewFusion(nn.Module):
             b, tokens, 3, self.heads, head_dim
         )
         q, k, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        if self.dynamic:
+            latent_part = self.latent_query(latent_query.to(self.latent_query.weight.dtype))
+            time_part = self.time_query((timestep.float() / 1000).to(self.time_query.weight.dtype).view(b, 1))
+            q = q + latent_part.reshape(b, 1, tokens, head_dim) + time_part[:, None, None, :]
         with torch.autocast(device_type=features.device.type, enabled=False):
             q, k, value = q.float(), k.float(), value.float()
             rre_matrices = None
@@ -482,7 +503,7 @@ class LRViewFusion(nn.Module):
                         (b, stop - start, tokens), dtype=torch.bool, device=features.device
                     )
                 if matrices is not None:
-                    bias, allowed, _ = _epipolar_chunk(
+                    bias, allowed, usable = _epipolar_chunk(
                         matrices,
                         valid,
                         pixels,
@@ -493,6 +514,8 @@ class LRViewFusion(nn.Module):
                     )
                     logits[..., :tokens] = logits[..., :tokens] + bias.reshape(b, stop - start, tokens)[:, None]
                     if self.mode in {'epipolar_local', 'rre_epipolar'}:
+                        if self.dynamic:
+                            allowed = allowed & usable[..., None]
                         # Keep a null candidate and fall back to global keys for
                         # degenerate camera pairs; otherwise restrict each query
                         # to a finite epipolar band in source patch coordinates.
@@ -517,7 +540,24 @@ class LRViewFusion(nn.Module):
                     logits[..., :tokens] = logits[..., :tokens].masked_fill(~key_allowed[:, None, None, :], -torch.inf)
                     if record:
                         allowed_keys = allowed_keys & key_allowed[:, None, :]
-                weights = torch.softmax(logits, dim=-1)
+                if self.dynamic:
+                    source_logits = logits[..., :tokens].reshape(
+                        b, self.heads, stop - start, views, patches
+                    )
+                    finite = torch.isfinite(source_logits)
+                    valid_source = finite.any(dim=-1)
+                    safe_logits = source_logits.masked_fill(~valid_source[..., None], 0)
+                    patch_weights = torch.softmax(safe_logits, dim=-1) * finite
+                    patch_weights = patch_weights / patch_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                    source_scores = torch.logsumexp(source_logits, dim=-1) - finite.sum(dim=-1).clamp_min(1).log()
+                    source_scores = source_scores.masked_fill(~valid_source, -torch.inf)
+                    gates = torch.softmax(torch.cat((source_scores, logits[..., tokens:]), dim=-1), dim=-1)
+                    weights = torch.cat((
+                        (patch_weights * gates[..., :views, None]).reshape(b, self.heads, stop - start, tokens),
+                        gates[..., views:],
+                    ), dim=-1)
+                else:
+                    weights = torch.softmax(logits, dim=-1)
                 if record:
                     same = query_views[:, None] == view_ids[None, :]
                     non_null = weights[..., :tokens]

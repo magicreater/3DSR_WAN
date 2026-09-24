@@ -351,6 +351,7 @@ def conditioned_prediction(
     camera=None,
     latent_shape: tuple[int, int, int] | None = None,
     geometry_enabled: bool = True,
+    shared_view_rope: bool = False,
 ) -> Tensor:
     """Run the shared Stage 1/2 path and sum residuals at matching blocks."""
     residuals: dict[int, Tensor] = {}
@@ -366,14 +367,16 @@ def conditioned_prediction(
         else:
             for block, residual in geometry_adapter.residuals(camera, latent_shape, timestep).items():
                 residuals[block] = residual if block not in residuals else residuals[block] + residual
+    dit_options = {"shared_view_rope": True} if shared_view_rope else {}
     if not residuals and camera_attention is None:
-        return dit(sample, timestep, context)
+        return dit(sample, timestep, context, **dit_options)
     return dit(
         sample,
         timestep,
         context,
         block_token_residuals=residuals or None,
         camera_attention=camera_attention,
+        **dit_options,
     )
 
 
