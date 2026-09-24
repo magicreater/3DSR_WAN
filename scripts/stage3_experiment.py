@@ -399,9 +399,8 @@ def sample_latents(
             timestep,
             text_context,
             features,
-            fusion_camera,
+            geometry_camera,
             latent_shape,
-            geometry_camera=geometry_camera,
         )
         if return_diagnostics:
             traced = velocity if inverse_permutation is None else permute_view_tensor(
@@ -2247,6 +2246,8 @@ def _train(args, config: Stage3Config) -> None:
         manifest_config.setdefault("pairing_target_gradient_ratio", 0.25)
         manifest_config.setdefault("pairing_weight_min", 0.01)
         manifest_config.setdefault("pairing_weight_max", 10.0)
+        manifest_config.setdefault("dynamic_fusion", False)
+        manifest_config.setdefault("shared_multiview_rope", False)
         if manifest_config != expected_config or manifest.get("provenance", {}).get("training_seed") != args.seed:
             raise ValueError("resume manifest does not match config and training seed")
         if config.pairing_supervision:
@@ -2792,13 +2793,16 @@ def _intervention(lr, camera, mode, generator, *, far_camera=None, return_metada
                 changed[:, :, 0] = 0
         mask = torch.ones(lr.shape[0], lr.shape[2], dtype=torch.bool, device=lr.device)
         return finish(changed, fusion_camera, camera, mask)
-    if mode == "joint_permute":
+    if mode in {"joint_permute", "aux_permute"}:
         views = lr.shape[2]
-        if views < 2:
-            raise ValueError("joint permutation requires at least two views")
-        permutation = torch.randperm(views, generator=generator)
+        if views < (3 if mode == "aux_permute" else 2):
+            raise ValueError("permutation requires enough views")
+        permutation = (torch.cat((torch.zeros(1, dtype=torch.long),
+                                  1 + torch.randperm(views - 1, generator=generator)))
+                       if mode == "aux_permute" else torch.randperm(views, generator=generator))
         if torch.equal(permutation, torch.arange(views)):
-            permutation = permutation.roll(1)
+            permutation = (torch.cat((permutation[:1], permutation[1:].roll(1)))
+                           if mode == "aux_permute" else permutation.roll(1))
         mask = torch.ones(lr.shape[0], views, dtype=torch.bool, device=lr.device)
         result = apply_joint_view_permutation(
             permutation,
@@ -3477,6 +3481,7 @@ def _parser() -> argparse.ArgumentParser:
             "shuffle_geometry", "shuffle_all", "shuffle_pair", "local_patch",
             "target_drop", "target_drop_shuffle_fusion", "mispaired_lr",
             "mispaired_camera", "joint_permute", "fusion_camera_dose_0",
+            "aux_permute",
             "fusion_camera_dose_half", "fusion_camera_dose_full",
         ),
         default=("correct", "remove", "duplicate", "shuffle_camera", "local_patch"),
@@ -3501,6 +3506,7 @@ def _parser() -> argparse.ArgumentParser:
             "no_self_shuffle_fusion", "no_self_far_shuffle_fusion",
             "target_drop_shuffle_fusion", "mispaired_lr", "mispaired_camera",
             "joint_permute", "fusion_camera_dose_0", "fusion_camera_dose_half",
+            "aux_permute",
             "fusion_camera_dose_full",
         ),
         default=("correct",),

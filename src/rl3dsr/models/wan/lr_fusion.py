@@ -549,7 +549,7 @@ class LRViewFusion(nn.Module):
                     safe_logits = source_logits.masked_fill(~valid_source[..., None], 0)
                     patch_weights = torch.softmax(safe_logits, dim=-1) * finite
                     patch_weights = patch_weights / patch_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                    source_scores = torch.logsumexp(source_logits, dim=-1) - finite.sum(dim=-1).clamp_min(1).log()
+                    source_scores = torch.logsumexp(safe_logits, dim=-1) - finite.sum(dim=-1).clamp_min(1).log()
                     source_scores = source_scores.masked_fill(~valid_source, -torch.inf)
                     gates = torch.softmax(torch.cat((source_scores, logits[..., tokens:]), dim=-1), dim=-1)
                     weights = torch.cat((

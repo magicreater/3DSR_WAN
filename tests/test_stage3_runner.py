@@ -672,6 +672,26 @@ def test_fusion_camera_dose_uses_valid_se3_and_exact_endpoints(runner):
     assert scores[0] < scores[1] < scores[2]
 
 
+def test_auxiliary_permutation_keeps_target_and_relabels_full_model_inputs(runner):
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+
+    lr = torch.arange(4).reshape(1, 1, 4, 1, 1).float()
+    pose = torch.eye(4).repeat(1, 4, 1, 1)
+    pose[0, :, 0, 3] = torch.arange(4)
+    camera = CameraBatch(torch.eye(3).repeat(1, 4, 1, 1), pose, (16, 16), "multiview")
+    changed, fusion, geometry, mask, metadata = runner._intervention(
+        lr, camera, "aux_permute", torch.Generator().manual_seed(7), return_metadata=True
+    )
+    permutation = torch.tensor(metadata["permutation"])
+    assert metadata["target_index"] == 0
+    assert permutation[0] == 0 and not torch.equal(permutation, torch.arange(4))
+    assert torch.equal(changed, lr[:, :, permutation])
+    assert torch.equal(fusion.T_world_from_camera, camera.T_world_from_camera[:, permutation])
+    assert torch.equal(geometry.T_world_from_camera, camera.T_world_from_camera[:, permutation])
+    assert mask.all()
+    assert torch.equal(runner.inverse_permute_joint_output(changed, metadata), lr)
+
+
 def test_far_fusion_camera_intervention_keeps_lr_target_and_geometry(runner):
     from rl3dsr.models.wan.geometry_conditioning import CameraBatch
 

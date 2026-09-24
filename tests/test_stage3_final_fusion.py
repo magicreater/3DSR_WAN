@@ -45,6 +45,9 @@ def test_dynamic_fusion_query_null_and_auxiliary_order(views):
                    timestep=torch.tensor([500.0]),
                    source_mask=torch.zeros(1, views, dtype=torch.bool))
     assert torch.allclose(empty, features, atol=1e-6)
+    empty.sum().backward(retain_graph=True)
+    assert torch.isfinite(fusion.qkv.weight.grad).all()
+    fusion.zero_grad(set_to_none=True)
     permutation = torch.tensor([0, *range(2, views), 1])
     permuted_camera = CameraBatch(
         camera.K[:, permutation], camera.T_world_from_camera[:, permutation],
