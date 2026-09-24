@@ -662,6 +662,21 @@ def per_view_flow_losses(prediction, target):
     return (prediction - target).square().mean(dim=dimensions)
 
 
+def decoded_target_ssim_loss(vae, noisy, prediction, sigma, hr):
+    """Differentiable SSIM on the correctly paired target view only."""
+    from torchmetrics.functional.image import structural_similarity_index_measure
+
+    if noisy.shape != prediction.shape or noisy.shape[2] != hr.shape[2]:
+        raise ValueError("latent and HR view dimensions must match")
+    x0_hat = noisy[:, :, :1] - sigma.reshape(-1, 1, 1, 1, 1) * prediction[:, :, :1]
+    decoded = vae.decode_multiview(x0_hat)[:, :, 0]
+    reference = hr[:, :, 0]
+    return 1 - structural_similarity_index_measure(
+        (decoded.float() + 1) * 0.5, (reference.float() + 1) * 0.5,
+        data_range=1.0,
+    )
+
+
 def _camera_pair_training_losses(
     prediction_correct,
     prediction_wrong,
@@ -669,9 +684,15 @@ def _camera_pair_training_losses(
     *,
     margin_ratio: float,
     target_view_only: bool,
+    target_view_flow_fraction: float | None = None,
 ):
     """Keep the SR flow loss global while optionally ranking only view zero."""
-    flow = flow_matching_loss(prediction_correct, target)
+    if target_view_flow_fraction is None:
+        flow = flow_matching_loss(prediction_correct, target)
+    else:
+        per_view = per_view_flow_losses(prediction_correct, target)
+        flow = (target_view_flow_fraction * per_view[:, 0]
+                + (1 - target_view_flow_fraction) * per_view[:, 1:].mean(dim=1)).mean()
     if target_view_only:
         prediction_correct = prediction_correct[:, :, 0:1]
         prediction_wrong = prediction_wrong[:, :, 0:1]
@@ -683,6 +704,14 @@ def _camera_pair_training_losses(
         margin_ratio=margin_ratio,
     )
     return flow, e_correct, e_wrong, rank
+
+
+def _symmetric_correspondence_rank(camera_rank, lr_rank, camera_fraction=0.5):
+    if camera_rank.shape != lr_rank.shape:
+        raise ValueError("camera and LR ranking losses must have matching shapes")
+    if not 0 < camera_fraction < 1:
+        raise ValueError("camera_fraction must be in (0, 1)")
+    return camera_fraction * camera_rank + (1 - camera_fraction) * lr_rank
 
 
 def _camera_rank_gradient_groups(module, parameters, gradients):
@@ -2201,6 +2230,8 @@ def _train(args, config: Stage3Config) -> None:
         manifest_config.setdefault("allow_self_view_source", True)
         manifest_config.setdefault("camera_rank_weight", 0.0)
         manifest_config.setdefault("camera_rank_margin_ratio", 0.05)
+        manifest_config.setdefault("symmetric_correspondence_rank", False)
+        manifest_config.setdefault("symmetric_camera_fraction", 0.5)
         manifest_config.setdefault("pairing_temperature", 0.07)
         manifest_config.setdefault("pairing_minimum_coverage", 0.05)
         manifest_config.setdefault("pairing_calibration_batches", 8)
@@ -2318,10 +2349,17 @@ def _train(args, config: Stage3Config) -> None:
         step_started = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         losses, scenes, view_groups, sigmas, target_lr_dropped = [], [], [], [], []
+        structure_losses = []
+        paired_structure_losses = []
         main_flow_losses, correct_flow_losses, wrong_flow_losses = [], [], []
         rank_losses, rank_active_fractions, rank_gradient_norms = [], [], []
+        lr_wrong_flow_losses, lr_rank_losses = [], []
+        lr_rank_active_fractions, lr_rank_gradient_norms = [], []
+        correspondence_rank_losses, correspondence_rank_gradient_norms = [], []
         per_view_correct_losses, per_view_wrong_losses = [], []
+        per_view_lr_wrong_losses = []
         rank_gradient_groups: dict[str, list[float]] = {}
+        lr_rank_gradient_groups: dict[str, list[float]] = {}
         pairing_losses, pair_counts, pairing_coverage_minima = [], [], []
         flow_fusion_gradients = rank_fusion_gradients = pairing_fusion_gradients = None
         for micro in range(config.gradient_accumulation):
@@ -2341,10 +2379,20 @@ def _train(args, config: Stage3Config) -> None:
                 lr[:, :, 0] = 0
             with torch.no_grad():
                 clean = runtime.vae.encode_multiview(hr)
-            wrong_camera = None
+            wrong_camera = wrong_permutation = None
             if config.camera_rank_weight > 0 or config.pairing_supervision:
                 assert pairing_generator is not None
-                wrong_camera = derange_auxiliary_fusion_camera(camera, pairing_generator)
+                if config.symmetric_correspondence_rank:
+                    wrong_permutation = _deranged_auxiliary_indices(
+                        camera.K.shape[1], pairing_generator
+                    )
+                    wrong_camera = _camera_with_auxiliary_permutation(
+                        camera, wrong_permutation
+                    )
+                else:
+                    wrong_camera = derange_auxiliary_fusion_camera(
+                        camera, pairing_generator
+                    )
             prepared_result = runtime.module.prepare_multiview(
                 lr, camera, tuple(clean.shape[2:]), (config.image_size, config.image_size),
                 **({
@@ -2397,20 +2445,110 @@ def _train(args, config: Stage3Config) -> None:
                     target,
                     margin_ratio=config.camera_rank_margin_ratio,
                     target_view_only=config.arm == "A6",
+                    target_view_flow_fraction=config.target_view_flow_fraction,
                 )
-                rank_term = config.camera_rank_weight * rank.mean()
-                rank_gradients = torch.autograd.grad(
-                    rank_term / config.gradient_accumulation,
+                camera_rank_scale = (
+                    config.symmetric_camera_fraction
+                    if config.symmetric_correspondence_rank else 1.0
+                )
+                camera_rank_term = config.camera_rank_weight * camera_rank_scale * rank.mean()
+                camera_rank_gradients = torch.autograd.grad(
+                    camera_rank_term / config.gradient_accumulation,
                     trainable,
                     retain_graph=True,
                     allow_unused=True,
                 )
+                rank_term = camera_rank_term
+                rank_gradients = _accumulate_gradient_vectors(None, camera_rank_gradients)
+                lr_rank = None
+                if config.symmetric_correspondence_rank:
+                    assert wrong_permutation is not None
+                    wrong_lr = permute_view_tensor(lr, wrong_permutation)
+                    wrong_lr_prepared = runtime.module.prepare_multiview(
+                        wrong_lr,
+                        camera,
+                        tuple(clean.shape[2:]),
+                        (config.image_size, config.image_size),
+                    )
+                    prediction_lr_wrong = runtime.module.predict(
+                        runtime.dit,
+                        noisy,
+                        timestep,
+                        None,
+                        wrong_lr_prepared,
+                        camera,
+                        tuple(clean.shape[2:]),
+                    )
+                    _, _, e_lr_wrong, lr_rank = _camera_pair_training_losses(
+                        prediction,
+                        prediction_lr_wrong,
+                        target,
+                        margin_ratio=config.camera_rank_margin_ratio,
+                        target_view_only=True,
+                    )
+                    lr_rank_term = (
+                        config.camera_rank_weight
+                        * (1 - config.symmetric_camera_fraction)
+                        * lr_rank.mean()
+                    )
+                    lr_rank_gradients = torch.autograd.grad(
+                        lr_rank_term / config.gradient_accumulation,
+                        trainable,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    combined_rank = _symmetric_correspondence_rank(
+                        rank, lr_rank, config.symmetric_camera_fraction
+                    )
+                    rank_term = config.camera_rank_weight * combined_rank.mean()
+                    rank_gradients = _accumulate_gradient_vectors(
+                        rank_gradients, lr_rank_gradients
+                    )
+                    lr_wrong_flow_losses.append(float(e_lr_wrong.mean().detach()))
+                    lr_rank_losses.append(float(lr_rank.mean().detach()))
+                    lr_rank_active_fractions.append(
+                        float((lr_rank.detach() > 0).float().mean())
+                    )
+                    lr_rank_gradient_norms.append(
+                        _tensor_gradient_norm(lr_rank_gradients)
+                    )
+                    correspondence_rank_losses.append(
+                        float(combined_rank.mean().detach())
+                    )
+                    correspondence_rank_gradient_norms.append(
+                        _tensor_gradient_norm(rank_gradients)
+                    )
+                    per_view_lr_wrong_losses.append(
+                        per_view_flow_losses(prediction_lr_wrong, target)
+                        .detach().mean(dim=0).float().cpu().tolist()
+                    )
+                    for name, value in _camera_rank_gradient_groups(
+                        runtime.module, trainable, lr_rank_gradients
+                    ).items():
+                        lr_rank_gradient_groups.setdefault(
+                            name.replace("camera_rank_", "lr_rank_"), []
+                        ).append(value)
                 loss = flow_term + rank_term
+                if config.correct_image_ssim_weight is not None:
+                    structure_term = decoded_target_ssim_loss(
+                        runtime.vae, noisy, prediction, sigma, hr
+                    )
+                    loss = loss + config.correct_image_ssim_weight * structure_term
+                    structure_losses.append(float(structure_term.detach()))
+                    if config.paired_image_ssim_rank:
+                        wrong_structure_term = decoded_target_ssim_loss(
+                            runtime.vae, noisy, prediction_wrong, sigma, hr
+                        )
+                        paired_structure_term = F.relu(
+                            0.0003 + structure_term - wrong_structure_term
+                        )
+                        loss = loss + config.correct_image_ssim_weight * paired_structure_term
+                        paired_structure_losses.append(float(paired_structure_term.detach()))
                 correct_flow_losses.append(float(e_correct.mean().detach()))
                 wrong_flow_losses.append(float(e_wrong.mean().detach()))
                 rank_losses.append(float(rank.mean().detach()))
                 rank_active_fractions.append(float((rank.detach() > 0).float().mean()))
-                rank_gradient_norms.append(_tensor_gradient_norm(rank_gradients))
+                rank_gradient_norms.append(_tensor_gradient_norm(camera_rank_gradients))
                 if config.arm == "A6":
                     per_view_correct_losses.append(
                         per_view_flow_losses(prediction, target).detach().mean(dim=0).float().cpu().tolist()
@@ -2419,7 +2557,7 @@ def _train(args, config: Stage3Config) -> None:
                         per_view_flow_losses(prediction_wrong, target).detach().mean(dim=0).float().cpu().tolist()
                     )
                     for name, value in _camera_rank_gradient_groups(
-                        runtime.module, trainable, rank_gradients
+                        runtime.module, trainable, camera_rank_gradients
                     ).items():
                         rank_gradient_groups.setdefault(name, []).append(value)
                 micro_rank_fusion_gradients = tuple(
@@ -2498,6 +2636,11 @@ def _train(args, config: Stage3Config) -> None:
             "step_seconds": time.perf_counter() - step_started,
             "peak_gpu_memory_mib": torch.cuda.max_memory_allocated(runtime.device) / 2**20,
         }
+        if config.correct_image_ssim_weight is not None:
+            row["correct_image_ssim_loss"] = float(np.mean(structure_losses))
+            row["correct_image_ssim_weight"] = config.correct_image_ssim_weight
+            if config.paired_image_ssim_rank:
+                row["paired_image_ssim_rank_loss"] = float(np.mean(paired_structure_losses))
         if config.camera_rank_weight > 0:
             row.update({
                 "correct_flow_loss": float(np.mean(correct_flow_losses)),
@@ -2516,6 +2659,38 @@ def _train(args, config: Stage3Config) -> None:
                         for name, values in rank_gradient_groups.items()
                     },
                 })
+                if config.symmetric_correspondence_rank:
+                    row.update({
+                        "lr_rank_scope": "target_view_0",
+                        "correspondence_rank_weight": config.camera_rank_weight,
+                        "camera_rank_effective_weight": (
+                            config.camera_rank_weight * config.symmetric_camera_fraction
+                        ),
+                        "lr_rank_effective_weight": (
+                            config.camera_rank_weight * (1 - config.symmetric_camera_fraction)
+                        ),
+                        "lr_wrong_flow_loss": float(np.mean(lr_wrong_flow_losses)),
+                        "lr_rank_loss": float(np.mean(lr_rank_losses)),
+                        "lr_rank_active_fraction": float(
+                            np.mean(lr_rank_active_fractions)
+                        ),
+                        "lr_rank_gradient_norm": float(
+                            np.mean(lr_rank_gradient_norms)
+                        ),
+                        "correspondence_rank_loss": float(
+                            np.mean(correspondence_rank_losses)
+                        ),
+                        "correspondence_rank_gradient_norm": float(
+                            np.mean(correspondence_rank_gradient_norms)
+                        ),
+                        "per_view_lr_wrong_flow_loss": np.mean(
+                            per_view_lr_wrong_losses, axis=0
+                        ).tolist(),
+                        **{
+                            name: float(np.mean(values))
+                            for name, values in lr_rank_gradient_groups.items()
+                        },
+                    })
         if config.pairing_supervision:
             row.update(a5_step_telemetry(
                 flow_losses=main_flow_losses,

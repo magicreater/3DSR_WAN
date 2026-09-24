@@ -63,6 +63,11 @@ class Stage3Config:
     allow_self_view_source: bool = True
     camera_rank_weight: float = 0.0
     camera_rank_margin_ratio: float = 0.05
+    symmetric_correspondence_rank: bool = False
+    symmetric_camera_fraction: float = 0.5
+    target_view_flow_fraction: float | None = None
+    correct_image_ssim_weight: float | None = None
+    paired_image_ssim_rank: bool = False
     pairing_temperature: float = 0.07
     pairing_minimum_coverage: float = 0.05
     pairing_calibration_batches: int = 8
@@ -113,8 +118,48 @@ class Stage3Config:
         value = self.camera_rank_margin_ratio
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise ValueError("camera_rank_margin_ratio must be finite and positive")
+        if type(self.symmetric_correspondence_rank) is not bool:
+            raise ValueError("symmetric_correspondence_rank must be boolean")
+        value = self.symmetric_camera_fraction
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 < value < 1
+        ):
+            raise ValueError("symmetric_camera_fraction must be finite and in (0, 1)")
+        if not self.symmetric_correspondence_rank and value != 0.5:
+            raise ValueError(
+                "symmetric_camera_fraction requires symmetric correspondence ranking"
+            )
         if self.camera_rank_weight > 0 and self.allow_self_view_source:
             raise ValueError("camera ranking requires allow_self_view_source=false")
+        if self.symmetric_correspondence_rank and (
+            self.arm != "A6" or self.camera_rank_weight <= 0 or self.allow_self_view_source
+        ):
+            raise ValueError(
+                "symmetric correspondence ranking requires A6 camera ranking without self-view source"
+            )
+        value = self.target_view_flow_fraction
+        if value is not None and (
+            self.arm != "A6" or self.views < 2 or isinstance(value, bool)
+            or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or not 0 < value < 1
+        ):
+            raise ValueError("target_view_flow_fraction requires A6, multiple views, and a fraction in (0, 1)")
+        value = self.correct_image_ssim_weight
+        if value is not None and (
+            self.arm != "A6" or self.target_view_flow_fraction is not None
+            or isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value <= 0
+        ):
+            raise ValueError("correct_image_ssim_weight requires uniform A6 flow and a positive finite weight")
+        if type(self.paired_image_ssim_rank) is not bool or (
+            self.paired_image_ssim_rank and (
+                self.correct_image_ssim_weight is None or self.camera_rank_weight <= 0
+            )
+        ):
+            raise ValueError("paired_image_ssim_rank requires A6 camera ranking and correct-image SSIM")
         for group in (self.training_seeds, self.final_inference_seeds):
             if not isinstance(group, tuple) or not group or any(type(v) is not int or v < 0 for v in group) or len(set(group)) != len(group):
                 raise ValueError("seed lists must contain distinct nonnegative integers")
@@ -172,7 +217,14 @@ class Stage3Config:
         }
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        if self.target_view_flow_fraction is None:
+            payload.pop("target_view_flow_fraction")
+        if self.correct_image_ssim_weight is None:
+            payload.pop("correct_image_ssim_weight")
+        if not self.paired_image_ssim_rank:
+            payload.pop("paired_image_ssim_rank")
+        return payload
 
 
 def load_stage3_config(path: str | Path) -> Stage3Config:

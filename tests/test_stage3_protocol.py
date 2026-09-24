@@ -37,6 +37,8 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
     assert Stage3Config(allow_self_view_source=False).allow_self_view_source is False
     assert Stage3Config().camera_rank_weight == 0.0
     assert Stage3Config().camera_rank_margin_ratio == 0.05
+    assert Stage3Config().symmetric_correspondence_rank is False
+    assert Stage3Config().symmetric_camera_fraction == 0.5
     assert Stage3Config().dataset_kind == "nerf_synthetic"
     assert replace(Stage3Config(), dataset_kind="mipnerf360", image_factor=4).image_factor == 4
     with pytest.raises(ValueError, match="image_factor"):
@@ -53,6 +55,14 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
         replace(Stage3Config(), camera_rank_weight=-0.1)
     with pytest.raises(ValueError, match="camera_rank_margin_ratio"):
         replace(Stage3Config(), camera_rank_margin_ratio=0.0)
+    with pytest.raises(ValueError, match="symmetric_correspondence_rank"):
+        replace(Stage3Config(), symmetric_correspondence_rank=1)
+    with pytest.raises(ValueError, match="symmetric_camera_fraction"):
+        replace(Stage3Config(), symmetric_camera_fraction=0.0)
+    with pytest.raises(ValueError, match="requires symmetric"):
+        replace(Stage3Config(), symmetric_camera_fraction=0.8)
+    with pytest.raises(ValueError, match="symmetric correspondence ranking"):
+        replace(Stage3Config(), symmetric_correspondence_rank=True)
 
 
 def test_a4_maps_to_rre_epipolar_and_enforces_production_contract():
@@ -85,6 +95,20 @@ def test_a6_keeps_rre_fusion_without_a5_pairing_supervision():
     )
     assert config.fusion_mode == "rre_epipolar"
     assert config.pairing_supervision is False
+    assert replace(config, symmetric_correspondence_rank=True).symmetric_correspondence_rank
+    weighted = replace(
+        config,
+        symmetric_correspondence_rank=True,
+        symmetric_camera_fraction=0.8,
+    )
+    assert weighted.symmetric_camera_fraction == 0.8
+    assert "target_view_flow_fraction" not in config.to_dict()
+    focused = replace(config, target_view_flow_fraction=0.5)
+    assert focused.to_dict()["target_view_flow_fraction"] == 0.5
+    with pytest.raises(ValueError, match="target_view_flow_fraction"):
+        replace(config, target_view_flow_fraction=1.0)
+    with pytest.raises(ValueError, match="target_view_flow_fraction"):
+        replace(Stage3Config(), target_view_flow_fraction=0.5)
 
 
 def test_legacy_arm_mapping_and_serialized_config_are_unchanged(tmp_path):
