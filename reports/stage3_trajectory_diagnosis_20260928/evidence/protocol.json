@@ -1,0 +1,165 @@
+{
+  "arms": {
+    "a5": {
+      "checkpoint": "/data/linzizhuo/RL3DSR_WAN_REMO-stage3-final/artifacts/stage3_final_20260924/train/a5_v4_lego_s42/stage3_step_4000.pt",
+      "checkpoint_sha256": "76106cdb2410e80755b63d1802b3d6b5f13e1138ee0c578ab56c2e02b1061bf6",
+      "config": "/data/linzizhuo/RL3DSR_WAN_REMO-stage3-final/artifacts/stage3_final_20260924/config/a5_v4_lego_s42.json",
+      "config_sha256": "c2823f7679dbfe0172911eb4bcdafe293b49350b9ab9d568421488dffeaeaa44",
+      "source_image_arm": "a5"
+    },
+    "full_ordinary": {
+      "checkpoint": "/data/linzizhuo/RL3DSR_WAN_REMO-stage3-loss/artifacts/stage3_loss_conditional_20260926/train/full_ordinary/stage3_step_4000.pt",
+      "checkpoint_sha256": "0111dcb8c30aa5889c1283451d92e9f9bd805920af2e8621949fb2716fe52a96",
+      "config": "/data/linzizhuo/RL3DSR_WAN_REMO-stage3-loss/configs/stage3_loss_full.json",
+      "config_sha256": "7cbf7d2a691b56e637146b026d3f2afa7263c0e619a3f654282ab6a902d6d5f0",
+      "source_image_arm": "candidate"
+    }
+  },
+  "clean_estimate": "z_hat0=state-sigma*predicted_velocity",
+  "code_sha256": "ad91f1e395b55dd338252df4eb9da3708c467384ed4dd94109528a085808c6f6",
+  "contexts": {
+    "0": [
+      0,
+      41,
+      42,
+      67
+    ],
+    "10": [
+      10,
+      2,
+      52,
+      69
+    ],
+    "11": [
+      11,
+      79,
+      61,
+      57
+    ],
+    "13": [
+      13,
+      63,
+      55,
+      70
+    ],
+    "17": [
+      17,
+      72,
+      95,
+      19
+    ],
+    "24": [
+      24,
+      29,
+      92,
+      52
+    ],
+    "30": [
+      30,
+      77,
+      37,
+      18
+    ],
+    "32": [
+      32,
+      85,
+      8,
+      53
+    ],
+    "36": [
+      36,
+      33,
+      6,
+      43
+    ],
+    "4": [
+      4,
+      15,
+      74,
+      22
+    ],
+    "59": [
+      59,
+      22,
+      25,
+      15
+    ],
+    "60": [
+      60,
+      78,
+      51,
+      38
+    ],
+    "66": [
+      66,
+      58,
+      45,
+      12
+    ],
+    "7": [
+      7,
+      88,
+      56,
+      48
+    ],
+    "89": [
+      89,
+      98,
+      76,
+      65
+    ],
+    "93": [
+      93,
+      44,
+      87,
+      3
+    ]
+  },
+  "dataset_train_sha256": "82d46cfbd405d7da8562b6fa75b6fb0631a3f941adf66f0c023acb8bf9ea273a",
+  "image_steps": [
+    0,
+    9,
+    19,
+    29,
+    39,
+    49
+  ],
+  "metrics": "rl3dsr.validation.decoded_space.frame_metrics; target view only; full-view VAE decoding",
+  "metrics_sha256": "56105cee45cbbb06676a5fa1e971eca33fbbe7a7b8d70b7c295ed05303ca1497",
+  "modes": [
+    "correct",
+    "target_drop",
+    "remove",
+    "shuffle_all"
+  ],
+  "noise_seed_rule": "seed*1000000+target_index",
+  "purpose": "read-only true-HQ-noised versus native-UniPC free-run trajectory audit",
+  "sampling_sha256": "730f70af79cdf956d2dfdf3d92011af419dd230402d5f4a30d0d11360104012b",
+  "seeds": [
+    3302,
+    3303
+  ],
+  "sigma_path": "step0 pure noise matches native initial state; later z_true=(1-sigma)*VAE(HQ)+sigma*initial_noise; native sigma0=0.9997998",
+  "source_manifest_sha256": "65f60031c9d020914351c837575e3c57eca5ea4f06fd2c5903954343b5364cb1",
+  "stage3_experiment_sha256": "8ea969b5bad0a0fbe1e1cacef020125c301abb6dd376a9cecd02b13e8fb5af4d",
+  "stage4": "HOLD",
+  "targets": [
+    0,
+    89,
+    32,
+    17,
+    7,
+    4,
+    60,
+    36,
+    24,
+    66,
+    13,
+    11,
+    30,
+    10,
+    93,
+    59
+  ],
+  "view_protocol_sha256": "c2308be4459b4adf95cca12d514f1f62e4075c3884cb99c6215314e7403b3869"
+}
