@@ -336,6 +336,10 @@ def test_pairing_state_detaches_lr_features_but_keeps_qk_projection_gradients():
     assert len(state["pairs"]) == 6
     assert state["target_patch_count"] == 6
     assert len(state["valid_pair_identities"]) == 6
+    assert state["valid_pair_identities"] == [
+        {key: pair[key] for key in ("batch_index", "target_view", "source_view")}
+        for pair in state["pairs"]
+    ]
 
 
 def test_pairing_state_rejects_distorted_ucm_epipolar_geometry():

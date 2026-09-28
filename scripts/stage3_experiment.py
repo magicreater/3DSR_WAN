@@ -209,6 +209,7 @@ def _mip_scene_data(root: Path, factor: int, split: Split):
     return adapter, adapter.index(split)
 
 
+@lru_cache(maxsize=16)
 def _scene_data(root: Path, config: Stage3Config, split: Split):
     if config.dataset_kind == "mipnerf360":
         return _mip_scene_data(root, config.image_factor, split)
@@ -463,6 +464,12 @@ def _camera(observations, resolution: int, device: torch.device) -> CameraBatch:
     )
 
 
+@lru_cache(maxsize=16)
+def _scene_camera(root: Path, config: Stage3Config, split: Split) -> CameraBatch:
+    _, sequence = _scene_data(root, config, split)
+    return _camera(sequence.observations, config.image_size, torch.device("cpu"))
+
+
 def _load_group(
     dataset_root: Path,
     scene: str,
@@ -471,10 +478,9 @@ def _load_group(
     generator: torch.Generator,
     device: torch.device,
 ):
-    adapter, sequence = _scene_data(
-        dataset_root / scene, config, Split.TRAIN if route == "train" else Split.TEST
-    )
-    all_camera = _camera(sequence.observations, config.image_size, torch.device("cpu"))
+    split = Split.TRAIN if route == "train" else Split.TEST
+    _, sequence = _scene_data(dataset_root / scene, config, split)
+    all_camera = _scene_camera(dataset_root / scene, config, split)
     anchor = int(torch.randint(len(sequence.observations), (), generator=generator))
     indices = sample_view_indices(
         all_camera,

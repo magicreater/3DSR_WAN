@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import numpy as np
 
 
 @pytest.fixture
@@ -24,6 +25,39 @@ def test_inspect_has_no_runtime_or_output_side_effects(runner, tmp_path, monkeyp
     runner.main(["inspect", "--config", str(config)])
     assert json.loads(capsys.readouterr().out)["arm"] == "A3"
     assert list(tmp_path.iterdir()) == [config]
+
+
+def test_scene_index_and_cpu_camera_are_reused(runner, tmp_path, monkeypatch):
+    from rl3dsr.data import Split
+    from rl3dsr.validation.stage3_protocol import Stage3Config
+
+    calls = []
+    observation = SimpleNamespace(K=np.eye(3, dtype=np.float32),
+                                  T_world_from_camera=np.eye(4, dtype=np.float32),
+                                  width=16, height=16)
+
+    class Adapter:
+        def __init__(self, root):
+            self.root = root
+
+        def index(self, split):
+            calls.append(split)
+            return SimpleNamespace(observations=(observation,))
+
+    monkeypatch.setattr(runner, "NeRFSyntheticAdapter", Adapter)
+    config = Stage3Config()
+    runner._scene_data.cache_clear()
+    runner._scene_camera.cache_clear()
+    try:
+        first = runner._scene_camera(tmp_path, config, Split.TRAIN)
+        second = runner._scene_camera(tmp_path, config, Split.TRAIN)
+        assert first is second
+        assert len(calls) == 1
+        assert runner._scene_data(tmp_path, config, Split.TRAIN)[1].observations[0] is observation
+        assert len(calls) == 1
+    finally:
+        runner._scene_camera.cache_clear()
+        runner._scene_data.cache_clear()
 
 
 def test_missing_inputs_fail_before_runtime(runner, tmp_path, monkeypatch):
