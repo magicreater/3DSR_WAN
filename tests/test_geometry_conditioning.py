@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import pytest
 import torch
 
 from rl3dsr.models.wan.geometry_conditioning import CameraBatch, GeometryConditioner
@@ -59,3 +60,16 @@ def test_temporal_sequence_uses_same_shape_contract():
     module = GeometryConditioner(hidden_dim=16, attention_heads=4)
     residuals = module.residuals(camera, (5, 4, 4), torch.tensor([200.0]))
     assert residuals[0].shape == (1, 5 * 4, 1536)
+
+
+def test_camera_validation_cache_rechecks_in_place_mutation():
+    camera = _camera()
+    camera.validate()
+    camera.validate()
+    camera.K[0, 0, 0, 0] = 0
+    with pytest.raises(ValueError, match="focal lengths"):
+        camera.validate()
+    with torch.inference_mode():
+        inference_camera = _camera()
+        inference_camera.validate()
+        inference_camera.validate()
