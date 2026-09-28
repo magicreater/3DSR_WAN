@@ -78,6 +78,8 @@ class Stage3Config:
     pairing_weight_max: float = 10.0
     dataset_kind: str = "nerf_synthetic"
     image_factor: int = 1
+    wan_lora: bool = False
+    wan_lora_learning_rate: float = 1e-5
 
     def __post_init__(self):
         if self.arm not in ARM_MODES:
@@ -197,6 +199,13 @@ class Stage3Config:
                 raise ValueError("A5 requires pairing_target_gradient_ratio=0.25")
             if self.pairing_weight_min not in (0.01, 1e-5) or self.pairing_weight_max != 10.0:
                 raise ValueError("A5 requires pairing weight clip [0.01,10] or [1e-5,10]")
+        if type(self.wan_lora) is not bool or (self.wan_lora and self.arm != "A5"):
+            raise ValueError("wan_lora must be boolean and requires A5")
+        if (isinstance(self.wan_lora_learning_rate, bool)
+                or not isinstance(self.wan_lora_learning_rate, (int, float))
+                or not math.isfinite(self.wan_lora_learning_rate)
+                or self.wan_lora_learning_rate <= 0):
+            raise ValueError("wan_lora_learning_rate must be finite and positive")
         if self.nearest_views < self.views - 1:
             raise ValueError("nearest_views must cover all auxiliary views")
 
@@ -230,6 +239,9 @@ class Stage3Config:
             payload.pop("correct_image_ssim_weight")
         if not self.paired_image_ssim_rank:
             payload.pop("paired_image_ssim_rank")
+        if not self.wan_lora:
+            payload.pop("wan_lora")
+            payload.pop("wan_lora_learning_rate")
         return payload
 
 

@@ -49,6 +49,7 @@ from rl3dsr.models.wan.stage3 import (
     load_stage3_initialization_checkpoint,
     validate_stage3_checkpoint_payload,
 )
+from rl3dsr.models.wan.wan_lora import inject_wan_lora, wan_lora_parameters
 from rl3dsr.models.wan.lr_fusion import pairing_info_nce_loss
 from rl3dsr.models.wan.sampling import SigmaCycle
 from rl3dsr.validation.decoded_space import frame_metrics
@@ -267,6 +268,8 @@ def load_runtime(
     load_adapter_checkpoint(bridge_checkpoint, conditioner)
     vae = WanVAE.from_checkpoint(model_dir, device=device, dtype=torch.bfloat16)
     dit = WanDiT.from_checkpoint(model_dir, device=device, dtype=torch.bfloat16)
+    if config.wan_lora:
+        inject_wan_lora(dit.model)
     geometry = FullRREConditioner(branch_count=len(dit.model.blocks)).to(device)
     if rre_checkpoint is not None:
         load_geometry_checkpoint(
@@ -296,11 +299,13 @@ def load_runtime(
     if stage3_checkpoint is not None:
         if model_only_initialization:
             payload = load_stage3_initialization_checkpoint(
-                stage3_checkpoint, module, reset_fusion=reset_initialization_fusion
+                stage3_checkpoint, module, reset_fusion=reset_initialization_fusion,
+                wan_model=dit.model if config.wan_lora else None,
             )
         else:
             payload = load_stage3_checkpoint(
-                stage3_checkpoint, module, expected_config=config.to_dict()
+                stage3_checkpoint, module, expected_config=config.to_dict(),
+                wan_model=dit.model if config.wan_lora else None,
             )
     return Runtime(module, vae, dit, device, payload)
 
@@ -1777,6 +1782,17 @@ def _checkpoint_validation_module(config: Stage3Config) -> Stage3Conditioning:
     )
 
 
+def _stage3_optimizer(adapter_parameters, wan_parameters, config: Stage3Config):
+    groups = [{"params": adapter_parameters, "lr": config.learning_rate}]
+    if config.wan_lora:
+        if len(wan_parameters) != 32:
+            raise ValueError("Wan LoRA requires 32 trainable matrices")
+        groups.append({"params": wan_parameters, "lr": config.wan_lora_learning_rate})
+    elif wan_parameters:
+        raise ValueError("Wan LoRA parameters are disabled in config")
+    return torch.optim.AdamW(groups, weight_decay=config.weight_decay)
+
+
 def _trial_generator_state(value: torch.Tensor, *, device: str, label: str) -> None:
     """Ask a private generator to parse state without touching a global RNG."""
     try:
@@ -1812,6 +1828,7 @@ def _validate_resume_optimizer_sigma(
     state: dict,
     module: Stage3Conditioning,
     config: Stage3Config,
+    wan_parameters: tuple[torch.nn.Parameter, ...] = (),
 ) -> None:
     """Trial optimizer metadata and validate the fixed balanced SigmaCycle schema."""
     optimizer_state = state["optimizer"]
@@ -1821,30 +1838,16 @@ def _validate_resume_optimizer_sigma(
         or not isinstance(optimizer_state["state"], dict)
         or not optimizer_state["state"]
         or not isinstance(optimizer_state["param_groups"], list)
-        or len(optimizer_state["param_groups"]) != 1
+        or len(optimizer_state["param_groups"]) != (2 if config.wan_lora else 1)
     ):
         raise ValueError("resume checkpoint contains malformed optimizer state")
-    parameters = tuple(
-        parameter for parameter in module.parameters() if parameter.requires_grad
-    )
+    adapter_parameters = tuple(parameter for parameter in module.parameters() if parameter.requires_grad)
+    parameters = adapter_parameters + wan_parameters
     try:
-        trial_optimizer = torch.optim.AdamW(
-            parameters,
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
-        )
+        trial_optimizer = _stage3_optimizer(adapter_parameters, wan_parameters, config)
     except (KeyError, RuntimeError, TypeError, ValueError) as exc:
         raise ValueError("resume checkpoint contains malformed optimizer state") from exc
-    expected_group = trial_optimizer.state_dict()["param_groups"][0]
-    group = optimizer_state["param_groups"][0]
-    if not isinstance(group, dict) or set(group) != set(expected_group):
-        raise ValueError("resume checkpoint contains malformed optimizer state")
-    expected_ids = list(range(len(parameters)))
-    if (
-        group["params"] != expected_ids
-        or any(type(value) is not int for value in group["params"])
-    ):
-        raise ValueError("resume checkpoint contains malformed optimizer state")
+    expected_groups = trial_optimizer.state_dict()["param_groups"]
 
     def valid_hyperparameter(actual, expected) -> bool:
         if type(actual) is not type(expected):
@@ -1861,12 +1864,19 @@ def _validate_resume_optimizer_sigma(
             return math.isfinite(actual) and actual == expected
         return actual == expected
 
-    if any(
-        not valid_hyperparameter(group[key], expected_group[key])
-        for key in expected_group
-        if key != "params"
-    ):
-        raise ValueError("resume checkpoint contains malformed optimizer state")
+    for group, expected_group in zip(optimizer_state["param_groups"], expected_groups):
+        if (
+            not isinstance(group, dict)
+            or set(group) != set(expected_group)
+            or group["params"] != expected_group["params"]
+            or any(type(value) is not int for value in group["params"])
+            or any(
+                not valid_hyperparameter(group[key], expected_group[key])
+                for key in expected_group if key != "params"
+            )
+        ):
+            raise ValueError("resume checkpoint contains malformed optimizer state")
+    expected_ids = list(range(len(parameters)))
     valid_ids = set(expected_ids)
     if (
         any(type(parameter_id) is not int for parameter_id in optimizer_state["state"])
@@ -1874,7 +1884,7 @@ def _validate_resume_optimizer_sigma(
     ):
         raise ValueError("resume checkpoint contains malformed optimizer state")
     allowed_state_keys = {"step", "exp_avg", "exp_avg_sq"}
-    if group["amsgrad"]:
+    if any(group["amsgrad"] for group in expected_groups):
         allowed_state_keys.add("max_exp_avg_sq")
     expected_optimizer_step = state.get("step")
     if type(expected_optimizer_step) is not int or expected_optimizer_step < 0:
@@ -2122,7 +2132,9 @@ def _prevalidate_resume_payload(payload: dict, config: Stage3Config, expected_st
         noise_device="cuda",
         require_version_two=config.pairing_supervision,
     )
-    _validate_resume_optimizer_sigma(payload["training_state"], module, config)
+    # LoRA parameter shapes are checked against the loaded Wan model below.
+    if not config.wan_lora:
+        _validate_resume_optimizer_sigma(payload["training_state"], module, config)
 
 
 def _restore_training_state(state, optimizer, sigma_cycle, view_generator, noise_generator,
@@ -2197,7 +2209,7 @@ def _fresh_training_start(output: Path, init_checkpoint: Path | None):
     if init_checkpoint is None:
         return 1, [], None
     payload = torch.load(init_checkpoint, map_location="cpu", weights_only=True)
-    if payload.get("format") != "rl3dsr-stage3" or payload.get("format_version") != 1:
+    if payload.get("format") != "rl3dsr-stage3" or payload.get("format_version") not in (1, 2):
         raise ValueError("initialization checkpoint is not Stage 3")
     if type(payload.get("step")) is not int or payload["step"] < 0:
         raise ValueError("initialization checkpoint has invalid saved step")
@@ -2248,6 +2260,10 @@ def _train(args, config: Stage3Config) -> None:
         manifest_config.setdefault("pairing_weight_max", 10.0)
         manifest_config.setdefault("dynamic_fusion", False)
         manifest_config.setdefault("shared_multiview_rope", False)
+        manifest_config.setdefault("wan_lora", False)
+        manifest_config.setdefault("wan_lora_learning_rate", 1e-5)
+        expected_config.setdefault("wan_lora", False)
+        expected_config.setdefault("wan_lora_learning_rate", 1e-5)
         if manifest_config != expected_config or manifest.get("provenance", {}).get("training_seed") != args.seed:
             raise ValueError("resume manifest does not match config and training seed")
         if config.pairing_supervision:
@@ -2269,10 +2285,21 @@ def _train(args, config: Stage3Config) -> None:
         device=args.device,
     )
     runtime.module.train()
-    runtime.dit.model.eval().requires_grad_(False)
+    runtime.dit.model.eval()
     runtime.vae.model.model.eval().requires_grad_(False)
     torch.cuda.reset_peak_memory_stats(runtime.device)
-    trainable = [parameter for parameter in runtime.module.parameters() if parameter.requires_grad]
+    adapter_parameters = tuple(parameter for parameter in runtime.module.parameters() if parameter.requires_grad)
+    lora_parameters = wan_lora_parameters(runtime.dit.model) if config.wan_lora else ()
+    if any(parameter.requires_grad for name, parameter in runtime.dit.model.named_parameters()
+           if "lora_" not in name):
+        raise RuntimeError("pretrained Wan parameters are not frozen")
+    if config.wan_lora and any(not parameter.requires_grad for parameter in lora_parameters):
+        raise RuntimeError("Wan LoRA parameters are frozen")
+    if resume_payload is not None and config.wan_lora:
+        _validate_resume_optimizer_sigma(
+            resume_payload["training_state"], runtime.module, config, lora_parameters
+        )
+    trainable = list(adapter_parameters + lora_parameters)
     fusion_parameters = (
         tuple(runtime.module.fusion.parameters()) if config.pairing_supervision else ()
     )
@@ -2280,9 +2307,7 @@ def _train(args, config: Stage3Config) -> None:
     fusion_trainable_indices = tuple(
         trainable_positions[id(parameter)] for parameter in fusion_parameters
     )
-    optimizer = torch.optim.AdamW(
-        trainable, lr=config.learning_rate, weight_decay=config.weight_decay
-    )
+    optimizer = _stage3_optimizer(adapter_parameters, lora_parameters, config)
     sigma_cycle = SigmaCycle(
         FlowSamplingConfig(config.sampling_steps, config.sampling_shift),
         seed=args.seed + 1000,
@@ -2324,6 +2349,8 @@ def _train(args, config: Stage3Config) -> None:
         "dataset_root": str(args.dataset_root.resolve()),
         "bridge_checkpoint": str(args.bridge_checkpoint.resolve()),
         "bridge_checkpoint_sha256": _sha256(args.bridge_checkpoint),
+        "wan_model_dir": str(args.model_dir.resolve()),
+        "wan_checkpoint_sha256": _sha256(args.model_dir / "diffusion_pytorch_model.safetensors"),
         "rre_checkpoint": None if args.rre_checkpoint is None else str(args.rre_checkpoint.resolve()),
         "rre_checkpoint_sha256": None if args.rre_checkpoint is None else _sha256(args.rre_checkpoint),
         "git_revision": _git_revision(),
@@ -2621,11 +2648,16 @@ def _train(args, config: Stage3Config) -> None:
             target_lr_dropped.append(bool(dropped))
         if any(p.grad is None or not torch.isfinite(p.grad).all() for p in trainable):
             raise RuntimeError("trainable adapter gradient is missing or non-finite")
-        if any(p.grad is not None for p in runtime.dit.model.parameters()):
+        if any(p.grad is not None for name, p in runtime.dit.model.named_parameters()
+               if "lora_" not in name):
             raise RuntimeError("frozen Wan received a gradient")
         bridge_gradient_norm = _module_grad_norm(runtime.module.conditioner.bridge)
         rre_gradient_norm = _module_grad_norm(runtime.module.geometry)
         fusion_gradient_norm = _module_grad_norm(runtime.module.fusion)
+        lora_gradient_norm = math.sqrt(sum(
+            float(parameter.grad.detach().float().square().sum())
+            for parameter in lora_parameters
+        )) if config.wan_lora else 0.0
         gradient_norm = float(torch.nn.utils.clip_grad_norm_(trainable, config.gradient_clip))
         optimizer.step()
         row = {
@@ -2636,6 +2668,10 @@ def _train(args, config: Stage3Config) -> None:
             "bridge_gradient_norm": bridge_gradient_norm,
             "rre_gradient_norm": rre_gradient_norm,
             "fusion_gradient_norm": fusion_gradient_norm,
+            "wan_lora_gradient_norm": lora_gradient_norm,
+            "wan_lora_learning_rate": (
+                float(optimizer.param_groups[1]["lr"]) if config.wan_lora else None
+            ),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "scenes": scenes,
             "view_indices": view_groups,
@@ -2729,6 +2765,7 @@ def _train(args, config: Stage3Config) -> None:
                     dropout_generator, pairing_generator,
                     pairing_weight=pairing_weight if config.pairing_supervision else None,
                 ),
+                wan_model=runtime.dit.model if config.wan_lora else None,
             )
 
 

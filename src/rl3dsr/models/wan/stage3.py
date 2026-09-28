@@ -15,6 +15,7 @@ from torch import nn, Tensor
 
 from .geometry_conditioning import CameraBatch
 from .lq_conditioning import FrozenLQConditioner, conditioned_prediction
+from .wan_lora import LORA_CONFIG, load_wan_lora_state, validate_wan_lora_state, wan_lora_state
 
 
 @dataclass(frozen=True)
@@ -152,12 +153,13 @@ def _states(module: Stage3Conditioning):
 
 
 def save_stage3_checkpoint(path, module: Stage3Conditioning, *, config: dict, step: int,
-                           provenance: dict, training_state: dict | None = None):
-    """Write an immutable adapter bundle; never serialize Wan/VAE/projector."""
+                           provenance: dict, training_state: dict | None = None,
+                           wan_model: nn.Module | None = None):
+    """Write immutable adapter/LoRA weights; never serialize Wan/VAE/projector."""
     if type(step) is not int or step < 0:
         raise ValueError("step must be a non-negative integer")
     payload = {
-        "format": "rl3dsr-stage3", "format_version": 1, "step": step,
+        "format": "rl3dsr-stage3", "format_version": 2 if wan_model is not None else 1, "step": step,
         "config": json.loads(json.dumps(config)), "provenance": dict(provenance),
         "bridge_architecture": {"blocks": list(module.conditioner.bridge_blocks),
                                 "time_conditioning": module.conditioner.bridge_time_conditioning},
@@ -166,6 +168,12 @@ def save_stage3_checkpoint(path, module: Stage3Conditioning, *, config: dict, st
         } for key, item in _states(module).items()},
         "training_state": training_state,
     }
+    if bool(config.get("wan_lora")) != (wan_model is not None):
+        raise ValueError("Wan LoRA config and checkpoint model disagree")
+    if wan_model is not None:
+        state = wan_lora_state(wan_model)
+        validate_wan_lora_state(state, wan_model)
+        payload["wan_lora"] = {"architecture": dict(LORA_CONFIG), "state": state}
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation preserves historical candidates; incomplete writes are
@@ -179,12 +187,21 @@ def validate_stage3_checkpoint_payload(
     module: Stage3Conditioning,
     *,
     expected_config: dict | None = None,
+    wan_model: nn.Module | None = None,
 ) -> dict:
     """Validate a loaded checkpoint without mutating adapter parameters."""
     if not isinstance(payload, dict):
         raise ValueError("unsupported Stage 3 checkpoint; initialize old bridges with load_adapter_checkpoint")
-    if payload.get("format") != "rl3dsr-stage3" or payload.get("format_version") != 1:
+    version = payload.get("format_version")
+    if payload.get("format") != "rl3dsr-stage3" or version not in (1, 2):
         raise ValueError("unsupported Stage 3 checkpoint; initialize old bridges with load_adapter_checkpoint")
+    if version == 2:
+        lora = payload.get("wan_lora")
+        if not isinstance(lora, dict) or lora.get("architecture") != LORA_CONFIG:
+            raise ValueError("Wan LoRA checkpoint architecture mismatch")
+        validate_wan_lora_state(lora.get("state"), wan_model)
+    elif "wan_lora" in payload:
+        raise ValueError("unexpected Wan LoRA state in legacy checkpoint")
     if expected_config is not None:
         if not isinstance(payload.get("config"), dict):
             raise ValueError("Stage 3 checkpoint config mismatch")
@@ -211,6 +228,8 @@ def validate_stage3_checkpoint_payload(
         saved_config.setdefault("pairing_weight_max", 10.0)
         saved_config.setdefault("dynamic_fusion", False)
         saved_config.setdefault("shared_multiview_rope", False)
+        saved_config.setdefault("wan_lora", False)
+        saved_config.setdefault("wan_lora_learning_rate", 1e-5)
         expected.setdefault("target_lr_dropout", 0.0)
         expected.setdefault("epipolar_attention", "global_bias")
         expected.setdefault("epipolar_band", 1.5)
@@ -227,8 +246,12 @@ def validate_stage3_checkpoint_payload(
         expected.setdefault("pairing_weight_max", 10.0)
         expected.setdefault("dynamic_fusion", False)
         expected.setdefault("shared_multiview_rope", False)
+        expected.setdefault("wan_lora", False)
+        expected.setdefault("wan_lora_learning_rate", 1e-5)
         if saved_config != expected:
             raise ValueError("Stage 3 checkpoint config mismatch")
+        if bool(expected["wan_lora"]) != (version == 2):
+            raise ValueError("Stage 3 checkpoint Wan LoRA presence mismatch")
     expected_arch = {"blocks": list(module.conditioner.bridge_blocks),
                      "time_conditioning": module.conditioner.bridge_time_conditioning}
     if payload.get("bridge_architecture") != expected_arch:
@@ -254,18 +277,25 @@ def validate_stage3_checkpoint_payload(
     return payload
 
 
-def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config: dict | None = None):
+def load_stage3_checkpoint(path, module: Stage3Conditioning, *, expected_config: dict | None = None,
+                           wan_model: nn.Module | None = None):
     payload = torch.load(Path(path), map_location="cpu", weights_only=True)
-    validate_stage3_checkpoint_payload(payload, module, expected_config=expected_config)
+    validate_stage3_checkpoint_payload(payload, module, expected_config=expected_config,
+                                       wan_model=wan_model)
+    if payload["format_version"] == 2 and wan_model is None:
+        raise ValueError("Wan LoRA checkpoint requires an injected Wan model")
     states = payload["adapters"]
     for name, item in _states(module).items():
         if item is not None:
             item.load_state_dict(states[name], strict=True)
+    if payload["format_version"] == 2:
+        load_wan_lora_state(wan_model, payload["wan_lora"]["state"])
     return payload
 
 
 def load_stage3_initialization_checkpoint(
-    path, module: Stage3Conditioning, *, reset_fusion: bool = False
+    path, module: Stage3Conditioning, *, reset_fusion: bool = False,
+    wan_model: nn.Module | None = None,
 ):
     """Load adapter parameters without restoring config or training progress.
 
@@ -294,10 +324,17 @@ def load_stage3_initialization_checkpoint(
             "blocks": list(module.conditioner.bridge_blocks),
             "time_conditioning": module.conditioner.bridge_time_conditioning,
         }
-        if payload.get("format") != "rl3dsr-stage3" or payload.get("format_version") != 1:
+        if payload.get("format") != "rl3dsr-stage3" or payload.get("format_version") not in (1, 2):
             raise ValueError("unsupported Stage 3 checkpoint")
         if payload.get("bridge_architecture") != expected_arch:
             raise ValueError("Stage 3 bridge architecture mismatch")
+        if payload["format_version"] == 2:
+            if wan_model is None:
+                raise ValueError("Wan LoRA checkpoint requires an injected Wan model")
+            lora = payload.get("wan_lora")
+            if not isinstance(lora, dict) or lora.get("architecture") != LORA_CONFIG:
+                raise ValueError("Wan LoRA checkpoint architecture mismatch")
+            validate_wan_lora_state(lora.get("state"), wan_model)
         selected = {"bridge": module.conditioner.bridge, "geometry": module.geometry}
         for name, item in selected.items():
             saved = states[name]
@@ -314,5 +351,7 @@ def load_stage3_initialization_checkpoint(
         for name, item in selected.items():
             if item is not None:
                 item.load_state_dict(states[name], strict=True)
+        if payload["format_version"] == 2:
+            load_wan_lora_state(wan_model, payload["wan_lora"]["state"])
         return payload
-    return load_stage3_checkpoint(path, module, expected_config=None)
+    return load_stage3_checkpoint(path, module, expected_config=None, wan_model=wan_model)

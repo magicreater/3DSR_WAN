@@ -1,0 +1,63 @@
+{
+  "allow_self_view_source": false,
+  "arm": "A5",
+  "camera_rank_margin_ratio": 0.05,
+  "camera_rank_weight": 1.0,
+  "checkpoint_every": 500,
+  "dataset_kind": "nerf_synthetic",
+  "dynamic_fusion": false,
+  "epipolar_attention": "local_band",
+  "epipolar_band": 1.5,
+  "epipolar_tau": 1.0,
+  "final_groups_per_scene": 8,
+  "final_inference_seeds": [
+    3302,
+    3303,
+    3304
+  ],
+  "fusion_dim": 192,
+  "fusion_heads": 1,
+  "gradient_accumulation": 4,
+  "gradient_clip": 1.0,
+  "image_factor": 1,
+  "image_size": 256,
+  "learning_rate": 0.0001,
+  "nearest_views": 12,
+  "pairing_calibration_batches": 8,
+  "pairing_minimum_coverage": 0.05,
+  "pairing_target_gradient_ratio": 0.25,
+  "pairing_temperature": 0.07,
+  "pairing_weight_max": 10.0,
+  "pairing_weight_min": 1e-05,
+  "query_chunk_size": 128,
+  "sampling_shift": 5.0,
+  "sampling_steps": 50,
+  "scale": 4,
+  "shared_multiview_rope": false,
+  "steps": 4000,
+  "symmetric_camera_fraction": 0.5,
+  "symmetric_correspondence_rank": false,
+  "target_lr_dropout": 0.5,
+  "test_scenes": [
+    "materials",
+    "ship"
+  ],
+  "train_scenes": [
+    "chair",
+    "lego",
+    "drums",
+    "hotdog",
+    "mic"
+  ],
+  "training_seeds": [
+    42,
+    43
+  ],
+  "validation_groups_per_scene": 4,
+  "validation_inference_seed": 3301,
+  "validation_scenes": [
+    "ficus"
+  ],
+  "views": 8,
+  "weight_decay": 0.01
+}
