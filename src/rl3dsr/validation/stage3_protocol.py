@@ -80,6 +80,7 @@ class Stage3Config:
     image_factor: int = 1
     wan_lora: bool = False
     wan_lora_learning_rate: float = 1e-5
+    paired_wan_forward: bool = False
 
     def __post_init__(self):
         if self.arm not in ARM_MODES:
@@ -201,6 +202,10 @@ class Stage3Config:
                 raise ValueError("A5 requires pairing weight clip [0.01,10] or [1e-5,10]")
         if type(self.wan_lora) is not bool or (self.wan_lora and self.arm != "A5"):
             raise ValueError("wan_lora must be boolean and requires A5")
+        if type(self.paired_wan_forward) is not bool or (
+            self.paired_wan_forward and (self.arm != "A5" or self.camera_rank_weight <= 0)
+        ):
+            raise ValueError("paired_wan_forward must be boolean and requires A5 camera ranking")
         if (isinstance(self.wan_lora_learning_rate, bool)
                 or not isinstance(self.wan_lora_learning_rate, (int, float))
                 or not math.isfinite(self.wan_lora_learning_rate)
@@ -242,6 +247,8 @@ class Stage3Config:
         if not self.wan_lora:
             payload.pop("wan_lora")
             payload.pop("wan_lora_learning_rate")
+        if not self.paired_wan_forward:
+            payload.pop("paired_wan_forward")
         return payload
 
 

@@ -60,6 +60,29 @@ def test_scene_index_and_cpu_camera_are_reused(runner, tmp_path, monkeypatch):
         runner._scene_data.cache_clear()
 
 
+def test_paired_wan_prediction_keeps_correct_wrong_order(runner):
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+
+    class Module:
+        def predict(self, dit, noisy, timestep, context, features, camera, shape):
+            assert dit == "dit" and context is None and shape == (4, 2, 2)
+            assert noisy.shape == (2, 16, 4, 2, 2)
+            assert timestep.tolist() == [500, 500]
+            assert features[:, 0, 0].tolist() == [3, 7]
+            assert camera.K.shape == (2, 4, 3, 3)
+            return noisy + torch.arange(2).view(2, 1, 1, 1, 1)
+
+    camera = CameraBatch(torch.eye(3).repeat(1, 4, 1, 1),
+                         torch.eye(4).repeat(1, 4, 1, 1), (16, 16), "multiview")
+    runtime = SimpleNamespace(module=Module(), dit="dit")
+    correct, wrong = runner._predict_camera_pair(
+        runtime, torch.zeros(1, 16, 4, 2, 2), torch.tensor([500]),
+        torch.full((1, 4, 2), 3.0), torch.full((1, 4, 2), 7.0), camera, (4, 2, 2),
+    )
+    assert torch.count_nonzero(correct) == 0
+    assert torch.all(wrong == 1)
+
+
 def test_missing_inputs_fail_before_runtime(runner, tmp_path, monkeypatch):
     config = tmp_path / "config.json"
     config.write_text('{}')

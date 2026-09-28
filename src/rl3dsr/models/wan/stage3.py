@@ -230,6 +230,7 @@ def validate_stage3_checkpoint_payload(
         saved_config.setdefault("shared_multiview_rope", False)
         saved_config.setdefault("wan_lora", False)
         saved_config.setdefault("wan_lora_learning_rate", 1e-5)
+        saved_config.setdefault("paired_wan_forward", False)
         expected.setdefault("target_lr_dropout", 0.0)
         expected.setdefault("epipolar_attention", "global_bias")
         expected.setdefault("epipolar_band", 1.5)
@@ -248,6 +249,7 @@ def validate_stage3_checkpoint_payload(
         expected.setdefault("shared_multiview_rope", False)
         expected.setdefault("wan_lora", False)
         expected.setdefault("wan_lora_learning_rate", 1e-5)
+        expected.setdefault("paired_wan_forward", False)
         if saved_config != expected:
             raise ValueError("Stage 3 checkpoint config mismatch")
         if bool(expected["wan_lora"]) != (version == 2):

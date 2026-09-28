@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import csv
+from dataclasses import replace
 from functools import lru_cache
 import hashlib
 import json
@@ -1799,6 +1800,24 @@ def _stage3_optimizer(adapter_parameters, wan_parameters, config: Stage3Config):
     return torch.optim.AdamW(groups, weight_decay=config.weight_decay)
 
 
+def _predict_camera_pair(runtime: Runtime, noisy, timestep, prepared, wrong_prepared,
+                         camera: CameraBatch, latent_shape):
+    """Evaluate A5 correct and wrong fusion with one Wan batch."""
+    pair_camera = replace(
+        camera,
+        K=torch.cat((camera.K, camera.K)),
+        T_world_from_camera=torch.cat((camera.T_world_from_camera, camera.T_world_from_camera)),
+        xi=None if camera.xi is None else torch.cat((camera.xi, camera.xi)),
+    )
+    prediction = runtime.module.predict(
+        runtime.dit, torch.cat((noisy, noisy)), torch.cat((timestep, timestep)),
+        None, torch.cat((prepared, wrong_prepared)), pair_camera, latent_shape,
+    )
+    if prediction.shape[0] != 2 * noisy.shape[0]:
+        raise RuntimeError("paired Wan output batch does not match inputs")
+    return prediction.chunk(2, dim=0)
+
+
 def _trial_generator_state(value: torch.Tensor, *, device: str, label: str) -> None:
     """Ask a private generator to parse state without touching a global RNG."""
     try:
@@ -2268,8 +2287,10 @@ def _train(args, config: Stage3Config) -> None:
         manifest_config.setdefault("shared_multiview_rope", False)
         manifest_config.setdefault("wan_lora", False)
         manifest_config.setdefault("wan_lora_learning_rate", 1e-5)
+        manifest_config.setdefault("paired_wan_forward", False)
         expected_config.setdefault("wan_lora", False)
         expected_config.setdefault("wan_lora_learning_rate", 1e-5)
+        expected_config.setdefault("paired_wan_forward", False)
         if manifest_config != expected_config or manifest.get("provenance", {}).get("training_seed") != args.seed:
             raise ValueError("resume manifest does not match config and training seed")
         if config.pairing_supervision:
@@ -2456,15 +2477,11 @@ def _train(args, config: Stage3Config) -> None:
                 dtype=clean.dtype,
             )
             noisy, timestep, target = flow_matching_pair(clean, noise, sigma)
-            prediction = runtime.module.predict(
-                runtime.dit,
-                noisy,
-                timestep,
-                None,
-                prepared,
-                camera,
-                tuple(clean.shape[2:]),
-            )
+            if not config.paired_wan_forward:
+                prediction = runtime.module.predict(
+                    runtime.dit, noisy, timestep, None, prepared, camera,
+                    tuple(clean.shape[2:]),
+                )
             if config.camera_rank_weight > 0:
                 assert wrong_camera is not None
                 wrong_prepared = runtime.module.prepare_multiview(
@@ -2473,15 +2490,16 @@ def _train(args, config: Stage3Config) -> None:
                     tuple(clean.shape[2:]),
                     (config.image_size, config.image_size),
                 )
-                prediction_wrong = runtime.module.predict(
-                    runtime.dit,
-                    noisy,
-                    timestep,
-                    None,
-                    wrong_prepared,
-                    camera,
-                    tuple(clean.shape[2:]),
-                )
+                if config.paired_wan_forward:
+                    prediction, prediction_wrong = _predict_camera_pair(
+                        runtime, noisy, timestep, prepared, wrong_prepared,
+                        camera, tuple(clean.shape[2:]),
+                    )
+                else:
+                    prediction_wrong = runtime.module.predict(
+                        runtime.dit, noisy, timestep, None, wrong_prepared, camera,
+                        tuple(clean.shape[2:]),
+                    )
                 flow_term, e_correct, e_wrong, rank = _camera_pair_training_losses(
                     prediction,
                     prediction_wrong,
