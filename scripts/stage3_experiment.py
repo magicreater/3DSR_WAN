@@ -270,7 +270,7 @@ def load_runtime(
     vae = WanVAE.from_checkpoint(model_dir, device=device, dtype=torch.bfloat16)
     dit = WanDiT.from_checkpoint(model_dir, device=device, dtype=torch.bfloat16)
     if config.wan_lora:
-        inject_wan_lora(dit.model)
+        inject_wan_lora(dit.model, config.wan_lora_blocks)
     geometry = FullRREConditioner(branch_count=len(dit.model.blocks)).to(device)
     if rre_checkpoint is not None:
         load_geometry_checkpoint(
@@ -2482,7 +2482,7 @@ def _train(args, config: Stage3Config) -> None:
                     prediction_wrong,
                     target,
                     margin_ratio=config.camera_rank_margin_ratio,
-                    target_view_only=config.arm == "A6",
+                    target_view_only=(config.arm == "A6" or config.camera_rank_view_scope == "target"),
                     target_view_flow_fraction=config.target_view_flow_fraction,
                 )
                 camera_rank_scale = (
@@ -2738,6 +2738,8 @@ def _train(args, config: Stage3Config) -> None:
                             for name, values in lr_rank_gradient_groups.items()
                         },
                     })
+            elif config.camera_rank_view_scope == "target":
+                row["camera_rank_scope"] = "target_view_0"
         if config.pairing_supervision:
             row.update(a5_step_telemetry(
                 flow_losses=main_flow_losses,

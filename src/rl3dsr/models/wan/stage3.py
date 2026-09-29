@@ -15,7 +15,10 @@ from torch import nn, Tensor
 
 from .geometry_conditioning import CameraBatch
 from .lq_conditioning import FrozenLQConditioner, conditioned_prediction
-from .wan_lora import LORA_CONFIG, load_wan_lora_state, validate_wan_lora_state, wan_lora_state
+from .wan_lora import (
+    load_wan_lora_state, lora_architecture, validate_wan_lora_architecture,
+    validate_wan_lora_state, wan_lora_blocks, wan_lora_state,
+)
 
 
 @dataclass(frozen=True)
@@ -173,7 +176,9 @@ def save_stage3_checkpoint(path, module: Stage3Conditioning, *, config: dict, st
     if wan_model is not None:
         state = wan_lora_state(wan_model)
         validate_wan_lora_state(state, wan_model)
-        payload["wan_lora"] = {"architecture": dict(LORA_CONFIG), "state": state}
+        payload["wan_lora"] = {
+            "architecture": lora_architecture(wan_lora_blocks(wan_model)), "state": state,
+        }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation preserves historical candidates; incomplete writes are
@@ -197,9 +202,10 @@ def validate_stage3_checkpoint_payload(
         raise ValueError("unsupported Stage 3 checkpoint; initialize old bridges with load_adapter_checkpoint")
     if version == 2:
         lora = payload.get("wan_lora")
-        if not isinstance(lora, dict) or lora.get("architecture") != LORA_CONFIG:
+        if not isinstance(lora, dict):
             raise ValueError("Wan LoRA checkpoint architecture mismatch")
-        validate_wan_lora_state(lora.get("state"), wan_model)
+        blocks = validate_wan_lora_architecture(lora.get("architecture"), wan_model)
+        validate_wan_lora_state(lora.get("state"), wan_model, blocks)
     elif "wan_lora" in payload:
         raise ValueError("unexpected Wan LoRA state in legacy checkpoint")
     if expected_config is not None:
@@ -332,9 +338,10 @@ def load_stage3_initialization_checkpoint(
             if wan_model is None:
                 raise ValueError("Wan LoRA checkpoint requires an injected Wan model")
             lora = payload.get("wan_lora")
-            if not isinstance(lora, dict) or lora.get("architecture") != LORA_CONFIG:
+            if not isinstance(lora, dict):
                 raise ValueError("Wan LoRA checkpoint architecture mismatch")
-            validate_wan_lora_state(lora.get("state"), wan_model)
+            blocks = validate_wan_lora_architecture(lora.get("architecture"), wan_model)
+            validate_wan_lora_state(lora.get("state"), wan_model, blocks)
         selected = {"bridge": module.conditioner.bridge, "geometry": module.geometry}
         for name, item in selected.items():
             saved = states[name]

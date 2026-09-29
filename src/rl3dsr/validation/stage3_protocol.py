@@ -80,6 +80,8 @@ class Stage3Config:
     image_factor: int = 1
     wan_lora: bool = False
     wan_lora_learning_rate: float = 1e-5
+    wan_lora_blocks: tuple[int, ...] = (0, 1, 2, 3)
+    camera_rank_view_scope: str = "all"
 
     def __post_init__(self):
         if self.arm not in ARM_MODES:
@@ -201,6 +203,14 @@ class Stage3Config:
                 raise ValueError("A5 requires pairing weight clip [0.01,10] or [1e-5,10]")
         if type(self.wan_lora) is not bool or (self.wan_lora and self.arm != "A5"):
             raise ValueError("wan_lora must be boolean and requires A5")
+        if self.wan_lora_blocks not in ((0, 1, 2, 3), (12, 13, 14, 15)):
+            raise ValueError("wan_lora_blocks must select the first or middle four Wan blocks")
+        if not self.wan_lora and self.wan_lora_blocks != (0, 1, 2, 3):
+            raise ValueError("wan_lora_blocks requires wan_lora")
+        if self.camera_rank_view_scope not in ("all", "target"):
+            raise ValueError("camera_rank_view_scope must be all or target")
+        if self.camera_rank_view_scope == "target" and self.arm != "A5":
+            raise ValueError("target camera ranking requires A5")
         if (isinstance(self.wan_lora_learning_rate, bool)
                 or not isinstance(self.wan_lora_learning_rate, (int, float))
                 or not math.isfinite(self.wan_lora_learning_rate)
@@ -242,6 +252,10 @@ class Stage3Config:
         if not self.wan_lora:
             payload.pop("wan_lora")
             payload.pop("wan_lora_learning_rate")
+        if self.wan_lora_blocks == (0, 1, 2, 3):
+            payload.pop("wan_lora_blocks")
+        if self.camera_rank_view_scope == "all":
+            payload.pop("camera_rank_view_scope")
         return payload
 
 
@@ -252,7 +266,7 @@ def load_stage3_config(path: str | Path) -> Stage3Config:
     unknown = set(payload) - {f.name for f in fields(Stage3Config)}
     if unknown:
         raise ValueError(f"Unknown config fields: {sorted(unknown)}")
-    for name in ("train_scenes", "validation_scenes", "test_scenes", "training_seeds", "final_inference_seeds"):
+    for name in ("train_scenes", "validation_scenes", "test_scenes", "training_seeds", "final_inference_seeds", "wan_lora_blocks"):
         if name in payload:
             if not isinstance(payload[name], list):
                 raise ValueError(f"{name} must be a JSON array")

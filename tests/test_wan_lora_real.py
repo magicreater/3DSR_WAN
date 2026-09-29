@@ -10,7 +10,8 @@ from rl3dsr.models.wan.wan_lora import inject_wan_lora
 
 
 @pytest.mark.wan
-def test_real_wan_lora_is_noop_then_backpropagates():
+@pytest.mark.parametrize("blocks", [(0, 1, 2, 3), (12, 13, 14, 15)])
+def test_real_wan_lora_is_noop_then_backpropagates(blocks):
     model_dir = os.environ.get("WAN_MODEL_DIR")
     if not model_dir or not torch.cuda.is_available():
         pytest.skip("WAN_MODEL_DIR and CUDA are required")
@@ -20,7 +21,7 @@ def test_real_wan_lora_is_noop_then_backpropagates():
     timestep = torch.tensor([500.0], device="cuda")
     with torch.no_grad():
         before = dit(latents, timestep)
-    parameters = inject_wan_lora(dit.model)
+    parameters = inject_wan_lora(dit.model, blocks)
     with torch.no_grad():
         after = dit(latents, timestep)
     assert torch.equal(before, after)

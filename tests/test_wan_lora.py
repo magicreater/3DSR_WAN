@@ -40,7 +40,7 @@ class Block(nn.Module):
 class TinyWan(nn.Module):
     def __init__(self):
         super().__init__()
-        self.blocks = nn.ModuleList(Block() for _ in range(6))
+        self.blocks = nn.ModuleList(Block() for _ in range(16))
 
     def forward(self, x):
         for block in self.blocks:
@@ -48,12 +48,15 @@ class TinyWan(nn.Module):
         return x
 
 
-def test_first_four_lora_is_initially_noop_and_only_it_gets_wan_gradients():
+@pytest.mark.parametrize("blocks", [(0, 1, 2, 3), (12, 13, 14, 15)])
+def test_selected_lora_is_initially_noop_and_only_it_gets_wan_gradients(blocks):
     model = TinyWan().eval().requires_grad_(False)
     x = torch.randn(2, 3, 16)
     before = model(x).detach()
-    parameters = inject_wan_lora(model)
+    parameters = inject_wan_lora(model, blocks)
     assert len(parameters) == 32
+    assert {int(name.split(".")[1]) for name, _ in model.named_parameters()
+            if "lora_" in name} == set(blocks)
     assert torch.equal(model(x).detach(), before)
     assert not any(parameter.requires_grad for name, parameter in model.named_parameters()
                    if "lora_" not in name)
@@ -66,27 +69,34 @@ def test_first_four_lora_is_initially_noop_and_only_it_gets_wan_gradients():
         inject_wan_lora(model)
 
 
-def test_lora_checkpoint_roundtrip_and_legacy_parent(tmp_path):
+@pytest.mark.parametrize("blocks", [(0, 1, 2, 3), (12, 13, 14, 15)])
+def test_lora_checkpoint_roundtrip_and_legacy_parent(tmp_path, blocks):
     source = TinyWan().eval().requires_grad_(False)
-    inject_wan_lora(source)
+    inject_wan_lora(source, blocks)
     with torch.no_grad():
         for parameter in wan_lora_parameters(source):
             parameter.add_(0.01)
     module = bundle()
     config = {"arm": "A5", "wan_lora": True, "wan_lora_learning_rate": 1e-5}
+    if blocks[0] == 12:
+        config["wan_lora_blocks"] = list(blocks)
     path = tmp_path / "lora.pt"
     save_stage3_checkpoint(path, module, config=config, step=3, provenance={"wan_checkpoint_sha256": "abc"},
                            wan_model=source)
     target = TinyWan().eval().requires_grad_(False)
-    inject_wan_lora(target)
+    inject_wan_lora(target, blocks)
     loaded = load_stage3_checkpoint(path, bundle(), expected_config=config, wan_model=target)
     assert loaded["format_version"] == 2
     assert all(torch.equal(value, wan_lora_state(target)[name])
                for name, value in wan_lora_state(source).items())
+    wrong = TinyWan().eval().requires_grad_(False)
+    inject_wan_lora(wrong, (12, 13, 14, 15) if blocks[0] == 0 else (0, 1, 2, 3))
+    with pytest.raises(ValueError, match="architecture mismatch"):
+        load_stage3_checkpoint(path, bundle(), expected_config=config, wan_model=wrong)
     legacy = tmp_path / "legacy.pt"
     save_stage3_checkpoint(legacy, module, config={"arm": "A5"}, step=1, provenance={})
     fresh = TinyWan().eval().requires_grad_(False)
-    inject_wan_lora(fresh)
+    inject_wan_lora(fresh, blocks)
     initial = wan_lora_state(fresh)
     load_stage3_initialization_checkpoint(legacy, bundle(), wan_model=fresh)
     assert all(torch.equal(value, wan_lora_state(fresh)[name]) for name, value in initial.items())

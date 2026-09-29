@@ -42,10 +42,27 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
     assert Stage3Config().dataset_kind == "nerf_synthetic"
     assert Stage3Config().wan_lora is False
     assert "wan_lora" not in Stage3Config().to_dict()
+    assert "wan_lora_blocks" not in Stage3Config().to_dict()
+    assert "camera_rank_view_scope" not in Stage3Config().to_dict()
     assert Stage3Config(arm="A5", fusion_heads=1, epipolar_attention="local_band",
                         allow_self_view_source=False, wan_lora=True).to_dict()["wan_lora"] is True
     with pytest.raises(ValueError, match="requires A5"):
         replace(Stage3Config(), wan_lora=True)
+    a5_lora = Stage3Config(
+        arm="A5", fusion_heads=1, epipolar_attention="local_band",
+        allow_self_view_source=False, wan_lora=True,
+    )
+    middle_target = replace(
+        a5_lora, wan_lora_blocks=(12, 13, 14, 15), camera_rank_view_scope="target",
+    )
+    path.write_text(json.dumps(middle_target.to_dict()))
+    assert load_stage3_config(path) == middle_target
+    with pytest.raises(ValueError, match="wan_lora_blocks"):
+        replace(a5_lora, wan_lora_blocks=(0, 1, 2, 12))
+    with pytest.raises(ValueError, match="requires wan_lora"):
+        replace(middle_target, wan_lora=False)
+    with pytest.raises(ValueError, match="target camera ranking requires A5"):
+        replace(Stage3Config(), camera_rank_view_scope="target")
     assert replace(Stage3Config(), dataset_kind="mipnerf360", image_factor=4).image_factor == 4
     with pytest.raises(ValueError, match="image_factor"):
         replace(Stage3Config(), image_factor=4)

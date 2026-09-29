@@ -44,6 +44,22 @@ def a5_config(**changes):
     return config
 
 
+def test_target_camera_rank_keeps_correct_flow_on_all_views(runner):
+    target = torch.zeros(1, 1, 4, 2, 2)
+    correct = target.clone()
+    correct[:, :, 1:] = 1
+    wrong = correct.clone()
+    wrong[:, :, 0] = 2
+    all_flow, all_correct, _, _ = runner._camera_pair_training_losses(
+        correct, wrong, target, margin_ratio=0.05, target_view_only=False,
+    )
+    target_flow, target_correct, _, _ = runner._camera_pair_training_losses(
+        correct, wrong, target, margin_ratio=0.05, target_view_only=True,
+    )
+    assert torch.equal(all_flow, target_flow)
+    assert all_correct.item() > target_correct.item() == 0
+
+
 def valid_preflight_payload(config, *, training_seed=42):
     batches = []
     for index in range(8):
