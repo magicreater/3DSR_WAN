@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import numpy as np
 
 
 @pytest.fixture
@@ -24,6 +25,62 @@ def test_inspect_has_no_runtime_or_output_side_effects(runner, tmp_path, monkeyp
     runner.main(["inspect", "--config", str(config)])
     assert json.loads(capsys.readouterr().out)["arm"] == "A3"
     assert list(tmp_path.iterdir()) == [config]
+
+
+def test_scene_index_and_cpu_camera_are_reused(runner, tmp_path, monkeypatch):
+    from rl3dsr.data import Split
+    from rl3dsr.validation.stage3_protocol import Stage3Config
+
+    calls = []
+    observation = SimpleNamespace(K=np.eye(3, dtype=np.float32),
+                                  T_world_from_camera=np.eye(4, dtype=np.float32),
+                                  width=16, height=16)
+
+    class Adapter:
+        def __init__(self, root):
+            self.root = root
+
+        def index(self, split):
+            calls.append(split)
+            return SimpleNamespace(observations=(observation,))
+
+    monkeypatch.setattr(runner, "NeRFSyntheticAdapter", Adapter)
+    config = Stage3Config()
+    runner._scene_data.cache_clear()
+    runner._scene_camera.cache_clear()
+    try:
+        first = runner._scene_camera(tmp_path, config, Split.TRAIN)
+        second = runner._scene_camera(tmp_path, config, Split.TRAIN)
+        assert first is second
+        assert len(calls) == 1
+        assert runner._scene_data(tmp_path, config, Split.TRAIN)[1].observations[0] is observation
+        assert len(calls) == 1
+    finally:
+        runner._scene_camera.cache_clear()
+        runner._scene_data.cache_clear()
+
+
+def test_paired_wan_prediction_keeps_correct_wrong_order(runner):
+    from rl3dsr.models.wan.geometry_conditioning import CameraBatch
+
+    class Module:
+        def predict(self, dit, noisy, timestep, context, features, camera, shape):
+            assert dit == "dit" and context is None and shape == (4, 2, 2)
+            assert noisy.shape == (2, 16, 4, 2, 2)
+            assert timestep.tolist() == [500, 500]
+            assert features[:, 0, 0].tolist() == [3, 7]
+            assert camera.K.shape == (2, 4, 3, 3)
+            return noisy + torch.arange(2).view(2, 1, 1, 1, 1)
+
+    camera = CameraBatch(torch.eye(3).repeat(1, 4, 1, 1),
+                         torch.eye(4).repeat(1, 4, 1, 1), (16, 16), "multiview")
+    runtime = SimpleNamespace(module=Module(), dit="dit")
+    correct, wrong = runner._predict_camera_pair(
+        runtime, torch.zeros(1, 16, 4, 2, 2), torch.tensor([500]),
+        torch.full((1, 4, 2), 3.0), torch.full((1, 4, 2), 7.0), camera, (4, 2, 2),
+    )
+    assert torch.count_nonzero(correct) == 0
+    assert torch.all(wrong == 1)
 
 
 def test_missing_inputs_fail_before_runtime(runner, tmp_path, monkeypatch):

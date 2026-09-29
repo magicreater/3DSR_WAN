@@ -146,12 +146,13 @@ def mutual_epipolar_patch_pairs(
     ):
         raise ValueError('minimum_coverage must be finite and in [0,1]')
     discovery = torch.nn.functional.normalize(features.detach().float(), dim=-1)
+    valid_pairs = usable.reshape(b, views, patches, views).any(dim=2).cpu().tolist()
     result = []
     for batch in range(b):
         for target in range(views):
             target_slice = slice(target * patches, (target + 1) * patches)
             for source in range(views):
-                if source == target or not bool(usable[batch, target_slice, source].any()):
+                if source == target or not valid_pairs[batch][target][source]:
                     continue
                 source_slice = slice(source * patches, (source + 1) * patches)
                 pair_usable = usable[batch, target_slice, source]
@@ -341,22 +342,8 @@ class LRViewFusion(nn.Module):
             features, allowed, usable, minimum_coverage=minimum_coverage
         )
         valid_pair_identities = [
-            {
-                'batch_index': batch_index,
-                'target_view': target_view,
-                'source_view': source_view,
-            }
-            for batch_index in range(b)
-            for target_view in range(views)
-            for source_view in range(views)
-            if target_view != source_view
-            and bool(
-                usable[
-                    batch_index,
-                    target_view * patches:(target_view + 1) * patches,
-                    source_view,
-                ].any()
-            )
+            {key: pair[key] for key in ('batch_index', 'target_view', 'source_view')}
+            for pair in pairs
         ]
         return {
             'query': q,

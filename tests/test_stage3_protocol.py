@@ -44,6 +44,15 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
     assert "wan_lora" not in Stage3Config().to_dict()
     assert Stage3Config(arm="A5", fusion_heads=1, epipolar_attention="local_band",
                         allow_self_view_source=False, wan_lora=True).to_dict()["wan_lora"] is True
+    assert "paired_wan_forward" not in Stage3Config().to_dict()
+    assert Stage3Config(arm="A5", fusion_heads=1, epipolar_attention="local_band",
+                        allow_self_view_source=False, camera_rank_weight=1.0,
+                        paired_wan_forward=True).to_dict()["paired_wan_forward"] is True
+    with pytest.raises(ValueError, match="requires A5"):
+        replace(Stage3Config(), paired_wan_forward=True)
+    with pytest.raises(ValueError, match="camera ranking"):
+        Stage3Config(arm="A5", fusion_heads=1, epipolar_attention="local_band",
+                     allow_self_view_source=False, paired_wan_forward=True)
     with pytest.raises(ValueError, match="requires A5"):
         replace(Stage3Config(), wan_lora=True)
     assert replace(Stage3Config(), dataset_kind="mipnerf360", image_factor=4).image_factor == 4

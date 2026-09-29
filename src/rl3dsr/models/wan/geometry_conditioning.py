@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -32,6 +32,7 @@ class CameraBatch:
     reference_index: int = 0
     camera_model: str = "pinhole"
     xi: Tensor | None = None
+    _validated_signature: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
     def validate(self, batch: int | None = None) -> None:
         if self.K.ndim != 4 or self.K.shape[-2:] != (3, 3):
@@ -42,6 +43,13 @@ class CameraBatch:
             raise ValueError("K and T_world_from_camera must share [B,S]")
         if batch is not None and self.K.shape[0] != batch:
             raise ValueError(f"camera batch must have B={batch}")
+        tensors = (self.K, self.T_world_from_camera) + ((self.xi,) if isinstance(self.xi, Tensor) else ())
+        signature = None if any(torch.is_inference(value) for value in tensors) else (
+            tuple((id(value), value._version) for value in tensors),
+            self.image_size, self.sequence_kind, self.reference_index, self.camera_model,
+        )
+        if signature is not None and signature == self._validated_signature:
+            return
         if not torch.is_floating_point(self.K) or not torch.is_floating_point(self.T_world_from_camera):
             raise ValueError("camera tensors must be floating point")
         if self.K.device != self.T_world_from_camera.device or self.K.dtype != self.T_world_from_camera.dtype:
@@ -84,6 +92,8 @@ class CameraBatch:
             rtol=0,
         ):
             raise ValueError("camera transforms must have homogeneous last row [0,0,0,1]")
+        if signature is not None:
+            object.__setattr__(self, "_validated_signature", signature)
 
 
 def _normalize(value: Tensor, eps: float = 1e-6) -> Tensor:
