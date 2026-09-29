@@ -76,11 +76,12 @@ class Runtime:
         self.checkpoint = checkpoint
 
 
-def scene_routes(config: Stage3Config, phase: str) -> list[tuple[str, str]]:
+def scene_routes(config: Stage3Config, phase: str, *, validation_only: bool = False) -> list[tuple[str, str]]:
     if phase == "train":
         return [(scene, "train") for scene in config.train_scenes]
     if phase == "validate":
-        return [(scene, "val") for scene in config.validation_scene_names]
+        scenes = config.validation_scenes if validation_only else config.validation_scene_names
+        return [(scene, "val") for scene in scenes]
     if phase == "test":
         return [(scene, "test") for scene in config.test_scenes]
     raise ValueError("phase must be train, validate or test")
@@ -3369,7 +3370,7 @@ def _evaluate(
     payload = runtime.checkpoint or {}
     step = int(payload.get("step", -1))
     training_seed = payload.get("provenance", {}).get("training_seed")
-    routes = scene_routes(config, phase)
+    routes = scene_routes(config, phase, validation_only=getattr(args, "validation_scenes_only", False))
     groups = (
         config.final_groups_per_scene if phase == "test" else config.validation_groups_per_scene
     )
@@ -3505,11 +3506,13 @@ def _parser() -> argparse.ArgumentParser:
     _add_runtime_paths(validate)
     validate.add_argument("--checkpoint", type=Path, required=True)
     validate.add_argument("--output-dir", type=Path, required=True)
+    validate.add_argument("--validation-scenes-only", action="store_true")
     intervene = subparsers.add_parser("intervene")
     intervene.add_argument("--config", type=Path, required=True)
     _add_runtime_paths(intervene)
     intervene.add_argument("--checkpoint", type=Path, required=True)
     intervene.add_argument("--output-dir", type=Path, required=True)
+    intervene.add_argument("--validation-scenes-only", action="store_true")
     intervene.add_argument(
         "--modes",
         nargs="+",

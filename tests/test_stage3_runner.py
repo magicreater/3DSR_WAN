@@ -137,6 +137,7 @@ def test_split_routes_do_not_touch_test_during_development(runner):
     config = Stage3Config()
     assert runner.scene_routes(config, "train") == [(s, "train") for s in config.train_scenes]
     assert runner.scene_routes(config, "validate") == [(s, "val") for s in config.validation_scene_names]
+    assert runner.scene_routes(config, "validate", validation_only=True) == [(s, "val") for s in config.validation_scenes]
     assert runner.scene_routes(config, "test") == [(s, "test") for s in config.test_scenes]
 
 
