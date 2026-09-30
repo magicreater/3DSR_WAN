@@ -1,0 +1,1 @@
+{"arm":"A5","allow_self_view_source":false,"epipolar_attention":"local_band","fusion_heads":1,"views":8,"steps":12000,"checkpoint_every":4000,"target_lr_dropout":0.5,"camera_rank_weight":0.0,"pairing_weight_min":1e-5}
