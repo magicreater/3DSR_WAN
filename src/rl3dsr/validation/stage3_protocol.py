@@ -76,6 +76,7 @@ class Stage3Config:
     pairing_target_gradient_ratio: float = 0.25
     pairing_weight_min: float = 0.01
     pairing_weight_max: float = 10.0
+    pairing_supervision_enabled: bool | None = None
     dataset_kind: str = "nerf_synthetic"
     image_factor: int = 1
     wan_lora: bool = False
@@ -152,11 +153,13 @@ class Stage3Config:
             )
         value = self.target_view_flow_fraction
         if value is not None and (
-            self.arm != "A6" or self.views < 2 or isinstance(value, bool)
+            self.arm not in {"A5", "A6"} or self.views < 2 or isinstance(value, bool)
             or not isinstance(value, (int, float)) or not math.isfinite(value)
             or not 0 < value < 1
         ):
-            raise ValueError("target_view_flow_fraction requires A6, multiple views, and a fraction in (0, 1)")
+            raise ValueError("target_view_flow_fraction requires A5/A6, multiple views, and a fraction in (0, 1)")
+        if value is not None and self.arm == "A5" and (self.camera_rank_weight > 0 or self.pairing_supervision):
+            raise ValueError("A5 target_view_flow_fraction requires ranking and pairing disabled")
         value = self.correct_image_ssim_weight
         if value is not None and (
             self.arm != "A6" or self.target_view_flow_fraction is not None
@@ -201,6 +204,10 @@ class Stage3Config:
                 raise ValueError("A5 requires pairing_target_gradient_ratio=0.25")
             if self.pairing_weight_min not in (0.01, 1e-5) or self.pairing_weight_max != 10.0:
                 raise ValueError("A5 requires pairing weight clip [0.01,10] or [1e-5,10]")
+        if self.pairing_supervision_enabled is not None and (
+            type(self.pairing_supervision_enabled) is not bool or self.arm != "A5"
+        ):
+            raise ValueError("pairing_supervision_enabled must be boolean and requires A5")
         if type(self.wan_lora) is not bool or (self.wan_lora and self.arm != "A5"):
             raise ValueError("wan_lora must be boolean and requires A5")
         if self.wan_lora_blocks not in ((0, 1, 2, 3), (12, 13, 14, 15)):
@@ -229,7 +236,7 @@ class Stage3Config:
 
     @property
     def pairing_supervision(self) -> bool:
-        return self.arm == "A5"
+        return self.arm == "A5" if self.pairing_supervision_enabled is None else self.pairing_supervision_enabled
 
     @property
     def pairing_protocol(self) -> dict:
@@ -245,6 +252,8 @@ class Stage3Config:
         payload = asdict(self)
         if self.target_view_flow_fraction is None:
             payload.pop("target_view_flow_fraction")
+        if self.pairing_supervision_enabled is None:
+            payload.pop("pairing_supervision_enabled")
         if self.correct_image_ssim_weight is None:
             payload.pop("correct_image_ssim_weight")
         if not self.paired_image_ssim_rank:

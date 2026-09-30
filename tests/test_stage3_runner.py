@@ -408,6 +408,14 @@ def test_a6_ranking_uses_only_target_view_but_flow_uses_all_views(runner):
     assert torch.equal(runner.per_view_flow_losses(correct, target), torch.tensor([[1.0, 4.0, 9.0]]))
 
 
+def test_a5_target_flow_weighting_applies_only_when_requested(runner):
+    target = torch.zeros(1, 1, 8, 1, 1)
+    prediction = torch.ones_like(target)
+    prediction[:, :, 0] = 3
+    assert runner._correct_flow_loss(prediction, target) == 2
+    assert runner._correct_flow_loss(prediction, target, 0.25) == 3
+
+
 def test_camera_rank_gradient_groups_split_existing_modules(runner):
     from types import SimpleNamespace
 

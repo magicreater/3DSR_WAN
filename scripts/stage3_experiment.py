@@ -210,11 +210,16 @@ def _mip_scene_data(root: Path, factor: int, split: Split):
     return adapter, adapter.index(split)
 
 
+@lru_cache(maxsize=32)
+def _nerf_scene_data(root: Path, split: Split):
+    adapter = NeRFSyntheticAdapter(root)
+    return adapter, adapter.index(split)
+
+
 def _scene_data(root: Path, config: Stage3Config, split: Split):
     if config.dataset_kind == "mipnerf360":
         return _mip_scene_data(root, config.image_factor, split)
-    adapter = NeRFSyntheticAdapter(root)
-    return adapter, adapter.index(split)
+    return _nerf_scene_data(root, split)
 
 
 def _git_revision() -> str | None:
@@ -471,6 +476,7 @@ def _load_group(
     config: Stage3Config,
     generator: torch.Generator,
     device: torch.device,
+    image_cache: dict[str, torch.Tensor] | None = None,
 ):
     adapter, sequence = _scene_data(
         dataset_root / scene, config, Split.TRAIN if route == "train" else Split.TEST
@@ -484,7 +490,7 @@ def _load_group(
         view_count=config.views,
         nearest=min(config.nearest_views, len(sequence.observations) - 1),
     )
-    return _load_indices(dataset_root, scene, route, indices, config, device)
+    return _load_indices(dataset_root, scene, route, indices, config, device, image_cache)
 
 
 def _load_indices(
@@ -494,6 +500,7 @@ def _load_indices(
     indices: list[int],
     config: Stage3Config,
     device: torch.device,
+    image_cache: dict[str, torch.Tensor] | None = None,
 ):
     if len(indices) != config.views or len(set(indices)) != config.views:
         raise ValueError("view indices must contain exactly the configured unique views")
@@ -503,12 +510,42 @@ def _load_indices(
     if min(indices) < 0 or max(indices) >= len(sequence.observations):
         raise ValueError("view index is outside the selected split")
     observations = tuple(sequence.observations[index] for index in indices)
-    hr = rgb_images_to_video(
-        [adapter.load_rgb(item) for item in observations], config.image_size
-    ).to(device)
+    hr = (
+        image_cache[scene].index_select(2, torch.tensor(indices)).to(device)
+        if image_cache is not None else
+        rgb_images_to_video([adapter.load_rgb(item) for item in observations], config.image_size).to(device)
+    )
     camera = _camera(observations, config.image_size, device)
     lr = Stage1Degradation(scale=config.scale)(hr)
     return indices, hr, lr, camera
+
+
+def _build_training_cache(runtime: Runtime, dataset_root: Path, config: Stage3Config):
+    """Cache fixed train images and independent one-view VAE means in host RAM."""
+    images, latents = {}, {}
+    for scene in config.train_scenes:
+        adapter, sequence = _scene_data(dataset_root / scene, config, Split.TRAIN)
+        hr = rgb_images_to_video(
+            [adapter.load_rgb(item) for item in sequence.observations], config.image_size
+        )
+        with torch.no_grad():
+            clean = torch.cat([
+                runtime.vae.encode_multiview(hr[:, :, start:start + 8].to(runtime.device)).cpu()
+                for start in range(0, hr.shape[2], 8)
+            ], dim=2)
+        images[scene], latents[scene] = hr, clean
+    scene = config.train_scenes[0]
+    indices = list(range(config.views))
+    _, direct_hr, _, _ = _load_indices(dataset_root, scene, "train", indices, config, runtime.device)
+    cached_hr = images[scene].index_select(2, torch.tensor(indices)).to(runtime.device)
+    if not torch.equal(direct_hr, cached_hr):
+        raise RuntimeError("training RGB cache differs from the original loader")
+    with torch.no_grad():
+        direct_clean = runtime.vae.encode_multiview(direct_hr)
+    cached_clean = latents[scene].index_select(2, torch.tensor(indices)).to(runtime.device)
+    if not torch.allclose(direct_clean, cached_clean, rtol=1e-5, atol=1e-5):
+        raise RuntimeError("training VAE cache differs from direct encoding")
+    return images, latents
 
 
 def _prepare_seen_manifest(args, config: Stage3Config) -> None:
@@ -688,6 +725,14 @@ def decoded_target_ssim_loss(vae, noisy, prediction, sigma, hr):
     )
 
 
+def _correct_flow_loss(prediction, target, target_view_flow_fraction: float | None = None):
+    if target_view_flow_fraction is None:
+        return flow_matching_loss(prediction, target)
+    per_view = per_view_flow_losses(prediction, target)
+    return (target_view_flow_fraction * per_view[:, 0]
+            + (1 - target_view_flow_fraction) * per_view[:, 1:].mean(dim=1)).mean()
+
+
 def _camera_pair_training_losses(
     prediction_correct,
     prediction_wrong,
@@ -698,12 +743,7 @@ def _camera_pair_training_losses(
     target_view_flow_fraction: float | None = None,
 ):
     """Keep the SR flow loss global while optionally ranking only view zero."""
-    if target_view_flow_fraction is None:
-        flow = flow_matching_loss(prediction_correct, target)
-    else:
-        per_view = per_view_flow_losses(prediction_correct, target)
-        flow = (target_view_flow_fraction * per_view[:, 0]
-                + (1 - target_view_flow_fraction) * per_view[:, 1:].mean(dim=1)).mean()
+    flow = _correct_flow_loss(prediction_correct, target, target_view_flow_fraction)
     if target_view_only:
         prediction_correct = prediction_correct[:, :, 0:1]
         prediction_wrong = prediction_wrong[:, :, 0:1]
@@ -2245,6 +2285,8 @@ def _train(args, config: Stage3Config) -> None:
         if not manifest_path.is_file():
             raise ValueError("resume manifest is missing")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if bool(manifest.get("provenance", {}).get("training_cache", False)) != bool(getattr(args, "cache_training_data", False)):
+            raise ValueError("resume training cache mode differs from manifest")
         expected_config = json.loads(json.dumps(config.to_dict()))
         manifest_config = dict(manifest.get("config") or {})
         manifest_config.setdefault("target_lr_dropout", 0.0)
@@ -2345,6 +2387,10 @@ def _train(args, config: Stage3Config) -> None:
         runtime.checkpoint,
         lambda: pairing_calibration,
     )
+    image_cache = latent_cache = None
+    if getattr(args, "cache_training_data", False):
+        image_cache, latent_cache = _build_training_cache(runtime, args.dataset_root, config)
+        torch.cuda.reset_peak_memory_stats(runtime.device)
     provenance = {
         "training_seed": args.seed,
         "dataset_root": str(args.dataset_root.resolve()),
@@ -2356,6 +2402,7 @@ def _train(args, config: Stage3Config) -> None:
         "rre_checkpoint_sha256": None if args.rre_checkpoint is None else _sha256(args.rre_checkpoint),
         "git_revision": _git_revision(),
         "initialization_mode": initialization_mode,
+        "training_cache": bool(getattr(args, "cache_training_data", False)),
         "copied_modules": [],
         "reset_modules": [],
     }
@@ -2405,7 +2452,8 @@ def _train(args, config: Stage3Config) -> None:
                 ((step - 1) * config.gradient_accumulation + micro) % len(config.train_scenes)
             ]
             indices, hr, lr, camera = _load_group(
-                args.dataset_root, scene, "train", config, view_generator, runtime.device
+                args.dataset_root, scene, "train", config, view_generator, runtime.device,
+                image_cache,
             )
             pairing_lr = lr
             dropped = (
@@ -2416,7 +2464,10 @@ def _train(args, config: Stage3Config) -> None:
                 lr = lr.clone()
                 lr[:, :, 0] = 0
             with torch.no_grad():
-                clean = runtime.vae.encode_multiview(hr)
+                clean = (
+                    latent_cache[scene].index_select(2, torch.tensor(indices)).to(runtime.device)
+                    if latent_cache is not None else runtime.vae.encode_multiview(hr)
+                )
             wrong_camera = wrong_permutation = None
             if config.camera_rank_weight > 0 or config.pairing_supervision:
                 assert pairing_generator is not None
@@ -2602,7 +2653,10 @@ def _train(args, config: Stage3Config) -> None:
                     rank_gradients[index] for index in fusion_trainable_indices
                 )
             else:
-                flow_term = flow_matching_loss(prediction, target)
+                flow_term = _correct_flow_loss(
+                    prediction, target,
+                    config.target_view_flow_fraction if dropped else None,
+                )
                 rank_term = prediction.new_zeros(())
                 loss = flow_term
                 micro_rank_fusion_gradients = ()
@@ -3503,6 +3557,7 @@ def _parser() -> argparse.ArgumentParser:
     restart.add_argument("--resume", type=Path)
     restart.add_argument("--init-checkpoint", type=Path)
     train.add_argument("--init-reset-fusion", action="store_true")
+    train.add_argument("--cache-training-data", action="store_true")
     validate = subparsers.add_parser("validate")
     validate.add_argument("--config", type=Path, required=True)
     _add_runtime_paths(validate)

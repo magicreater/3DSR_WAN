@@ -52,6 +52,15 @@ def test_strict_config_and_disjoint_scenes(tmp_path):
         arm="A5", fusion_heads=1, epipolar_attention="local_band",
         allow_self_view_source=False, wan_lora=True,
     )
+    assert a5_lora.pairing_supervision is True
+    assert "pairing_supervision_enabled" not in a5_lora.to_dict()
+    no_pairing = replace(a5_lora, camera_rank_weight=0.0, pairing_supervision_enabled=False,
+                         target_view_flow_fraction=0.25, views=8)
+    assert no_pairing.pairing_supervision is False
+    path.write_text(json.dumps(no_pairing.to_dict()))
+    assert load_stage3_config(path) == no_pairing
+    with pytest.raises(ValueError, match="ranking and pairing disabled"):
+        replace(no_pairing, pairing_supervision_enabled=True)
     middle_target = replace(
         a5_lora, wan_lora_blocks=(12, 13, 14, 15), camera_rank_view_scope="target",
     )
